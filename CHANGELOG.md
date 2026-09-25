@@ -4,6 +4,13 @@ All notable changes to FactorSeal will be documented in this file.
 
 ## Unreleased
 
+- Open Desktop's permission approval popup on macOS and Windows as well as
+  Linux, for native SecretSpec requests and requests relayed from WSL2.
+  Relayed requests show the WSL distro and that access expires after five
+  minutes. The popup no longer takes typing until clicked, and ignores
+  approval for one second after its requests change, so keystrokes or an
+  Enter meant for another app cannot approve a request.
+
 - Update the SecretSpec provider integration to IPC 0.20, accept the registered
   `factorseal://` provider URI, and display conventional secret names with
   project and profile coordinates. Group related access requests in the
