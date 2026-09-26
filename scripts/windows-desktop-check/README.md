@@ -14,7 +14,7 @@ by default `%USERPROFILE%\Projects\factorseal`; set `FACTORSEAL_WINDOWS_TREE`
 
 | Script | Runs on | Does |
 | --- | --- | --- |
-| `build-windows.sh [release] [--broker]` | WSL | Mirrors the checkout and builds Desktop, the CLI (with the SecretSpec provider), and its parser and network helpers natively. Refuses to start while Desktop or the CLI runs. `--broker` also cross-compiles the WSL broker. |
+| `build-windows.sh [release] [--broker]` | WSL | Mirrors the checkout and builds Desktop, the CLI (with the SecretSpec provider), and its parser, network and browser bridge helpers natively. Refuses to start while Desktop or the CLI runs. `--broker` also cross-compiles the WSL broker. |
 | `build-windows.sh check` | WSL | Mirrors, then runs clippy and Desktop's tests natively. Safe while Desktop runs. |
 | `check.sh popup [--delay S] [--key K]` | WSL | Sends a request through the WSL broker and reports whether the popup opened, reached the foreground or flashed its taskbar button, with screenshots of the popup and the taskbar and a check that the vault holds the pending request. |
 | `check.sh grant --key K` | WSL | After the popup was approved, resends the request and checks that it succeeds without a new popup and that the grant stays within the 300-second WSL cap. |
