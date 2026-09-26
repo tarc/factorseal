@@ -4,6 +4,13 @@ All notable changes to FactorSeal will be documented in this file.
 
 ## Unreleased
 
+- Unlock on Windows without administrator rights. Windows gives the TPM
+  storage hierarchy authorization only to administrators, so `hardwareseal`
+  now tries the empty authorization Windows sets by default when it is
+  refused, and derives the same storage key, so existing vaults keep working.
+  If the TPM rejects that, the error says to run as administrator instead of
+  showing a raw TBS status.
+
 - Open Desktop's permission approval popup on macOS and Windows as well as
   Linux, for native SecretSpec requests and requests relayed from WSL2.
   Relayed requests show the WSL distro and that access expires after five
