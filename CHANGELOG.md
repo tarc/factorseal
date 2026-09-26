@@ -4,6 +4,13 @@ All notable changes to FactorSeal will be documented in this file.
 
 ## Unreleased
 
+- Tell SecretSpec that approval is needed when a person has not finished
+  approving a request within SecretSpec's 30-second operation limit. The
+  provider now answers `interaction_required` with the pending permission's
+  reference just before the deadline, instead of timing out with
+  `deadline_exceeded`. The permission stays pending, so rerunning after
+  approving it succeeds.
+
 - Keep permission requests that are waiting for review when the vault seals.
   Pending permissions are now stored in the encrypted vault, local to the
   device, and offered again after the next unseal, even after Desktop
