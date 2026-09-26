@@ -4,6 +4,12 @@ All notable changes to FactorSeal will be documented in this file.
 
 ## Unreleased
 
+- Flash Desktop's taskbar button on Windows when the approval popup loses
+  the foreground before it was clicked, as when Windows gives it the focus
+  for a moment and then hands it back to the app being used. A popup opened
+  while the main window is active has no taskbar button of its own, so the
+  main window's button flashes for it until the popup is in front.
+
 - Unlock on Windows without administrator rights. Windows gives the TPM
   storage hierarchy authorization only to administrators, so `hardwareseal`
   now tries the empty authorization Windows sets by default when it is
