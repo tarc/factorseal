@@ -17,9 +17,13 @@ script, the flow, and the pitfalls. This file is the order of work.
 The user must do the steps only a person can. Give them the exact commands,
 say which shell they run in, and wait for them.
 
-1. Ask the user to start Desktop and unlock the vault. On this setup they
-   start it from an elevated PowerShell:
-   `cd <windows copy>; .\target\release\factorseal-desktop.exe`
+Without the user, use the test vault: `check.sh test-desktop`, then
+`check.sh popup --test-vault --then grant` (or `--then deny`, which does not
+yet deny in the vault). The driver takes over the pointer for a few seconds,
+so say so first. Against the user's own vault:
+
+1. Ask the user to start Desktop and unlock the vault, from a normal
+   PowerShell: `cd <windows copy>; .\target\release\factorseal-desktop.exe`
 2. Run `./scripts/windows-desktop-check/check.sh popup` (or `--delay 10` and
    ask them to bring another app to the front, for the "behind" case). Tell
    them to leave the popup alone until the result prints.
@@ -33,9 +37,8 @@ promptly; it seals itself after a few idle minutes.
 
 ## Inspect
 
-- UI Automation: `uia-dump.ps1 -Out <file>`. From WSL it sees only window
-  frames while Desktop is elevated; ask the user to run it from an elevated
-  PowerShell, then read the file.
+- UI Automation: `uia-dump.ps1 -Out <file> [-DesktopPid <pid>]`. From WSL it
+  sees only window frames if Desktop was started elevated.
 - Hangs or crashes: start `proc-watch.ps1 -Out <file> -Seconds 600` from WSL
   in the background before the user launches Desktop, and ask them to set
   `$env:FACTORSEAL_TIMINGS = '1'` and redirect stderr to a file.
