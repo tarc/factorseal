@@ -4,6 +4,13 @@ All notable changes to FactorSeal will be documented in this file.
 
 ## Unreleased
 
+- Keep permission requests that are waiting for review when the vault seals.
+  Pending permissions are now stored in the encrypted vault, local to the
+  device, and offered again after the next unseal, even after Desktop
+  restarts. Desktop's approval popup stays open through a seal and offers to
+  unlock; granting still takes the password again. A request denied while the
+  vault is sealed is denied as soon as it is unsealed.
+
 - Flash Desktop's taskbar button on Windows when the approval popup loses
   the foreground before it was clicked, as when Windows gives it the focus
   for a moment and then hands it back to the app being used. A popup opened
