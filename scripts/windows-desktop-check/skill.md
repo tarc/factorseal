@@ -18,9 +18,9 @@ The user must do the steps only a person can. Give them the exact commands,
 say which shell they run in, and wait for them.
 
 Without the user, use the test vault: `check.sh test-desktop`, then
-`check.sh popup --test-vault --then grant` (or `--then deny`, which does not
-yet deny in the vault). The driver takes over the pointer for a few seconds,
-so say so first. Against the user's own vault:
+`check.sh popup --test-vault --then grant` (or `--then deny`). The driver
+takes over the pointer for a few seconds, so say so first. Against the
+user's own vault:
 
 1. Ask the user to start Desktop and unlock the vault, from a normal
    PowerShell: `cd <windows copy>; .\target\release\factorseal-desktop.exe`
