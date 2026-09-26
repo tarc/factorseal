@@ -6,4 +6,5 @@
 /dist
 /result
 /.nixos-test-history
-/.claude/settings.local.json
+/.claude/
+/.mcp.json

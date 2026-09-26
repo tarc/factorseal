@@ -1,8 +1,3 @@
----
-name: windows-desktop-check
-description: Build FactorSeal natively on Windows from WSL2 and check FactorSeal Desktop's approval popup there (foreground or taskbar flash, pending request in the vault, WSL grant cap, UI Automation tree, hangs). Use when a task needs a Windows build of Desktop or the CLI, or verifying Desktop's approval popup, the WSL broker, or native SecretSpec requests on Windows.
----
-
 # Windows Desktop checks from WSL2
 
 Read `scripts/windows-desktop-check/README.md` first; it describes every
