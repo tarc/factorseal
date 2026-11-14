@@ -4156,6 +4156,67 @@ fn single_use_write_permission_allows_exactly_one_write() {
     assert!(read.result.unwrap_err().interaction.is_some());
 }
 
+/// A single-use grant for a WSL write is clamped like any WSL grant: it
+/// lasts the single-use window or until the unseal's absolute deadline,
+/// whichever comes first, and the sweep at the next unseal removes it.
+#[test]
+fn wsl_single_use_grant_ends_with_the_unseal_too() {
+    let wsl_write = |value: &[u8]| {
+        VaultRequest::new_with_application(
+            VaultAction::PutCache {
+                project: "demo".to_owned(),
+                address: project_address("demo"),
+                value: WireSecret::new(value.to_vec()).unwrap(),
+                evict_at: None,
+            },
+            VaultApplicationContext::new(Some("demo".to_owned()), None, None, None)
+                .unwrap()
+                .with_declared_wsl_origin(Some("NixOS".to_owned()))
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    let short = UnsealLeasePolicy {
+        idle_timeout: Duration::from_secs(60),
+        maximum_lifetime: Duration::from_secs(120),
+    };
+    for (policy, lifetime) in [(UnsealLeasePolicy::default(), None), (short, Some(120))] {
+        let now = wall_clock();
+        let (directory, service) = service(now, policy);
+        let provider = caller();
+        let manager = permission_manager();
+        service.authorize_permission_manager(&manager, now).unwrap();
+        let asked = service.handle(&provider, wsl_write(b"first"), now + 1);
+        assert!(asked.result.unwrap_err().interaction.is_some());
+        approve_only_pending(&directory, &service, &manager, true, now + 2).unwrap();
+        let expected = lifetime.map_or(now + 2 + SINGLE_USE_GRANT_SECONDS, |lifetime| {
+            (now + lifetime).min(now + 2 + SINGLE_USE_GRANT_SECONDS)
+        });
+        let permissions = listed_permissions(&service, &manager, now + 3);
+        assert!(
+            matches!(
+                permissions[0].state,
+                PermissionState::Granted {
+                    single_use: true,
+                    expires_at: Some(deadline),
+                    ..
+                } if deadline == expected
+            ),
+            "{:?}, expected expiry {expected}",
+            permissions[0].state
+        );
+
+        // Unspent when the vault seals: the next unseal removes it.
+        let service = reopen_after_seal(&directory, service, now + 4);
+        service
+            .authorize_permission_manager(&manager, now + 5)
+            .unwrap();
+        assert_eq!(listed_permissions(&service, &manager, now + 5), Vec::new());
+        let after = service.handle(&provider, wsl_write(b"first"), now + 6);
+        assert!(after.result.unwrap_err().interaction.is_some());
+    }
+}
+
 #[test]
 fn unused_single_use_write_permission_expires() {
     let now = wall_clock();
