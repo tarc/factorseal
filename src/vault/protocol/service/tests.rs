@@ -132,7 +132,6 @@ fn queued_request_is_rejected_after_absolute_expiry() {
 use super::super::grant::{
     GrantTarget, list_granted_permissions, promote_permission, revoke_permission, store_grant,
 };
-use super::super::wire::MAX_WSL_GRANT_SECONDS;
 use super::super::wire::SINGLE_USE_GRANT_SECONDS;
 use super::*;
 use crate::vault::{
@@ -1193,6 +1192,7 @@ fn revoking_an_expired_permission_cleans_the_registry() {
             GrantPermission::Get,
             permission(id, expires_at),
             100,
+            u64::MAX,
             &provenance,
         )
         .unwrap();
@@ -1861,13 +1861,13 @@ fn declared_launch_chain_is_shown_but_does_not_scope_the_grant() {
 
 /// A request relayed from WSL has no equivalent of the executable-identity
 /// hint a native caller gets, even as defense in depth (see
-/// `VaultApplicationContext::declared_wsl_origin`), so approving one must
-/// never grant a lease as long as what a native caller could receive. The
-/// normal interactive-approval and grant/retry flow is otherwise completely
-/// unchanged: what's WSL-specific is a lifetime cap, not a different code
-/// path.
+/// `VaultApplicationContext::declared_wsl_origin`): every WSL caller is the
+/// broker. Approving one therefore grants access only until the current
+/// unseal ends, whatever duration was approved. The normal
+/// interactive-approval and grant/retry flow is otherwise unchanged: what's
+/// WSL-specific is the lifetime, not a different code path.
 #[test]
-fn wsl_declared_origin_caps_the_granted_lease() {
+fn wsl_declared_origin_grant_ends_with_the_unseal() {
     let (directory, service) = service(100, UnsealLeasePolicy::default());
     let provider = caller();
     let application = VaultApplicationContext::new(
@@ -1924,7 +1924,7 @@ fn wsl_declared_origin_caps_the_granted_lease() {
     let PermissionState::Pending { challenge, .. } = &permissions[0].state else {
         panic!("expected pending permission");
     };
-    let requested_duration = 24 * 60 * 60; // one day: far beyond the WSL cap.
+    let requested_duration = 24 * 60 * 60; // one day: past the lease's 8 hours.
     let signature = unsealed
         .sign_permission_challenge(&permissions[0].id, challenge, Some(requested_duration))
         .unwrap();
@@ -1957,15 +1957,20 @@ fn wsl_declared_origin_caps_the_granted_lease() {
     let PermissionState::Granted { expires_at, .. } = permissions[0].state else {
         panic!("expected a granted permission");
     };
-    let expires_at = expires_at.expect("a WSL grant must not be \"until revoked\"");
-    assert!(
-        expires_at <= 103 + MAX_WSL_GRANT_SECONDS,
-        "requested a {requested_duration}s lease but the WSL cap should have applied"
+    let (_, absolute_deadline) = service
+        .state
+        .lock_live(Instant::now())
+        .unwrap()
+        .lease_deadlines();
+    assert_eq!(
+        expires_at,
+        Some(absolute_deadline),
+        "a {requested_duration}s approval must end with the unseal"
     );
 
-    // The retry succeeds because the (capped) grant is real and persisted,
-    // exactly like a native caller's -- WSL relaying only shortens the
-    // lease, it does not change how the retry-after-approval flow works.
+    // The retry succeeds because the clamped grant is real and persisted,
+    // exactly like a native caller's: WSL relaying only shortens the grant,
+    // it does not change how the retry-after-approval flow works.
     let retried = service.handle(&provider, get(), 104);
     assert!(matches!(
         retried.result,
@@ -2039,6 +2044,128 @@ fn permission_manager() -> CallerIdentity {
         None,
     )
     .unwrap()
+}
+
+fn approve_pending(
+    service: &VaultService,
+    manager: &CallerIdentity,
+    directory: &tempfile::TempDir,
+    id: &str,
+    now: u64,
+) {
+    let listed = service.handle(
+        manager,
+        VaultRequest::new(VaultAction::ListPermissions).unwrap(),
+        now,
+    );
+    let Ok(VaultResponseBody::Permissions { permissions, .. }) = listed.result else {
+        panic!("expected permissions");
+    };
+    let permission = permissions
+        .iter()
+        .find(|permission| permission.id == id)
+        .expect("the pending permission");
+    let PermissionState::Pending { challenge, .. } = &permission.state else {
+        panic!("expected a pending permission");
+    };
+    let root = directory.path().join("factorseal");
+    // "Until revoked": the longest a person can choose.
+    let signature = Vault::unseal_for_test(&root)
+        .unwrap()
+        .sign_permission_challenge(id, challenge, None)
+        .unwrap();
+    let approved = service.handle(
+        manager,
+        VaultRequest::new(VaultAction::ApprovePermission {
+            id: id.to_owned(),
+            signature,
+            duration_seconds: None,
+            single_use: false,
+        })
+        .unwrap(),
+        now,
+    );
+    assert!(matches!(
+        approved.result,
+        Ok(VaultResponseBody::PermissionChanged {
+            status: PermissionChange::Granted
+        })
+    ));
+}
+
+/// A WSL approval ends with the unseal that created it even when the vault
+/// seals before the lease's absolute deadline; a native grant survives.
+#[test]
+fn wsl_grants_are_removed_when_the_vault_unseals_again() {
+    let now = wall_clock();
+    let (directory, service) = service(now, UnsealLeasePolicy::default());
+    let provider = caller();
+    let manager = permission_manager();
+    service.authorize_permission_manager(&manager, now).unwrap();
+    let wsl_request = || {
+        VaultRequest::new_with_application(
+            VaultAction::GetCache {
+                project: "relayed".to_owned(),
+                address: project_address("relayed"),
+            },
+            VaultApplicationContext::new(Some("relayed".to_owned()), None, None, None)
+                .unwrap()
+                .with_declared_wsl_origin(Some("NixOS".to_owned()))
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    for (request, at) in [(wsl_request(), now + 1), (cache_request("native"), now + 2)] {
+        let interaction = service
+            .handle(&provider, request, at)
+            .result
+            .unwrap_err()
+            .interaction
+            .unwrap();
+        approve_pending(&service, &manager, &directory, &interaction.id, at);
+    }
+    assert!(
+        service
+            .handle(&provider, wsl_request(), now + 3)
+            .result
+            .is_ok()
+    );
+    assert!(
+        service
+            .handle(&provider, cache_request("native"), now + 3)
+            .result
+            .is_ok()
+    );
+
+    let service = reopen_after_seal(&directory, service, now + 10);
+    assert!(
+        service
+            .handle(&provider, wsl_request(), now + 11)
+            .result
+            .unwrap_err()
+            .interaction
+            .is_some(),
+        "the WSL grant must be gone after the vault sealed"
+    );
+    assert!(
+        service
+            .handle(&provider, cache_request("native"), now + 11)
+            .result
+            .is_ok(),
+        "a native grant survives the seal"
+    );
+    let listed = service.handle(
+        &manager,
+        VaultRequest::new(VaultAction::ListPermissions).unwrap(),
+        now + 12,
+    );
+    let Ok(VaultResponseBody::Permissions { permissions, .. }) = listed.result else {
+        panic!("expected permissions");
+    };
+    assert!(permissions.iter().all(|permission| {
+        permission.application.declared_wsl_origin.is_none()
+            || matches!(permission.state, PermissionState::Pending { .. })
+    }));
 }
 
 #[test]

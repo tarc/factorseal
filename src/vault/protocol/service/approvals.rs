@@ -594,6 +594,7 @@ impl PendingApprovals {
             .map(|record| record.status)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn approve(
         &mut self,
         store: &VaultStore,
@@ -601,6 +602,7 @@ impl PendingApprovals {
         signature: &[u8],
         lifetime: ApprovedLifetime,
         now: u64,
+        wsl_deadline: u64,
         provenance: &Provenance,
     ) -> VaultResult<()> {
         let ApprovedLifetime {
@@ -674,6 +676,7 @@ impl PendingApprovals {
             record.permission,
             permission,
             now,
+            wsl_deadline,
             provenance,
         )?;
         let caller_fingerprint = record.caller.fingerprint();

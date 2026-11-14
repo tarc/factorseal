@@ -10,7 +10,7 @@ use crate::vault::{
     VaultResult, VaultStore,
 };
 
-use super::wire::{MAX_WSL_GRANT_SECONDS, append_digest_bytes};
+use super::wire::append_digest_bytes;
 use super::{CallerIdentity, Permission, PermissionState};
 
 // Version 3 stores each operation independently so one permission's lifetime
@@ -399,6 +399,7 @@ fn exclusive_holder_address(target_digest: [u8; 32]) -> VaultResult<SecretAddres
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn promote_permission(
     store: &VaultStore,
     caller: &CallerIdentity,
@@ -406,6 +407,7 @@ pub(super) fn promote_permission(
     grant_permission: GrantPermission,
     mut permission: Permission,
     now: u64,
+    wsl_deadline: u64,
     provenance: &Provenance,
 ) -> VaultResult<()> {
     caller.validate()?;
@@ -424,17 +426,20 @@ pub(super) fn promote_permission(
     }
     // A request relayed from WSL carries no equivalent of the
     // executable-identity hint a native caller gets (see
-    // `VaultApplicationContext::declared_wsl_origin`): the grant this
-    // approval creates still works exactly like any native grant (the
-    // normal retry-after-approval flow depends on that), but its lifetime
-    // is capped far below whatever duration was requested or approved,
-    // regardless of an explicit "until revoked" choice. Both the persisted
-    // grant and the permission record shown in the Desktop UI reflect the
-    // same clamped deadline, so neither one overstates how long access
-    // actually lasts.
+    // `VaultApplicationContext::declared_wsl_origin`): every WSL caller is
+    // the broker. The grant this approval creates still works exactly like
+    // any native grant (the normal retry-after-approval flow depends on
+    // that), but it lasts at most until the current unseal ends, whatever
+    // duration was requested or approved, "until revoked" included. The
+    // lease's absolute deadline bounds it here; an earlier seal is covered
+    // by `revoke_wsl_grants` at the next unseal. Both the persisted grant
+    // and the permission record shown in the Desktop UI carry the clamped
+    // deadline, so neither one overstates how long access lasts.
     let expires_at = if permission.application.declared_wsl_origin.is_some() {
-        let capped = now + MAX_WSL_GRANT_SECONDS;
-        let clamped = expires_at.map_or(capped, |deadline| deadline.min(capped));
+        if wsl_deadline <= now {
+            return Err(VaultError::Expired);
+        }
+        let clamped = expires_at.map_or(wsl_deadline, |deadline| deadline.min(wsl_deadline));
         if let PermissionState::Granted { expires_at, .. } = &mut permission.state {
             *expires_at = Some(clamped);
         }
@@ -540,6 +545,43 @@ pub(super) fn revoke_permission(
         provenance,
         now,
     )
+}
+
+/// Remove every grant approved for a WSL-relayed request, with its
+/// permission record. Called when the vault unseals: such grants last only
+/// until the unseal that created them ends, and a seal before the lease's
+/// absolute deadline (idle, manual, or a stopped worker) leaves them behind.
+/// Returns how many were removed; writes nothing when there are none.
+pub(super) fn revoke_wsl_grants(
+    store: &VaultStore,
+    now: u64,
+    provenance: &Provenance,
+) -> VaultResult<usize> {
+    let mut registry = load_permission_registry(store, now)?;
+    let (wsl, kept): (Vec<_>, Vec<_>) = registry
+        .permissions
+        .into_iter()
+        .partition(|stored| stored.permission.application.declared_wsl_origin.is_some());
+    if wsl.is_empty() {
+        return Ok(0);
+    }
+    let operations = wsl
+        .iter()
+        .map(|stored| {
+            grant_address(
+                stored.caller_fingerprint,
+                stored.target_digest,
+                stored.grant_permission,
+            )
+            .map(|address| DocumentOperation::Delete { address })
+        })
+        .collect::<VaultResult<Vec<_>>>()?;
+    registry.permissions = kept
+        .into_iter()
+        .filter(|stored| !is_expired(&stored.permission, now))
+        .collect();
+    write_registry(store, &registry, operations, provenance, now)?;
+    Ok(wsl.len())
 }
 
 fn is_expired(permission: &Permission, now: u64) -> bool {

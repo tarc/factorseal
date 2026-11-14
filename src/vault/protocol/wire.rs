@@ -28,9 +28,10 @@ pub const SINGLE_USE_GRANT_SECONDS: u64 = 300;
 /// Maximum number of executables in
 /// [`VaultApplicationContext::declared_launch_chain`].
 pub const MAX_DECLARED_LAUNCH_CHAIN: usize = 4;
-/// Maximum lifetime for a grant created from a WSL-relayed request,
-/// regardless of the duration requested or approved. See
-/// [`VaultApplicationContext::declared_wsl_origin`].
+/// The former five-minute lifetime of a grant approved for a WSL-relayed
+/// request. The vault no longer applies it: such a grant now ends with the
+/// unseal (see [`VaultApplicationContext::declared_wsl_origin`]). Desktop's
+/// approval popup still quotes it until the popup offers the new choices.
 pub const MAX_WSL_GRANT_SECONDS: u64 = 300;
 /// Maximum number of metadata-only entries returned by one list request.
 ///
@@ -344,10 +345,12 @@ pub struct VaultApplicationContext {
     /// interop broker. Never authenticates anything and never affects the
     /// caller's fingerprint: transport authentication still resolves the
     /// broker's own SID and executable digest exactly as any other Windows
-    /// client. It is display context for the approval prompt, and it caps
-    /// the lifetime of any grant approved for such a request at
-    /// `MAX_WSL_GRANT_SECONDS`, since it carries no equivalent of the
-    /// executable-identity hint a native caller gets.
+    /// client. It is display context for the approval prompt, and it limits
+    /// any grant approved for such a request to the current unseal: the
+    /// grant expires at the lease's absolute deadline, and the next unseal
+    /// removes it if the vault sealed earlier. Every WSL caller is the
+    /// broker, so it carries no equivalent of the executable-identity hint a
+    /// native caller gets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declared_wsl_origin: Option<String>,
 }

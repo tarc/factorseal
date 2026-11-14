@@ -334,7 +334,7 @@ name. These project labels are caller-provided; they are not a verified project
 identity. Unlocking and grant approval stay in one popup, reusing the secure
 password entry. The signed grant binds the authenticated executable, project,
 folder, and operation, either for one hour or until revoked (requests relayed
-from WSL2 are capped at five minutes; see [WSL2 broker](#wsl2-broker)). Keyring requests
+from WSL2 last until the vault seals; see [WSL2 broker](#wsl2-broker)). Keyring requests
 use the nearest `secretspec.toml` ancestor of the OS-reported working directory
 (or that directory itself); SecretSpec IPC supplies its canonical project folder. Grants appear in Access
 Grants and are checked again for each secret operation. SecretSpec IPC uses the
@@ -366,10 +366,12 @@ caller-declared: approval prompts show it as “WSL distro”, but it
 never authenticates anything and does not change the caller's identity.
 
 Because the vault cannot tell WSL2 callers apart, a grant approved for a
-WSL2-relayed request expires after five minutes (`MAX_WSL_GRANT_SECONDS`). The
-cap applies whatever duration is chosen at approval, including “until revoked”.
-The stored grant and the permission record shown in Desktop both carry the capped
-expiry, so neither overstates how long access lasts. The broker currently
+WSL2-relayed request lasts only until the vault seals, whatever duration is
+chosen at approval, including “until revoked”. The grant expires at the unseal
+lease's absolute deadline, and if the vault seals before that (idle timeout,
+Seal, or a stopped worker), the next unseal removes it before serving any
+request. The stored grant and the permission record shown in Desktop both carry
+the clamped expiry, so neither overstates how long access lasts. The broker currently
 relays SecretSpec provider-cache reads only.
 
 ## Vault lifecycle

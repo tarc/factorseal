@@ -3,9 +3,9 @@
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use crate::vault::{Provenance, VaultError, VaultResult, VaultStore};
+use crate::vault::{Provenance, ServiceReason, VaultError, VaultResult, VaultStore};
 
-use super::super::grant::{list_granted_permissions, revoke_permission};
+use super::super::grant::{list_granted_permissions, revoke_permission, revoke_wsl_grants};
 use super::super::lease::{ReplayWindow, UnsealLease};
 use super::super::{CallerIdentity, Permission, PermissionWaitStatus, VaultInteractionReference};
 use super::super::{RequestId, UnsealLeasePolicy};
@@ -52,6 +52,13 @@ impl ServiceState {
 
     pub(super) fn new(store: VaultStore, now: u64, policy: UnsealLeasePolicy) -> VaultResult<Self> {
         let seal_handle = store.clone();
+        // WSL-relayed grants end with the unseal that created them; remove
+        // any an earlier seal left behind before serving a request.
+        revoke_wsl_grants(
+            &store,
+            now,
+            &Provenance::service(ServiceReason::GrantStorage),
+        )?;
         let lease = UnsealLease::new(now, policy)?;
         store.set_deadline(lease.expires_at())?;
         // Requests still waiting for review when the vault last sealed.
@@ -239,10 +246,20 @@ impl LiveStateGuard<'_> {
         now: u64,
         provenance: &Provenance,
     ) -> VaultResult<()> {
+        // A WSL-relayed approval lasts at most until this unseal ends.
+        let (_, wsl_deadline) = self.lease_deadlines();
         let LiveState {
             store, approvals, ..
         } = &mut *self.live;
-        approvals.approve(store, id, signature, lifetime, now, provenance)?;
+        approvals.approve(
+            store,
+            id,
+            signature,
+            lifetime,
+            now,
+            wsl_deadline,
+            provenance,
+        )?;
         self.save_approvals(now);
         self.approval_changed.notify_all();
         Ok(())
