@@ -972,6 +972,41 @@ fn approval_grant_duration_uses_app_default_and_accepts_overrides() {
 }
 
 #[test]
+fn a_wsl_request_defaults_to_lasting_until_the_vault_seals() {
+    let mut read = pending_permission(
+        factorseal::DocumentKind::SecretSpecProviderCache,
+        factorseal::PermissionOperation::Get,
+        Some(8 * 60 * 60),
+    );
+    read.application = read
+        .application
+        .with_declared_wsl_origin(Some("NixOS".to_owned()))
+        .unwrap();
+    let mut accept_default = std::io::Cursor::new(b"\n");
+    let mut output = Vec::new();
+    assert_eq!(
+        read_grant_lifetime(&mut accept_default, &mut output, &read).unwrap(),
+        GrantLifetime::Forever
+    );
+    assert!(
+        String::from_utf8(output)
+            .unwrap()
+            .contains("[until the vault seals]")
+    );
+    let mut shorter = std::io::Cursor::new(b"later\n30m\n");
+    let mut output = Vec::new();
+    assert_eq!(
+        read_grant_lifetime(&mut shorter, &mut output, &read).unwrap(),
+        GrantLifetime::Seconds(30 * 60)
+    );
+    assert!(
+        String::from_utf8(output)
+            .unwrap()
+            .contains("until the vault seals at most")
+    );
+}
+
+#[test]
 fn a_secretspec_write_is_approved_once_unless_a_duration_is_given() {
     let write = pending_permission(
         factorseal::DocumentKind::SecretSpecProviderCache,

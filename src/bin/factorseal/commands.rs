@@ -1331,10 +1331,13 @@ fn write_permission(output: &mut impl Write, approval: &Permission) -> Result<()
             // Caller-declared, not authenticated -- see
             // `VaultApplicationContext::declared_wsl_origin`. Surfaced here so a
             // human approving via the CLI sees the same context the Desktop UI
-            // shows: this is a short-lived lease regardless of duration
-            // requested, since a relayed WSL caller has none of the
-            // executable-identity assurance a native one has.
-            writeln!(output, "  relayed from WSL distro: {}", PromptText(distro))
+            // shows: the grant lasts at most until the vault seals, whatever
+            // duration is chosen, since every WSL caller is the broker.
+            writeln!(
+                output,
+                "  relayed from WSL distro: {} (access lasts until the vault seals at most)",
+                PromptText(distro)
+            )
         } else {
             Ok(())
         }
@@ -1424,15 +1427,21 @@ pub(super) fn parse_grant_lifetime(value: &str) -> Option<GrantLifetime> {
 /// Ask how long an approval lasts. A request that allows it can be
 /// approved `once`, for that write only. That is the default for a plain
 /// SecretSpec write, as in Desktop's popup; otherwise the caller's requested
-/// duration, or an hour, is (see `Permission::defaults_to_single_use`).
+/// duration, or an hour, is (see `Permission::defaults_to_single_use`). A
+/// request relayed from WSL lasts at most until the vault seals, so that is
+/// its default instead of a duration.
 pub(super) fn read_grant_lifetime(
     input: &mut impl BufRead,
     output: &mut impl Write,
     approval: &Permission,
 ) -> Result<GrantLifetime, CliError> {
     let once_allowed = approval.allows_single_use();
+    let relayed = approval.application.declared_wsl_origin.is_some();
     let default = if approval.defaults_to_single_use() {
         GrantLifetime::Once
+    } else if relayed {
+        // The vault clamps it to the end of this unseal.
+        GrantLifetime::Forever
     } else {
         GrantLifetime::Seconds(
             approval
@@ -1447,6 +1456,7 @@ pub(super) fn read_grant_lifetime(
             "Permission duration [{}]: ",
             match default {
                 GrantLifetime::Once => "once (this write only)".to_owned(),
+                GrantLifetime::Forever if relayed => "until the vault seals".to_owned(),
                 GrantLifetime::Forever => "forever".to_owned(),
                 GrantLifetime::Seconds(seconds) => format_grant_duration(seconds),
             }
@@ -1469,7 +1479,13 @@ pub(super) fn read_grant_lifetime(
             Some(lifetime) => return Ok(lifetime),
             None => {}
         }
-        if once_allowed {
+        if relayed {
+            writeln!(
+                output,
+                "A request from WSL lasts until the vault seals at most. Press Enter for that, or enter {}a shorter duration such as 30m.",
+                if once_allowed { "once for this write only, or " } else { "" }
+            )
+        } else if once_allowed {
             writeln!(
                 output,
                 "Enter once for this write only, or a duration such as 30m, 8h, 7d, or forever."
