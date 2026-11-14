@@ -165,7 +165,11 @@ Windows vault through the broker. Requests show in Desktop's approval popup with
 the distro, the folder in its Windows form (`\\wsl.localhost\<distro>\…`, or
 `C:\…` under `/mnt/c`) and the program that ran `secretspec`. An approval lasts
 until the vault seals. If the vault is sealed, the broker brings Desktop forward
-to unlock. `factorseal wsl-setup --remove` returns the provider to a Linux vault.
+to unlock, and `secretspec` waits for the unlock until shortly before its
+deadline, then continues. While `wsl.json` exists, the provider ignores
+`FACTORSEAL_ROOT` and uses the Windows vault; an explicit `FACTORSEAL_SOCKET`
+still names a Linux vault. `factorseal wsl-setup --remove` returns the provider
+to a Linux vault.
 See [WSL2 broker](architecture.md#wsl2-broker) for what the vault can and cannot
 verify about such requests.
 

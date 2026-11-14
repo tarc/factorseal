@@ -373,8 +373,10 @@ Seal, or a stopped worker), the next unseal removes it before serving any
 request. If the vault cannot read its permission registry then (a newer
 release's format after a downgrade, or a damaged document), it records an
 integrity failure and opens anyway rather than lock the person out; leftover
-WSL2 grants then last until their absolute deadline. The stored grant and the permission record shown in Desktop both carry
-the clamped expiry, so neither overstates how long access lasts.
+WSL2 grants then last until their absolute deadline. The stored grant and the
+permission record shown in Desktop carry the lease's absolute deadline, the
+latest the grant can last; a seal before then, often the idle seal minutes
+later, ends it too.
 
 In relay mode (`factorseal-wsl-broker.exe <pipe> <distro> relay`) the broker
 forwards requests from a Linux client in WSL, the SecretSpec provider that
@@ -383,8 +385,11 @@ input and output. It tags each request with its distro, rewrites the folder
 into the Windows form (`\\wsl.localhost\<distro>\...`, or the drive path for
 `/mnt/<drive>`), since the vault requires an absolute folder, and forwards only
 status, permission waits and provider-cache reads, writes and deletes. It
-answers anything else itself, so a WSL process cannot raise approval prompts
-for other requests. When the vault is sealed or not running, it starts
+answers anything else itself, so the relay never carries other requests. This
+narrows what honest WSL clients can trigger; it is not a boundary, since a WSL
+process can run any Windows program of the user through interop, including
+`factorseal.exe`. Like the distro, the folder and the launch chain a relayed
+request carries are declared by the WSL side. When the vault is sealed or not running, it starts
 FactorSeal Desktop, which shows the running instance so the person can unlock.
 Values are stored by project and key, so a WSL program reads what Windows
 SecretSpec wrote, but under its own approvals: the caller is the broker.

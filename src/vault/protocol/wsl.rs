@@ -8,9 +8,11 @@
 //! The broker decodes a request with [`VaultRequest::decode_relayed_from_wsl`],
 //! which tags it with the distro and rewrites its folder into a Windows path,
 //! forwards it only if [`relay_allows`] its action, and answers anything else
-//! itself, so a WSL process cannot raise approval prompts for arbitrary
-//! requests. Everything here is caller-declared context: the vault still
-//! authenticates only the broker.
+//! itself ([`serve`]), so the relay never carries other requests. That
+//! narrows what honest WSL clients can trigger; it is not a boundary, since
+//! a WSL process can run any Windows program of the user through interop.
+//! Everything here is caller-declared context (the distro, the folder, the
+//! launch chain): the vault still authenticates only the broker.
 
 use std::io::{self, Read, Write};
 
@@ -68,7 +70,8 @@ pub fn write_frame(writer: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
 
 /// Whether the broker forwards a request with this action to the vault:
 /// exactly what the SecretSpec provider sends from WSL. Everything else is
-/// answered by the broker, so it never raises an approval prompt.
+/// answered by the broker, so the relay never raises an approval prompt for
+/// it (see the module documentation for what that does not prevent).
 #[must_use]
 pub const fn relay_allows(action: &VaultAction) -> bool {
     matches!(
