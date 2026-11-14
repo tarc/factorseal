@@ -263,8 +263,9 @@ impl Relay {
 #[cfg(target_os = "linux")]
 impl Drop for Relay {
     fn drop(&mut self) {
-        // Closing the broker's input ends its loop; reap it so it does not
-        // linger as a zombie, and stop it if it does not exit.
+        // Stop the broker and reap it, so it does not linger as a zombie.
+        // It is idle between frames, so nothing is cut short; its input
+        // closes only afterwards, when the fields drop.
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
