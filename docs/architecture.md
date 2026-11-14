@@ -371,8 +371,20 @@ chosen at approval, including “until revoked”. The grant expires at the unse
 lease's absolute deadline, and if the vault seals before that (idle timeout,
 Seal, or a stopped worker), the next unseal removes it before serving any
 request. The stored grant and the permission record shown in Desktop both carry
-the clamped expiry, so neither overstates how long access lasts. The broker currently
-relays SecretSpec provider-cache reads only.
+the clamped expiry, so neither overstates how long access lasts.
+
+In relay mode (`factorseal-wsl-broker.exe <pipe> <distro> relay`) the broker
+forwards requests from a Linux client in WSL, the SecretSpec provider that
+`factorseal wsl-setup` configures, as length-prefixed frames on its standard
+input and output. It tags each request with its distro, rewrites the folder
+into the Windows form (`\\wsl.localhost\<distro>\...`, or the drive path for
+`/mnt/<drive>`), since the vault requires an absolute folder, and forwards only
+status, permission waits and provider-cache reads, writes and deletes. It
+answers anything else itself, so a WSL process cannot raise approval prompts
+for other requests. When the vault is sealed or not running, it starts
+FactorSeal Desktop, which shows the running instance so the person can unlock.
+Values are stored by project and key, so a WSL program reads what Windows
+SecretSpec wrote, but under its own approvals: the caller is the broker.
 
 ## Vault lifecycle
 

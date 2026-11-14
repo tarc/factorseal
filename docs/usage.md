@@ -145,6 +145,29 @@ Seal the running service immediately when it is no longer needed:
 $ factorseal seal
 ```
 
+### SecretSpec in WSL2 with the vault on Windows (experimental)
+
+With FactorSeal Desktop installed on Windows, the Linux `secretspec` inside a
+WSL2 distro can use the Windows vault. Install the Linux `factorseal` in the
+distro and run, once:
+
+```console
+$ factorseal wsl-setup
+```
+
+It finds the Windows installation (`%LOCALAPPDATA%\Programs\FactorSeal`, or
+`--windows-install <path>` as WSL sees it), records the broker
+`factorseal-wsl-broker.exe` and the vault's pipe in
+`~/.config/factorseal/wsl.json`, and publishes the SecretSpec claim. From then
+on `secretspec … --provider factorseal://default` in the distro reaches the
+Windows vault through the broker. Requests show in Desktop's approval popup with
+the distro, the folder in its Windows form (`\\wsl.localhost\<distro>\…`, or
+`C:\…` under `/mnt/c`) and the program that ran `secretspec`. An approval lasts
+until the vault seals. If the vault is sealed, the broker brings Desktop forward
+to unlock. `factorseal wsl-setup --remove` returns the provider to a Linux vault.
+See [WSL2 broker](architecture.md#wsl2-broker) for what the vault can and cannot
+verify about such requests.
+
 ### Import and export
 
 Create or restore a portable, versioned FactorSeal archive while the vault is
