@@ -157,7 +157,8 @@ $ factorseal wsl-setup
 
 It finds the Windows installation (`%LOCALAPPDATA%\Programs\FactorSeal`, or
 `--windows-install <path>` as WSL sees it), records the broker
-`factorseal-wsl-broker.exe` and the vault's pipe in
+`factorseal-wsl-broker.exe` and the pipe of the default Windows vault (or of the
+vault at `--windows-root <Windows path>`, as `factorseal.exe --root` takes it) in
 `~/.config/factorseal/wsl.json`, and publishes the SecretSpec claim. From then
 on `secretspec … --provider factorseal://default` in the distro reaches the
 Windows vault through the broker. Requests show in Desktop's approval popup with

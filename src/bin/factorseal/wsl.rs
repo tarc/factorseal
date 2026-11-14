@@ -70,7 +70,11 @@ pub(super) fn load() -> Result<Option<WslConfig>, CliError> {
 /// `factorseal wsl-setup`: point the SecretSpec provider in this distro at
 /// the vault of the Windows installation in `windows_install`, or remove
 /// that configuration.
-pub(super) fn setup(windows_install: Option<&Path>, remove: bool) -> Result<(), CliError> {
+pub(super) fn setup(
+    windows_install: Option<&Path>,
+    windows_root: Option<&std::ffi::OsStr>,
+    remove: bool,
+) -> Result<(), CliError> {
     let path = config_path().ok_or_else(|| {
         CliError::WslSetup("the user configuration directory is unavailable".to_owned())
     })?;
@@ -97,6 +101,26 @@ pub(super) fn setup(windows_install: Option<&Path>, remove: bool) -> Result<(), 
         Some(install) => install.to_owned(),
         None => default_install()?,
     };
+    let config = windows_config(&install, windows_root, distro)?;
+    write_private(&path, &serde_json::to_vec_pretty(&config)?)?;
+    super::secretspec_discovery::publish_for_wsl()?;
+    println!("Wrote {}", path.display());
+    println!(
+        "SecretSpec in this distro now uses the Windows vault ({}) through {}",
+        config.pipe,
+        config.broker.display()
+    );
+    Ok(())
+}
+
+/// The configuration for the Windows installation in `install`: its broker,
+/// and the pipe of the vault at `windows_root` (the default vault if
+/// `None`), named after that vault's installation id.
+fn windows_config(
+    install: &Path,
+    windows_root: Option<&std::ffi::OsStr>,
+    distro: String,
+) -> Result<WslConfig, CliError> {
     let broker = install.join(BROKER);
     let cli = install.join(WINDOWS_CLI);
     for required in [&broker, &cli] {
@@ -107,21 +131,12 @@ pub(super) fn setup(windows_install: Option<&Path>, remove: bool) -> Result<(), 
             )));
         }
     }
-    let pipe = format!("{PIPE_PREFIX}{}", installation_id(&cli)?);
-    let config = WslConfig {
+    let pipe = format!("{PIPE_PREFIX}{}", installation_id(&cli, windows_root)?);
+    Ok(WslConfig {
         broker,
         pipe,
         distro,
-    };
-    write_private(&path, &serde_json::to_vec_pretty(&config)?)?;
-    super::secretspec_discovery::publish_for_wsl()?;
-    println!("Wrote {}", path.display());
-    println!(
-        "SecretSpec in this distro now uses the Windows vault ({}) through {}",
-        config.pipe,
-        config.broker.display()
-    );
-    Ok(())
+    })
 }
 
 /// `%LOCALAPPDATA%\Programs\FactorSeal`, where the Windows installation
@@ -171,14 +186,19 @@ fn windows_output(bytes: &[u8]) -> Option<String> {
         .map(|text| text.trim().to_owned())
 }
 
-/// The Windows vault's installation id, from `factorseal.exe status`, which
-/// reads it from the vault's metadata whether or not the vault is unsealed.
-fn installation_id(cli: &Path) -> Result<String, CliError> {
+/// The Windows vault's installation id, from `factorseal.exe [--root R]
+/// status`, which reads it from the vault's metadata whether or not the
+/// vault is unsealed.
+fn installation_id(cli: &Path, windows_root: Option<&std::ffi::OsStr>) -> Result<String, CliError> {
     #[derive(Deserialize)]
     struct Status {
         installation_id: String,
     }
-    let output = Command::new(cli)
+    let mut command = Command::new(cli);
+    if let Some(root) = windows_root {
+        command.arg("--root").arg(root);
+    }
+    let output = command
         .arg("status")
         .current_dir("/")
         .output()
@@ -311,6 +331,60 @@ mod tests {
             .flat_map(|unit| unit.to_le_bytes())
             .collect();
         assert_eq!(windows_output(&unpaired), None);
+    }
+
+    /// A Windows installation folder with a fake `factorseal.exe` that
+    /// records its arguments and reports `installation_id`, and an empty
+    /// broker.
+    fn fake_install(directory: &Path, installation_id: &str) -> PathBuf {
+        let install = directory.join("install");
+        fs::create_dir(&install).unwrap();
+        fs::write(install.join(BROKER), b"").unwrap();
+        let cli = install.join(WINDOWS_CLI);
+        fs::write(
+            &cli,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '{{\"installation_id\":\"{installation_id}\",\"state\":\"sealed\"}}'\n",
+                directory.join("args").display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).unwrap();
+        install
+    }
+
+    #[test]
+    fn wsl_setup_reads_the_pipe_from_the_windows_vault() {
+        let directory = tempfile::tempdir().unwrap();
+        let install = fake_install(directory.path(), "abc-1");
+        let args = || fs::read_to_string(directory.path().join("args")).unwrap();
+
+        let config = windows_config(&install, None, "NixOS".to_owned()).unwrap();
+        assert_eq!(config.pipe, r"\\.\pipe\factorseal-abc-1");
+        assert_eq!(config.broker, install.join(BROKER));
+        assert_eq!(config.distro, "NixOS");
+        assert_eq!(args(), "status\n");
+
+        // Another vault, such as the check vault, by its Windows root.
+        let root = r"C:\Users\x\AppData\Local\FactorSeal-check\vault";
+        let config = windows_config(
+            &install,
+            Some(std::ffi::OsStr::new(root)),
+            "NixOS".to_owned(),
+        )
+        .unwrap();
+        assert_eq!(config.pipe, r"\\.\pipe\factorseal-abc-1");
+        assert_eq!(args(), format!("--root\n{root}\nstatus\n"));
+
+        fs::remove_file(install.join(BROKER)).unwrap();
+        assert!(windows_config(&install, None, "NixOS".to_owned()).is_err());
+    }
+
+    #[test]
+    fn wsl_setup_refuses_an_installation_id_that_is_not_a_pipe_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let install = fake_install(directory.path(), "../x");
+        assert!(windows_config(&install, None, "NixOS".to_owned()).is_err());
     }
 
     #[test]

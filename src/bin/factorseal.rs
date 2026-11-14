@@ -313,8 +313,9 @@ fn run(cli: Cli) -> Result<(), CliError> {
         #[cfg(all(target_os = "linux", feature = "secretspec-provider"))]
         Command::WslSetup {
             windows_install,
+            windows_root,
             remove,
-        } => wsl::setup(windows_install.as_deref(), remove),
+        } => wsl::setup(windows_install.as_deref(), windows_root.as_deref(), remove),
     }
 }
 

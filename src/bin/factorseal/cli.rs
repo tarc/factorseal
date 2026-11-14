@@ -339,8 +339,12 @@ pub(super) enum Command {
         /// %LOCALAPPDATA%\Programs\FactorSeal.
         #[arg(long, value_name = "PATH")]
         windows_install: Option<std::path::PathBuf>,
+        /// Vault root on Windows, as `factorseal.exe --root` takes it, for a
+        /// vault other than the default one (such as a test vault).
+        #[arg(long, value_name = "WINDOWS_PATH")]
+        windows_root: Option<std::ffi::OsString>,
         /// Remove the configuration, so the provider uses a Linux vault again.
-        #[arg(long, conflicts_with = "windows_install")]
+        #[arg(long, conflicts_with_all = ["windows_install", "windows_root"])]
         remove: bool,
     },
 }

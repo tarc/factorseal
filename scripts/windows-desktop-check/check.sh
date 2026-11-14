@@ -32,7 +32,9 @@
 #   check.sh secretspec-wsl
 #       On the test vault, run the Linux `secretspec` in WSL against the
 #       Windows vault through the Linux provider and the broker's relay mode,
-#       as `factorseal wsl-setup` configures it: set a key and read it back
+#       configured by `factorseal wsl-setup --windows-root` in a scratch
+#       directory (the broker is copied beside the native CLI, since
+#       wsl-setup takes one install folder): set a key and read it back
 #       (granted "Until the vault seals" in the popup), read it again without
 #       a popup, ask again from another folder, read the same value from the
 #       native provider in the translated folder, and ask again after the
@@ -50,7 +52,7 @@ set -euo pipefail
 
 case ${1:-} in
     popup | grant | test-desktop | write-once | secretspec-wsl) ;;
-    *) sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+    *) sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
 
 repo=$(cd "$(dirname "$0")/../.." && pwd)
@@ -490,11 +492,17 @@ secretspec-wsl)
         printf '[project]\nname = "%s"\nrevision = "1.0"\n\n[profiles.default]\n%s = { description = "WSL check", required = false }\n' \
             "$project" "$key" >"$base/$folder/secretspec.toml"
     done
-    printf '{"broker":"%s","pipe":"%s","distro":"%s"}\n' "$broker" "${pipe//\\/\\\\}" "$distro" >"$base/wsl.json"
-    install -d -m 700 "$base/xdg/secretspec/providers.d"
-    printf '{"executable":"%s","environment":["FACTORSEAL_WSL_CONFIG","WSL_INTEROP","WSL_DISTRO_NAME"]}\n' \
-        "$linux_cli" >"$base/xdg/secretspec/providers.d/factorseal.secretspec.json"
-    chmod 600 "$base/xdg/secretspec/providers.d/factorseal.secretspec.json"
+    # Configure the provider as a person would, with `factorseal wsl-setup`,
+    # pointed at the test vault and at this scratch directory. It takes one
+    # Windows install folder, so put the broker beside the native CLI.
+    install_dir=$(dirname "$cli")
+    cmp -s "$broker" "$install_dir/factorseal-wsl-broker.exe" || cp "$broker" "$install_dir/factorseal-wsl-broker.exe"
+    setup=$(XDG_CONFIG_HOME="$base/xdg" FACTORSEAL_WSL_CONFIG="$base/wsl.json" \
+        "$linux_cli" wsl-setup --windows-install "$install_dir" --windows-root "$test_root" 2>&1) ||
+        die "factorseal wsl-setup failed: $setup"
+    grep -qF "\"pipe\": \"${pipe//\\/\\\\}\"" "$base/wsl.json" ||
+        die "wsl-setup did not configure the test vault's pipe $pipe: $(cat "$base/wsl.json")"
+    echo "wsl-setup:     ${setup//$'\n'/ | }"
     secretspec_in() {
         local folder=$1
         shift
