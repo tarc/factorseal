@@ -14,7 +14,10 @@
 
 use std::io::{self, Read, Write};
 
-use super::wire::{MAX_MESSAGE_BYTES, VaultAction};
+use super::wire::{
+    MAX_MESSAGE_BYTES, RequestId, VaultAction, VaultClient, VaultRequest, VaultResponse,
+    VaultResponseError, VaultResponseErrorCode,
+};
 use crate::vault::{VaultError, VaultResult};
 
 /// Largest frame either side accepts: the vault's own message bound.
@@ -75,6 +78,102 @@ pub const fn relay_allows(action: &VaultAction) -> bool {
             | VaultAction::GetCache { .. }
             | VaultAction::PutCache { .. }
             | VaultAction::DeleteCache { .. }
+    )
+}
+
+/// Serve one Linux client in the broker: answer each request frame read
+/// from `input` with one response frame on `output`, until the input ends.
+///
+/// Each request is decoded with [`VaultRequest::decode_relayed_from_wsl`]
+/// and sent to `client` only if [`relay_allows`] its action; anything else
+/// is refused here with the request's own id. When the vault is sealed or
+/// unreachable, the client gets `Sealed`, and `on_sealed` (which brings
+/// Desktop forward) runs the first time only.
+pub fn serve(
+    client: &dyn VaultClient,
+    distro: &str,
+    input: &mut impl Read,
+    output: &mut impl Write,
+    on_sealed: impl FnOnce(),
+) -> VaultResult<()> {
+    validate_distro(distro)?;
+    let mut on_sealed = Some(on_sealed);
+    while let Some(frame) = read_frame(input)
+        .map_err(|error| VaultError::Protocol(format!("reading a request: {error}")))?
+    {
+        let (response, sealed) = relay_one(client, distro, &frame);
+        if sealed && let Some(on_sealed) = on_sealed.take() {
+            on_sealed();
+        }
+        let bytes = response.encode()?;
+        write_frame(output, bytes.as_ref())
+            .map_err(|error| VaultError::Protocol(format!("writing a response: {error}")))?;
+    }
+    Ok(())
+}
+
+/// The response to one relayed frame, and whether the vault was sealed or
+/// unreachable.
+fn relay_one(client: &dyn VaultClient, distro: &str, frame: &[u8]) -> (VaultResponse, bool) {
+    let id =
+        VaultRequest::encoded_request_id(frame).unwrap_or_else(|| RequestId::from_bytes([0; 16]));
+    let request = match VaultRequest::decode_relayed_from_wsl(frame, distro) {
+        Ok(request) => request,
+        Err(error) => {
+            return (
+                refusal(
+                    id,
+                    VaultResponseErrorCode::InvalidRequest,
+                    error.to_string(),
+                ),
+                false,
+            );
+        }
+    };
+    if !relay_allows(&request.action) {
+        return (
+            refusal(
+                id,
+                VaultResponseErrorCode::AuthorizationRequired,
+                "the WSL broker does not relay this request".to_owned(),
+            ),
+            false,
+        );
+    }
+    match client.request(&request) {
+        Ok(response) => {
+            let sealed = matches!(
+                &response.result,
+                Err(VaultResponseError {
+                    code: VaultResponseErrorCode::Sealed,
+                    ..
+                })
+            );
+            (response, sealed)
+        }
+        Err(VaultError::Sealed | VaultError::AgentUnreachable(_)) => (
+            refusal(
+                id,
+                VaultResponseErrorCode::Sealed,
+                "unlock FactorSeal Desktop on Windows, then try again".to_owned(),
+            ),
+            true,
+        ),
+        Err(error) => (
+            refusal(id, VaultResponseErrorCode::Internal, error.to_string()),
+            false,
+        ),
+    }
+}
+
+fn refusal(id: RequestId, code: VaultResponseErrorCode, message: String) -> VaultResponse {
+    VaultResponse::failure(
+        id,
+        VaultResponseError {
+            code,
+            message,
+            interaction: None,
+        },
     )
 }
 
@@ -426,6 +525,151 @@ mod tests {
         }
         assert!(
             BrokerVaultClient::new("x".into(), "pipe".to_owned(), "bad/name".to_owned()).is_err()
+        );
+    }
+
+    /// A vault for [`serve`]: records what reaches it and answers each
+    /// request with the next of `answers` (a sealed vault by default).
+    struct RecordingVault {
+        seen: std::sync::Mutex<Vec<(String, Option<String>)>>,
+        answers: std::sync::Mutex<Vec<VaultResult<VaultResponseErrorCode>>>,
+    }
+
+    impl VaultClient for RecordingVault {
+        fn request(&self, request: &VaultRequest) -> VaultResult<VaultResponse> {
+            self.seen.lock().unwrap().push((
+                format!("{:?}", std::mem::discriminant(&request.action)),
+                request
+                    .application()
+                    .and_then(|application| application.declared_wsl_origin.clone()),
+            ));
+            let answer = self
+                .answers
+                .lock()
+                .unwrap()
+                .pop()
+                .unwrap_or(Ok(VaultResponseErrorCode::Sealed));
+            Ok(refusal(request.request_id(), answer?, "test".to_owned()))
+        }
+    }
+
+    /// Relay `requests` through [`serve`], returning the responses and how
+    /// often `on_sealed` ran.
+    fn served(vault: &RecordingVault, requests: &[Vec<u8>]) -> (Vec<VaultResponse>, usize) {
+        let mut input = Vec::new();
+        for request in requests {
+            write_frame(&mut input, request).unwrap();
+        }
+        let mut output = Vec::new();
+        let mut opened = 0;
+        serve(vault, "NixOS", &mut input.as_slice(), &mut output, || {
+            opened += 1;
+        })
+        .unwrap();
+        let mut reader = output.as_slice();
+        let mut responses = Vec::new();
+        while let Some(frame) = read_frame(&mut reader).unwrap() {
+            responses.push(VaultResponse::decode(&frame).unwrap());
+        }
+        (responses, opened)
+    }
+
+    fn encoded(action: VaultAction) -> (RequestId, Vec<u8>) {
+        use super::super::wire::VaultApplicationContext;
+        // No folder: a Linux path's Windows form is not absolute on Linux.
+        let request = VaultRequest::new_with_application(
+            action,
+            VaultApplicationContext::new(Some("carimbo".to_owned()), None, None, None).unwrap(),
+        )
+        .unwrap();
+        (
+            request.request_id(),
+            request.encode().unwrap().as_ref().to_vec(),
+        )
+    }
+
+    fn get_cache() -> VaultAction {
+        VaultAction::GetCache {
+            project: "carimbo".to_owned(),
+            address: crate::vault::SecretSpecAddress::convention("carimbo", "default", "KEY")
+                .unwrap(),
+        }
+    }
+
+    fn code(response: &VaultResponse) -> Option<VaultResponseErrorCode> {
+        response.result.as_ref().err().map(|error| error.code)
+    }
+
+    #[test]
+    fn the_relay_refuses_other_actions_before_they_reach_the_vault() {
+        let vault = RecordingVault {
+            seen: std::sync::Mutex::new(Vec::new()),
+            answers: std::sync::Mutex::new(vec![Ok(VaultResponseErrorCode::Conflict)]),
+        };
+        let (list_id, list) = encoded(VaultAction::ListPermissions);
+        let (get_id, get) = encoded(get_cache());
+        let (responses, opened) = served(&vault, &[list, b"not json".to_vec(), get]);
+        assert_eq!(opened, 0);
+        assert_eq!(responses.len(), 3);
+        assert_eq!(responses[0].request_id(), list_id);
+        assert_eq!(
+            code(&responses[0]),
+            Some(VaultResponseErrorCode::AuthorizationRequired)
+        );
+        assert_eq!(responses[1].request_id(), RequestId::from_bytes([0; 16]));
+        assert_eq!(
+            code(&responses[1]),
+            Some(VaultResponseErrorCode::InvalidRequest)
+        );
+        // Only the cache read reaches the vault, tagged with the broker's distro.
+        assert_eq!(responses[2].request_id(), get_id);
+        assert_eq!(code(&responses[2]), Some(VaultResponseErrorCode::Conflict));
+        let seen = vault.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].0,
+            format!("{:?}", std::mem::discriminant(&get_cache()))
+        );
+        assert_eq!(seen[0].1.as_deref(), Some("NixOS"));
+    }
+
+    #[test]
+    fn the_relay_brings_desktop_forward_once_when_the_vault_is_sealed() {
+        // Answers pop from the end: sealed, unreachable, a client error, sealed.
+        let vault = RecordingVault {
+            seen: std::sync::Mutex::new(Vec::new()),
+            answers: std::sync::Mutex::new(vec![
+                Ok(VaultResponseErrorCode::Sealed),
+                Err(VaultError::Crypto),
+                Err(VaultError::AgentUnreachable("pipe".to_owned())),
+                Ok(VaultResponseErrorCode::Sealed),
+            ]),
+        };
+        let requests: Vec<_> = (0..4).map(|_| encoded(VaultAction::Status)).collect();
+        let frames: Vec<_> = requests.iter().map(|(_, frame)| frame.clone()).collect();
+        let (responses, opened) = served(&vault, &frames);
+        assert_eq!(opened, 1);
+        for ((id, _), response) in requests.iter().zip(&responses) {
+            assert_eq!(response.request_id(), *id);
+        }
+        assert_eq!(
+            responses.iter().map(code).collect::<Vec<_>>(),
+            [
+                Some(VaultResponseErrorCode::Sealed),
+                Some(VaultResponseErrorCode::Sealed),
+                Some(VaultResponseErrorCode::Internal),
+                Some(VaultResponseErrorCode::Sealed),
+            ]
+        );
+        assert!(
+            serve(
+                &vault,
+                "bad/name",
+                &mut [].as_slice(),
+                &mut Vec::new(),
+                || {}
+            )
+            .is_err()
         );
     }
 

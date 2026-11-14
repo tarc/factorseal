@@ -35,13 +35,10 @@ fn main() {
 
 #[cfg(windows)]
 mod windows_impl {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
     use factorseal::vault::{
-        MAX_PERMISSION_WAIT_MS, PermissionWaitStatus, RequestId, SecretSpecAddress, VaultAction,
-        VaultApplicationContext, VaultClient, VaultError, VaultRequest, VaultResponse,
-        VaultResponseBody, VaultResponseError, VaultResponseErrorCode, WindowsVaultClient,
-        wsl_relay,
+        MAX_PERMISSION_WAIT_MS, PermissionWaitStatus, SecretSpecAddress, VaultAction,
+        VaultApplicationContext, VaultClient, VaultRequest, VaultResponseBody, VaultResponseError,
+        WindowsVaultClient, wsl_relay,
     };
 
     const USAGE: &str = "usage: factorseal-wsl-broker <pipe-name> <distro> status | get <project> <profile> <key> | relay";
@@ -179,82 +176,17 @@ mod windows_impl {
 
     /// Serve one Linux client: each frame on standard input is a request,
     /// answered by one frame on standard output, until the input ends.
+    /// `wsl_relay::serve` enforces the allowlist; Desktop is brought forward
+    /// the first time the vault is sealed or unreachable.
     fn relay(client: &WindowsVaultClient, distro: &str) -> Result<(), String> {
-        wsl_relay::validate_distro(distro).map_err(|error| error.to_string())?;
-        let mut input = std::io::stdin().lock();
-        let mut output = std::io::stdout().lock();
-        let opened_desktop = AtomicBool::new(false);
-        while let Some(frame) = wsl_relay::read_frame(&mut input)
-            .map_err(|error| format!("reading a request: {error}"))?
-        {
-            let response = relay_one(client, distro, &frame, &opened_desktop);
-            let bytes = response.encode().map_err(|error| error.to_string())?;
-            wsl_relay::write_frame(&mut output, bytes.as_ref())
-                .map_err(|error| format!("writing a response: {error}"))?;
-        }
-        Ok(())
-    }
-
-    fn relay_one(
-        client: &WindowsVaultClient,
-        distro: &str,
-        frame: &[u8],
-        opened_desktop: &AtomicBool,
-    ) -> VaultResponse {
-        let id = VaultRequest::encoded_request_id(frame)
-            .unwrap_or_else(|| RequestId::from_bytes([0; 16]));
-        let request = match VaultRequest::decode_relayed_from_wsl(frame, distro) {
-            Ok(request) => request,
-            Err(error) => {
-                return refusal(
-                    id,
-                    VaultResponseErrorCode::InvalidRequest,
-                    error.to_string(),
-                );
-            }
-        };
-        if !wsl_relay::relay_allows(&request.action) {
-            return refusal(
-                id,
-                VaultResponseErrorCode::AuthorizationRequired,
-                "the WSL broker does not relay this request".to_owned(),
-            );
-        }
-        let response = client.request(&request);
-        let sealed = match &response {
-            Ok(response) => matches!(
-                &response.result,
-                Err(VaultResponseError {
-                    code: VaultResponseErrorCode::Sealed,
-                    ..
-                })
-            ),
-            Err(VaultError::Sealed | VaultError::AgentUnreachable(_)) => true,
-            Err(_) => false,
-        };
-        if sealed && !opened_desktop.swap(true, Ordering::Relaxed) {
-            open_desktop();
-        }
-        match response {
-            Ok(response) => response,
-            Err(VaultError::Sealed | VaultError::AgentUnreachable(_)) => refusal(
-                id,
-                VaultResponseErrorCode::Sealed,
-                "unlock FactorSeal Desktop on Windows, then try again".to_owned(),
-            ),
-            Err(error) => refusal(id, VaultResponseErrorCode::Internal, error.to_string()),
-        }
-    }
-
-    fn refusal(id: RequestId, code: VaultResponseErrorCode, message: String) -> VaultResponse {
-        VaultResponse::failure(
-            id,
-            VaultResponseError {
-                code,
-                message,
-                interaction: None,
-            },
+        wsl_relay::serve(
+            client,
+            distro,
+            &mut std::io::stdin().lock(),
+            &mut std::io::stdout().lock(),
+            open_desktop,
         )
+        .map_err(|error| error.to_string())
     }
 
     /// Bring FactorSeal Desktop forward so the person can unlock: starting
