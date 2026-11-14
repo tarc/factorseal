@@ -508,6 +508,78 @@ mod tests {
         script
     }
 
+    /// A stand-in broker that counts its runs in `runs`. On its first run it
+    /// misbehaves: `exit` reads the frame and exits without answering;
+    /// `other-id` answers with the all-zero id. Later runs answer properly.
+    #[cfg(target_os = "linux")]
+    fn misbehaving_broker(directory: &std::path::Path, mode: &str) -> std::path::PathBuf {
+        use super::super::wire::{VaultResponse, VaultResponseBody};
+        use std::os::unix::fs::PermissionsExt as _;
+        let template =
+            VaultResponse::success(RequestId::from_bytes([0; 16]), VaultResponseBody::Stored)
+                .encode()
+                .unwrap();
+        std::fs::write(directory.join("template.json"), template.as_ref()).unwrap();
+        let script = directory.join("broker");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/usr/bin/env python3\nimport json, os, struct, sys\n\
+                 runs = os.path.join('{dir}', 'runs')\n\
+                 count = int(open(runs).read()) + 1 if os.path.exists(runs) else 1\n\
+                 open(runs, 'w').write(str(count))\n\
+                 head = sys.stdin.buffer.read(4)\n\
+                 request = json.loads(sys.stdin.buffer.read(struct.unpack('<I', head)[0]))\n\
+                 if count == 1 and '{mode}' == 'exit':\n    sys.exit(0)\n\
+                 response = json.load(open(os.path.join('{dir}', 'template.json')))\n\
+                 if count > 1 or '{mode}' != 'other-id':\n    response['request_id'] = request['request_id']\n\
+                 body = json.dumps(response).encode()\n\
+                 sys.stdout.buffer.write(struct.pack('<I', len(body)) + body)\n\
+                 sys.stdout.buffer.flush()\n",
+                dir = directory.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        script
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_broker_client_resends_once_and_refuses_another_requests_answer() {
+        use super::super::wire::{VaultClient as _, VaultResponseBody};
+        let runs =
+            |directory: &std::path::Path| std::fs::read_to_string(directory.join("runs")).unwrap();
+        // A broker that dies after reading the frame: the replacement gets
+        // the same request.
+        let directory = tempfile::tempdir().unwrap();
+        let broker = misbehaving_broker(directory.path(), "exit");
+        let client = BrokerVaultClient::new(broker, "pipe".to_owned(), "NixOS".to_owned()).unwrap();
+        let request = VaultRequest::new(VaultAction::Status).unwrap();
+        let response = client.request(&request).unwrap();
+        assert_eq!(response.request_id(), request.request_id());
+        assert!(matches!(response.result, Ok(VaultResponseBody::Stored)));
+        assert_eq!(runs(directory.path()), "2");
+
+        // An answer to another request is an error, and the broker that
+        // gave it is not used again.
+        let directory = tempfile::tempdir().unwrap();
+        let broker = misbehaving_broker(directory.path(), "other-id");
+        let client = BrokerVaultClient::new(broker, "pipe".to_owned(), "NixOS".to_owned()).unwrap();
+        let error = client
+            .request(&VaultRequest::new(VaultAction::Status).unwrap())
+            .unwrap_err();
+        assert!(error.to_string().contains("another request"), "{error}");
+        assert_eq!(runs(directory.path()), "1");
+        assert!(client.relay.lock().unwrap().is_none());
+        let request = VaultRequest::new(VaultAction::Status).unwrap();
+        assert_eq!(
+            client.request(&request).unwrap().request_id(),
+            request.request_id()
+        );
+        assert_eq!(runs(directory.path()), "2");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn the_broker_client_round_trips_and_replaces_an_exited_broker() {
