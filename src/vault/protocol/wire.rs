@@ -511,6 +511,51 @@ impl VaultRequest {
         })
     }
 
+    /// Decode a request a Linux client sent through the WSL broker, as the
+    /// broker forwards it: tagged with `distro`, whatever the client said,
+    /// and with its folder in the Windows form
+    /// ([`super::wsl::windows_folder`]), because a Linux path is not absolute
+    /// on Windows and would fail validation. Then validated like any decoded
+    /// request.
+    pub fn decode_relayed_from_wsl(bytes: &[u8], distro: &str) -> VaultResult<Self> {
+        Self::decode_relayed_inner(bytes, distro).inspect_err(|_| {
+            crate::security::events::record(crate::security::events::Kind::MalformedRequest);
+        })
+    }
+
+    fn decode_relayed_inner(bytes: &[u8], distro: &str) -> VaultResult<Self> {
+        if bytes.len() > MAX_MESSAGE_BYTES {
+            return Err(VaultError::Protocol("request is too large".to_owned()));
+        }
+        let mut request: Self = serde_json::from_slice(bytes)
+            .map_err(|error| VaultError::Protocol(error.to_string()))?;
+        super::wsl::validate_distro(distro)?;
+        let mut application = match request.application.take() {
+            Some(application) => application,
+            None => VaultApplicationContext::new(None, None, None, None)?,
+        };
+        if let Some(folder) = application.base_dir.take() {
+            application.base_dir = Some(super::wsl::windows_folder(distro, &folder)?);
+        }
+        application.declared_wsl_origin = Some(distro.to_owned());
+        request.application = Some(application);
+        request.validate_fields()?;
+        Ok(request)
+    }
+
+    /// The id of an encoded request, read without validating the rest, so a
+    /// refusal can answer the request it refuses.
+    #[must_use]
+    pub fn encoded_request_id(bytes: &[u8]) -> Option<RequestId> {
+        #[derive(Deserialize)]
+        struct Identified {
+            request_id: RequestId,
+        }
+        serde_json::from_slice::<Identified>(bytes)
+            .ok()
+            .map(|identified| identified.request_id)
+    }
+
     fn decode_inner(bytes: &[u8]) -> VaultResult<Self> {
         if bytes.len() > MAX_MESSAGE_BYTES {
             return Err(VaultError::Protocol("request is too large".to_owned()));

@@ -114,6 +114,8 @@ pub(crate) use keys::WrappedKey;
 pub(crate) use keys::{InstallationSecrets, WrappedInstallationSecrets};
 #[cfg(feature = "key-protection")]
 pub use protection::{HardwareBackend, KeyProtector, KeyProtectorFactory};
+/// Relaying vault requests from WSL2 through the Windows broker.
+pub use protocol::wsl as wsl_relay;
 pub use protocol::{
     CallerIdentity, CallerPlatform, MAX_HISTORY_PAGE_SIZE, MAX_LIST_PAGE_SIZE,
     MAX_PERMISSION_WAIT_MS, MAX_WSL_GRANT_SECONDS, Permission, PermissionChange,

@@ -5,6 +5,7 @@ mod lease;
 #[cfg(feature = "vault-store")]
 mod service;
 mod wire;
+pub mod wsl;
 
 #[cfg(feature = "vault-store")]
 pub use grant::GrantPermission;

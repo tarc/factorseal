@@ -1,0 +1,445 @@
+//! Relaying vault requests from WSL2 through `factorseal-wsl-broker.exe`.
+//!
+//! A Linux client in WSL (the SecretSpec provider) writes each encoded
+//! [`VaultRequest`] to the broker's standard input and reads the encoded
+//! [`VaultResponse`] from its standard output. Each message is a frame: a
+//! four-byte little-endian length, then that many bytes.
+//!
+//! The broker decodes a request with [`VaultRequest::decode_relayed_from_wsl`],
+//! which tags it with the distro and rewrites its folder into a Windows path,
+//! forwards it only if [`relay_allows`] its action, and answers anything else
+//! itself, so a WSL process cannot raise approval prompts for arbitrary
+//! requests. Everything here is caller-declared context: the vault still
+//! authenticates only the broker.
+
+use std::io::{self, Read, Write};
+
+use super::wire::{MAX_MESSAGE_BYTES, VaultAction};
+use crate::vault::{VaultError, VaultResult};
+
+/// Largest frame either side accepts: the vault's own message bound.
+pub const MAX_RELAY_FRAME_BYTES: usize = MAX_MESSAGE_BYTES;
+
+/// Longest distro name accepted. WSL itself allows 64 characters or fewer.
+const MAX_DISTRO_BYTES: usize = 64;
+
+/// Read one frame. Returns `None` when the stream ends before a frame
+/// starts, which is how the client says it is done.
+pub fn read_frame(reader: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
+    let mut length = [0_u8; 4];
+    let mut filled = 0;
+    while filled < length.len() {
+        match reader.read(&mut length[filled..])? {
+            0 if filled == 0 => return Ok(None),
+            0 => return Err(io::ErrorKind::UnexpectedEof.into()),
+            read => filled += read,
+        }
+    }
+    let length = usize::try_from(u32::from_le_bytes(length))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "frame is too large"))?;
+    if length > MAX_RELAY_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame is too large",
+        ));
+    }
+    let mut bytes = vec![0; length];
+    reader.read_exact(&mut bytes)?;
+    Ok(Some(bytes))
+}
+
+/// Write one frame and flush it.
+pub fn write_frame(writer: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
+    if bytes.len() > MAX_RELAY_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "frame is too large",
+        ));
+    }
+    let length = u32::try_from(bytes.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "frame is too large"))?;
+    writer.write_all(&length.to_le_bytes())?;
+    writer.write_all(bytes)?;
+    writer.flush()
+}
+
+/// Whether the broker forwards a request with this action to the vault:
+/// exactly what the SecretSpec provider sends from WSL. Everything else is
+/// answered by the broker, so it never raises an approval prompt.
+#[must_use]
+pub const fn relay_allows(action: &VaultAction) -> bool {
+    matches!(
+        action,
+        VaultAction::Status
+            | VaultAction::WaitPermission { .. }
+            | VaultAction::GetCache { .. }
+            | VaultAction::PutCache { .. }
+            | VaultAction::DeleteCache { .. }
+    )
+}
+
+/// Check a caller-declared distro name before it goes into a path and an
+/// approval prompt: what WSL itself allows in a name, letters, digits, `.`,
+/// `-` and `_`.
+pub fn validate_distro(distro: &str) -> VaultResult<()> {
+    let valid = !distro.is_empty()
+        && distro.len() <= MAX_DISTRO_BYTES
+        && distro != "."
+        && distro != ".."
+        && distro
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'));
+    if valid {
+        Ok(())
+    } else {
+        Err(VaultError::Protocol(
+            "the WSL distro name is not valid".to_owned(),
+        ))
+    }
+}
+
+/// The Windows form of an absolute Linux folder inside `distro`, as Windows
+/// programs reach it: a folder of a mounted drive (`/mnt/c/...`) is that
+/// drive's folder (`C:\...`), and any other folder is under the distro's
+/// network share (`\\wsl.localhost\<distro>\...`).
+///
+/// The vault requires an absolute folder, and Windows does not consider a
+/// Linux path absolute, so a relayed request cannot keep the Linux form.
+/// Refuses relative paths, `.` or `..` components, and backslashes or NULs,
+/// which would make the Windows form ambiguous.
+pub fn windows_folder(distro: &str, folder: &str) -> VaultResult<String> {
+    validate_distro(distro)?;
+    let invalid = || {
+        VaultError::Protocol("a folder relayed from WSL must be an absolute Linux path".to_owned())
+    };
+    let rest = folder.strip_prefix('/').ok_or_else(invalid)?;
+    if folder.contains(['\\', '\0']) {
+        return Err(invalid());
+    }
+    let components: Vec<&str> = rest.split('/').filter(|part| !part.is_empty()).collect();
+    if components.iter().any(|part| matches!(*part, "." | "..")) {
+        return Err(invalid());
+    }
+    if let ["mnt", drive, tail @ ..] = components.as_slice()
+        && let [letter] = drive.as_bytes()
+        && letter.is_ascii_alphabetic()
+    {
+        let mut path = format!("{}:\\", char::from(letter.to_ascii_uppercase()));
+        path.push_str(&tail.join("\\"));
+        return Ok(path);
+    }
+    let mut path = format!("\\\\wsl.localhost\\{distro}\\");
+    path.push_str(&components.join("\\"));
+    Ok(path)
+}
+
+/// A [`VaultClient`](super::wire::VaultClient) for Linux programs in WSL2
+/// that reaches the Windows vault through `factorseal-wsl-broker.exe` in
+/// relay mode. The broker starts on the first request and serves every later
+/// one; if it exits, the next request starts a new one.
+#[cfg(target_os = "linux")]
+pub struct BrokerVaultClient {
+    broker: std::path::PathBuf,
+    pipe: String,
+    distro: String,
+    relay: std::sync::Mutex<Option<Relay>>,
+}
+
+#[cfg(target_os = "linux")]
+struct Relay {
+    child: std::process::Child,
+    input: std::process::ChildStdin,
+    output: std::io::BufReader<std::process::ChildStdout>,
+}
+
+#[cfg(target_os = "linux")]
+impl Relay {
+    fn exchange(&mut self, request: &[u8]) -> io::Result<Vec<u8>> {
+        write_frame(&mut self.input, request)?;
+        read_frame(&mut self.output)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "the broker exited"))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Relay {
+    fn drop(&mut self) {
+        // Closing the broker's input ends its loop; reap it so it does not
+        // linger as a zombie, and stop it if it does not exit.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl BrokerVaultClient {
+    /// `broker` is the Windows path of `factorseal-wsl-broker.exe` as seen
+    /// from WSL (`/mnt/c/...`), `pipe` the vault's named pipe and `distro`
+    /// the name this WSL distro declares.
+    pub fn new(broker: std::path::PathBuf, pipe: String, distro: String) -> VaultResult<Self> {
+        validate_distro(&distro)?;
+        Ok(Self {
+            broker,
+            pipe,
+            distro,
+            relay: std::sync::Mutex::new(None),
+        })
+    }
+
+    fn start(&self) -> VaultResult<Relay> {
+        use std::process::{Command, Stdio};
+        let mut child = Command::new(&self.broker)
+            .args([self.pipe.as_str(), self.distro.as_str(), "relay"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|error| {
+                VaultError::Protocol(format!(
+                    "could not start the WSL broker {}: {error}",
+                    self.broker.display()
+                ))
+            })?;
+        let (Some(input), Some(output)) = (child.stdin.take(), child.stdout.take()) else {
+            let _ = child.kill();
+            return Err(VaultError::WorkerUnavailable);
+        };
+        Ok(Relay {
+            child,
+            input,
+            output: std::io::BufReader::new(output),
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl super::wire::VaultClient for BrokerVaultClient {
+    fn request(
+        &self,
+        request: &super::wire::VaultRequest,
+    ) -> VaultResult<super::wire::VaultResponse> {
+        let bytes = request.encode()?;
+        let mut relay = self
+            .relay
+            .lock()
+            .map_err(|_| VaultError::WorkerUnavailable)?;
+        // A broker that exited since the last request gets one replacement.
+        // Resending is safe: the vault refuses a request id it already saw.
+        let mut last_error = None;
+        for _ in 0..2 {
+            let current = match relay.as_mut() {
+                Some(current) => current,
+                None => relay.insert(self.start()?),
+            };
+            match current.exchange(bytes.as_ref()) {
+                Ok(reply) => {
+                    let response = super::wire::VaultResponse::decode(&reply)?;
+                    if response.request_id() != request.request_id() {
+                        *relay = None;
+                        return Err(VaultError::Protocol(
+                            "the WSL broker answered another request".to_owned(),
+                        ));
+                    }
+                    return Ok(response);
+                }
+                Err(error) => {
+                    *relay = None;
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(VaultError::Protocol(format!(
+            "the WSL broker stopped: {}",
+            last_error.map_or_else(String::new, |error| error.to_string())
+        )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folders_map_to_what_windows_programs_see() {
+        for (folder, expected) in [
+            (
+                "/home/tarci/projects/carimbo",
+                r"\\wsl.localhost\NixOS\home\tarci\projects\carimbo",
+            ),
+            ("/", r"\\wsl.localhost\NixOS\"),
+            ("/mnt/c/Users/tarci/x", r"C:\Users\tarci\x"),
+            ("/mnt/d", r"D:\"),
+            ("/mnt/wsl/shared", r"\\wsl.localhost\NixOS\mnt\wsl\shared"),
+            ("/home//tarci/", r"\\wsl.localhost\NixOS\home\tarci"),
+        ] {
+            assert_eq!(
+                windows_folder("NixOS", folder).unwrap(),
+                expected,
+                "{folder}"
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_folders_are_refused() {
+        for folder in [
+            "relative/dir",
+            "",
+            "/home/../etc",
+            "/home/./x",
+            "/home/a\\b",
+            "/home/a\0b",
+        ] {
+            assert!(windows_folder("NixOS", folder).is_err(), "{folder:?}");
+        }
+    }
+
+    #[test]
+    fn distro_names_must_be_plain() {
+        for distro in ["NixOS", "Ubuntu-24.04", "my_distro"] {
+            assert!(validate_distro(distro).is_ok(), "{distro}");
+        }
+        for distro in ["", ".", "..", "a\\b", "a/b", "a b", &"x".repeat(65)] {
+            assert!(validate_distro(distro).is_err(), "{distro:?}");
+        }
+    }
+
+    #[test]
+    fn frames_round_trip_and_refuse_oversized_lengths() {
+        let mut stream = Vec::new();
+        write_frame(&mut stream, b"first").unwrap();
+        write_frame(&mut stream, b"").unwrap();
+        let mut reader = stream.as_slice();
+        assert_eq!(read_frame(&mut reader).unwrap().unwrap(), b"first");
+        assert_eq!(read_frame(&mut reader).unwrap().unwrap(), b"");
+        assert!(read_frame(&mut reader).unwrap().is_none());
+
+        let oversized = u32::try_from(MAX_RELAY_FRAME_BYTES + 1).unwrap();
+        let mut reader: &[u8] = &oversized.to_le_bytes();
+        assert!(read_frame(&mut reader).is_err());
+        let mut truncated: &[u8] = &[5, 0];
+        assert!(read_frame(&mut truncated).is_err());
+    }
+
+    /// An encoded `GetCache` request as the Linux provider sends it, with
+    /// `fields` set in its application context. Built as JSON because a
+    /// Linux folder is not a valid context on Windows.
+    fn linux_request(fields: &[(&str, &str)]) -> Vec<u8> {
+        use super::super::wire::{VaultApplicationContext, VaultRequest};
+        let request = VaultRequest::new_with_application(
+            VaultAction::GetCache {
+                project: "carimbo".to_owned(),
+                address: crate::SecretSpecAddress::convention("carimbo", "default", "KEY").unwrap(),
+            },
+            VaultApplicationContext::new(Some("carimbo".to_owned()), None, None, None).unwrap(),
+        )
+        .unwrap();
+        let mut json: serde_json::Value =
+            serde_json::from_slice(request.encode().unwrap().as_ref()).unwrap();
+        for (name, value) in fields {
+            json["application"][*name] = serde_json::Value::from(*value);
+        }
+        serde_json::to_vec(&json).unwrap()
+    }
+
+    #[test]
+    fn relayed_requests_keep_their_id_and_refuse_bad_context() {
+        use super::super::wire::VaultRequest;
+        let bytes = linux_request(&[("base_dir", "relative")]);
+        assert!(VaultRequest::encoded_request_id(&bytes).is_some());
+        assert!(VaultRequest::decode_relayed_from_wsl(&bytes, "NixOS").is_err());
+        let bytes = linux_request(&[("base_dir", "/home/tarci")]);
+        assert!(VaultRequest::decode_relayed_from_wsl(&bytes, "bad/name").is_err());
+        assert!(VaultRequest::encoded_request_id(b"not json").is_none());
+    }
+
+    /// The broker's own view: the folder becomes the Windows form and the
+    /// distro is the broker's, whatever the client declared.
+    #[cfg(windows)]
+    #[test]
+    fn relayed_requests_carry_the_windows_folder_and_the_brokers_distro() {
+        use super::super::wire::VaultRequest;
+        let bytes = linux_request(&[
+            ("base_dir", "/home/tarci/projects/carimbo"),
+            ("declared_wsl_origin", "SomethingElse"),
+        ]);
+        let request = VaultRequest::decode_relayed_from_wsl(&bytes, "NixOS").unwrap();
+        let application = request.application().unwrap();
+        assert_eq!(
+            application.base_dir.as_deref(),
+            Some(r"\\wsl.localhost\NixOS\home\tarci\projects\carimbo")
+        );
+        assert_eq!(application.declared_wsl_origin.as_deref(), Some("NixOS"));
+        assert_eq!(
+            Some(request.request_id()),
+            VaultRequest::encoded_request_id(&bytes)
+        );
+    }
+
+    /// A stand-in for the Windows broker: answers one frame with `template`
+    /// carrying the request's id, then exits, so the client must start a
+    /// new broker for its next request.
+    #[cfg(target_os = "linux")]
+    fn fake_broker(directory: &std::path::Path, template: &[u8]) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let template_path = directory.join("template.json");
+        std::fs::write(&template_path, template).unwrap();
+        let script = directory.join("broker");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/usr/bin/env python3\nimport json, struct, sys\n\
+                 assert sys.argv[1:] == ['pipe', 'NixOS', 'relay'], sys.argv\n\
+                 head = sys.stdin.buffer.read(4)\n\
+                 request = json.loads(sys.stdin.buffer.read(struct.unpack('<I', head)[0]))\n\
+                 response = json.load(open('{}'))\n\
+                 response['request_id'] = request['request_id']\n\
+                 body = json.dumps(response).encode()\n\
+                 sys.stdout.buffer.write(struct.pack('<I', len(body)) + body)\n\
+                 sys.stdout.buffer.flush()\n",
+                template_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        script
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_broker_client_round_trips_and_replaces_an_exited_broker() {
+        use super::super::wire::{
+            RequestId, VaultClient as _, VaultRequest, VaultResponse, VaultResponseBody,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let template =
+            VaultResponse::success(RequestId::from_bytes([0; 16]), VaultResponseBody::Stored)
+                .encode()
+                .unwrap();
+        let broker = fake_broker(directory.path(), template.as_ref());
+        let client = BrokerVaultClient::new(broker, "pipe".to_owned(), "NixOS".to_owned()).unwrap();
+        for _ in 0..2 {
+            let request = VaultRequest::new(VaultAction::Status).unwrap();
+            let response = client.request(&request).unwrap();
+            assert_eq!(response.request_id(), request.request_id());
+            assert!(matches!(response.result, Ok(VaultResponseBody::Stored)));
+        }
+        assert!(
+            BrokerVaultClient::new("x".into(), "pipe".to_owned(), "bad/name".to_owned()).is_err()
+        );
+    }
+
+    #[test]
+    fn only_the_providers_actions_are_relayed() {
+        assert!(relay_allows(&VaultAction::Status));
+        assert!(relay_allows(&VaultAction::WaitPermission {
+            id: "prm_x".to_owned(),
+            timeout_ms: 1,
+        }));
+        assert!(!relay_allows(&VaultAction::ListPermissions));
+        assert!(!relay_allows(&VaultAction::ListProjects {
+            cursor: None,
+            limit: 1,
+        }));
+    }
+}
