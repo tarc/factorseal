@@ -195,19 +195,37 @@ fn installation_id(cli: &Path) -> Result<String, CliError> {
     Ok(status.installation_id)
 }
 
-/// Write `bytes` to `path`, readable by the user only, in a directory only
-/// the user can open.
+/// Write `bytes` to `path`, readable by the user only. A directory this
+/// creates is private; an existing one keeps its mode, since
+/// `FACTORSEAL_WSL_CONFIG` can name any directory, but must not be writable
+/// by others, who could replace the file.
 fn write_private(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
     use std::io::Write as _;
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
     let failed = |error: std::io::Error| {
         CliError::WslSetup(format!("could not write {}: {error}", path.display()))
     };
     let directory = path
         .parent()
         .ok_or_else(|| CliError::WslSetup(format!("{} has no parent directory", path.display())))?;
-    fs::create_dir_all(directory).map_err(failed)?;
-    fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).map_err(failed)?;
+    match fs::metadata(directory) {
+        Ok(metadata) if metadata.permissions().mode() & 0o022 != 0 => {
+            return Err(CliError::WslSetup(format!(
+                "{} is writable by other users; choose a private directory",
+                directory.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(directory)
+                .map_err(failed)?;
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).map_err(failed)?;
+        }
+        Err(error) => return Err(failed(error)),
+    }
     let temporary = directory.join(format!(".wsl.json.{}.tmp", std::process::id()));
     let mut file = fs::OpenOptions::new()
         .create_new(true)
@@ -230,6 +248,37 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fn mode(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// The configuration can live in a directory that isn't FactorSeal's
+    /// (`FACTORSEAL_WSL_CONFIG`): leave its mode alone, refuse one others can
+    /// write to, and make only a directory it creates private.
+    #[test]
+    fn wsl_config_writes_leave_an_existing_directory_alone() {
+        let base = tempfile::tempdir().unwrap();
+        let shared = base.path().join("shared");
+        fs::create_dir(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
+        write_private(&shared.join("wsl.json"), b"{}").unwrap();
+        assert_eq!(mode(&shared), 0o755);
+        assert_eq!(mode(&shared.join("wsl.json")), 0o600);
+
+        let open = base.path().join("open");
+        fs::create_dir(&open).unwrap();
+        fs::set_permissions(&open, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(write_private(&open.join("wsl.json"), b"{}").is_err());
+        assert_eq!(mode(&open), 0o777);
+        assert!(!open.join("wsl.json").exists());
+
+        let created = base.path().join("new/factorseal");
+        write_private(&created.join("wsl.json"), b"{}").unwrap();
+        assert_eq!(mode(&created), 0o700);
+        assert_eq!(mode(&created.join("wsl.json")), 0o600);
+    }
 
     #[test]
     fn the_configuration_round_trips_and_rejects_unknown_fields() {
