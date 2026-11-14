@@ -25,13 +25,15 @@ const CLAIM_FILE: &str = "factorseal.secretspec.json";
 const PROVIDER_ENVIRONMENT: &[&str] = &["FACTORSEAL_ROOT", "FACTORSEAL_SOCKET"];
 
 /// In WSL the provider also needs to run the Windows broker, which goes
-/// through the interop socket named by `WSL_INTEROP`, and may be pointed at
-/// another configuration (`wsl::CONFIG_ENVIRONMENT`).
+/// through the interop socket named by `WSL_INTEROP`, and to find `wsl.json`
+/// where `wsl-setup` wrote it: under `XDG_CONFIG_HOME`, which SecretSpec's
+/// base set leaves out, or at `wsl::CONFIG_ENVIRONMENT`.
 #[cfg(target_os = "linux")]
 const WSL_PROVIDER_ENVIRONMENT: &[&str] = &[
     "FACTORSEAL_ROOT",
     "FACTORSEAL_SOCKET",
     super::wsl::CONFIG_ENVIRONMENT,
+    "XDG_CONFIG_HOME",
     "WSL_INTEROP",
     "WSL_DISTRO_NAME",
 ];
@@ -232,6 +234,34 @@ mod tests {
                 .mode()
                 & 0o777;
             assert_eq!(mode, 0o600);
+        }
+    }
+
+    /// The provider in WSL finds `wsl.json` under `XDG_CONFIG_HOME` like
+    /// `wsl-setup` wrote it, and runs the broker through the interop socket.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_wsl_claim_forwards_what_the_relayed_provider_needs() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
+        write_claim(directory.path(), &executable, WSL_PROVIDER_ENVIRONMENT).unwrap();
+        let claim: serde_json::Value = serde_json::from_slice(
+            &fs::read(directory.path().join("factorseal.secretspec.json")).unwrap(),
+        )
+        .unwrap();
+        let environment: Vec<&str> = claim["environment"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|name| name.as_str().unwrap())
+            .collect();
+        for name in [
+            "FACTORSEAL_WSL_CONFIG",
+            "XDG_CONFIG_HOME",
+            "WSL_INTEROP",
+            "WSL_DISTRO_NAME",
+        ] {
+            assert!(environment.contains(&name), "{name} is not forwarded");
         }
     }
 
