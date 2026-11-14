@@ -52,10 +52,12 @@ fn config_path() -> Option<PathBuf> {
 
 /// The configuration `wsl-setup` wrote, if any.
 pub(super) fn load() -> Result<Option<WslConfig>, CliError> {
-    let Some(path) = config_path() else {
-        return Ok(None);
-    };
-    match fs::read(&path) {
+    config_path().map_or(Ok(None), |path| load_from(&path))
+}
+
+/// The configuration at `path`, or `None` if there is no file.
+pub(super) fn load_from(path: &Path) -> Result<Option<WslConfig>, CliError> {
+    match fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|error| {
             CliError::WslSetup(format!("{} is not valid: {error}", path.display()))
         }),

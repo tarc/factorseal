@@ -69,11 +69,22 @@ pub(super) struct FactorsealProvider {
 
 impl FactorsealProvider {
     fn new(root: &Path, socket: Option<&Path>) -> Result<Self, CliError> {
-        // An explicit socket names a Linux vault; otherwise a WSL setup
-        // sends requests to the Windows vault.
         #[cfg(target_os = "linux")]
+        return Self::select(root, socket, super::wsl::load);
+        #[cfg(not(target_os = "linux"))]
+        Self::native(root, socket)
+    }
+
+    /// An explicit socket names a Linux vault; otherwise the WSL setup that
+    /// `load` reads, if any, sends requests to the Windows vault.
+    #[cfg(target_os = "linux")]
+    fn select(
+        root: &Path,
+        socket: Option<&Path>,
+        load: impl FnOnce() -> Result<Option<super::wsl::WslConfig>, CliError>,
+    ) -> Result<Self, CliError> {
         if socket.is_none()
-            && let Some(config) = super::wsl::load()?
+            && let Some(config) = load()?
         {
             return Ok(Self {
                 client: Arc::new(config.client()?),
@@ -83,6 +94,10 @@ impl FactorsealProvider {
                 application: OnceLock::new(),
             });
         }
+        Self::native(root, socket)
+    }
+
+    fn native(root: &Path, socket: Option<&Path>) -> Result<Self, CliError> {
         Ok(Self {
             client: Arc::new(super::platform::native_client(root, socket)?),
             #[cfg(target_os = "linux")]

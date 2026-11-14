@@ -467,6 +467,47 @@ async fn a_relayed_provider_waits_for_the_windows_unseal_not_a_linux_desktop() {
     assert!(actions[1..].iter().all(|action| *action == "status"));
 }
 
+/// With a WSL setup and no explicit socket, the provider talks to the
+/// Windows vault through the broker; an explicit socket names a Linux vault
+/// and wins; a damaged setup is an error, not a silent Linux fallback.
+#[cfg(target_os = "linux")]
+#[test]
+fn wsl_setup_selects_the_relayed_client_unless_a_socket_is_given() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("wsl.json");
+    let load = || super::super::wsl::load_from(&config);
+    let root = directory.path().join("root");
+    let socket = directory.path().join("factorseal.sock");
+
+    assert!(
+        !FactorsealProvider::select(&root, None, load)
+            .unwrap()
+            .relayed
+    );
+    std::fs::write(
+        &config,
+        r#"{"broker":"/mnt/c/FactorSeal/factorseal-wsl-broker.exe","pipe":"\\\\.\\pipe\\factorseal-abc","distro":"NixOS"}"#,
+    )
+    .unwrap();
+    assert!(
+        FactorsealProvider::select(&root, None, load)
+            .unwrap()
+            .relayed
+    );
+    assert!(
+        !FactorsealProvider::select(&root, Some(&socket), load)
+            .unwrap()
+            .relayed
+    );
+    std::fs::write(&config, b"{not json").unwrap();
+    assert!(matches!(
+        FactorsealProvider::select(&root, None, load),
+        Err(CliError::WslSetup(_))
+    ));
+    // An explicit socket never reads the setup.
+    assert!(FactorsealProvider::select(&root, Some(&socket), load).is_ok());
+}
+
 #[tokio::test]
 async fn provider_uses_cache_actions_for_crud_and_expiry() {
     let vault = Arc::new(MemoryVault::default());
