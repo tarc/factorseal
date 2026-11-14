@@ -194,15 +194,17 @@ function FindWindow {
 # A name with * matches as a wildcard, as the browser prompt's account
 # buttons are named "title · username". -Button skips text with the same
 # name, such as the browser prompt's title "Save login" above its button; it
-# also takes links, such as Settings' "Back to your vault", and tabs, such as
-# the sidebar's "Settings".
+# also takes links, such as Settings' "Back to your vault", tabs, such as
+# the sidebar's "Settings", and radio buttons, such as the popup's "Until the
+# vault seals".
 function Find($window, [string]$name, [switch]$Button) {
     $condition = [System.Windows.Automation.Condition]::TrueCondition
     if ($Button) {
         $condition = New-Object System.Windows.Automation.OrCondition(
             (New-Object System.Windows.Automation.PropertyCondition($auto::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button)),
             (New-Object System.Windows.Automation.PropertyCondition($auto::ControlTypeProperty, [System.Windows.Automation.ControlType]::Hyperlink)),
-            (New-Object System.Windows.Automation.PropertyCondition($auto::ControlTypeProperty, [System.Windows.Automation.ControlType]::TabItem)))
+            (New-Object System.Windows.Automation.PropertyCondition($auto::ControlTypeProperty, [System.Windows.Automation.ControlType]::TabItem)),
+            (New-Object System.Windows.Automation.PropertyCondition($auto::ControlTypeProperty, [System.Windows.Automation.ControlType]::RadioButton)))
     }
     if ($name.Contains('*')) {
         foreach ($element in $window.FindAll($scope::Descendants, $condition)) { if ($element.Current.Name -like $name) { return $element } }

@@ -118,10 +118,9 @@ pub use protection::{HardwareBackend, KeyProtector, KeyProtectorFactory};
 pub use protocol::wsl as wsl_relay;
 pub use protocol::{
     CallerIdentity, CallerPlatform, MAX_HISTORY_PAGE_SIZE, MAX_LIST_PAGE_SIZE,
-    MAX_PERMISSION_WAIT_MS, MAX_WSL_GRANT_SECONDS, Permission, PermissionChange,
-    PermissionOperation, PermissionPrincipal, PermissionState, PermissionTarget,
-    PermissionWaitStatus, RequestId, SINGLE_USE_GRANT_SECONDS, VaultAction,
-    VaultApplicationContext, VaultClient, VaultEntryImportStatus, VaultEntryMetadata,
+    MAX_PERMISSION_WAIT_MS, Permission, PermissionChange, PermissionOperation, PermissionPrincipal,
+    PermissionState, PermissionTarget, PermissionWaitStatus, RequestId, SINGLE_USE_GRANT_SECONDS,
+    VaultAction, VaultApplicationContext, VaultClient, VaultEntryImportStatus, VaultEntryMetadata,
     VaultInteractionReference, VaultMutation, VaultRequest, VaultResponse, VaultResponseBody,
     VaultResponseError, VaultResponseErrorCode, WireSecret, WireSecretAddress,
     read_permission_pages,

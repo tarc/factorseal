@@ -18,7 +18,7 @@
 #       window, and the request must stay denied.
 #   check.sh grant --key KEY [--test-vault]
 #       After approving in the popup, resend the request and check that it
-#       succeeds without a new popup and that the grant is capped at 300 s.
+#       succeeds without a new popup and that the grant ends with the unseal.
 #   check.sh test-desktop
 #       Create the throwaway test vault if needed, start a Desktop on it, and
 #       unlock it, so --test-vault runs need no person.
@@ -29,6 +29,17 @@
 #       the default was "this write only" (the popup is read through UI
 #       Automation): the grant covers one write, is gone after it, and the
 #       next write asks again.
+#   check.sh secretspec-wsl
+#       On the test vault, run the Linux `secretspec` in WSL against the
+#       Windows vault through the Linux provider and the broker's relay mode,
+#       as `factorseal wsl-setup` configures it: set a key and read it back
+#       (granted "Until the vault seals" in the popup), read it again without
+#       a popup, ask again from another folder, read the same value from the
+#       native provider in the translated folder, and ask again after the
+#       vault seals and unlocks. Needs the Linux CLI
+#       (FACTORSEAL_LINUX_CLI, default target/debug/factorseal) and builds
+#       SecretSpec from nix/secretspec.nix unless FACTORSEAL_SECRETSPEC names
+#       one.
 #
 # --test-vault targets the throwaway vault in %LOCALAPPDATA%\FactorSeal-check
 # and the Desktop running on it instead of the default vault. Needs the native
@@ -38,8 +49,8 @@
 set -euo pipefail
 
 case ${1:-} in
-    popup | grant | test-desktop | write-once) ;;
-    *) sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+    popup | grant | test-desktop | write-once | secretspec-wsl) ;;
+    *) sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
 
 repo=$(cd "$(dirname "$0")/../.." && pwd)
@@ -57,7 +68,6 @@ test_root="$test_dir\\vault"
 test_password="$test_dir\\password"
 project=wsl-ui-check
 profile=default
-max_wsl_grant_seconds=300
 
 die() { echo "FAIL: $*" >&2; exit 1; }
 
@@ -104,7 +114,7 @@ case $via in
     popup | cli) ;;
     *) die "--via takes popup or cli" ;;
 esac
-case $command in test-desktop | write-once) test_vault=yes ;; esac
+case $command in test-desktop | write-once | secretspec-wsl) test_vault=yes ;; esac
 
 root_args=()
 [ "$test_vault" = yes ] && root_args=(--root "$test_root")
@@ -204,12 +214,25 @@ check_grant() {
         sed -n 's/^"\(prm_[^"]*\)".*/\1/p' | head -1)
     [ -n "$id" ] || die "no grant found for $key"
     record=$(permission "$id")
-    granted=$(sed -n 's/.*granted: \([0-9]*\).*/\1/p' <<<"$record" | head -1)
-    expires=$(sed -n 's/.*expires: \([0-9]*\).*/\1/p' <<<"$record" | head -1)
-    [ -n "$granted" ] && [ -n "$expires" ] || die "grant for $key has no expiry: $record"
-    lifetime=$((expires - granted))
-    echo "grant:         $lifetime s (cap $max_wsl_grant_seconds s)"
-    [ "$lifetime" -le "$max_wsl_grant_seconds" ] || die "WSL grant outlives the cap"
+    check_ends_with_unseal "$record"
+}
+
+# The unseal lease's absolute deadline, from the broker's status reply.
+absolute_deadline() {
+    timeout 30 "$broker" "$pipe" "$distro" status 2>&1 |
+        sed -n 's/.*absolute_deadline: \([0-9]*\).*/\1/p'
+}
+
+# A WSL grant expires when the unseal that created it ends.
+check_ends_with_unseal() {
+    local granted expires deadline
+    granted=$(sed -n 's/.*granted: \([0-9]*\).*/\1/p' <<<"$1" | head -1)
+    expires=$(sed -n 's/.*expires: \([0-9]*\).*/\1/p' <<<"$1" | head -1)
+    deadline=$(absolute_deadline)
+    [ -n "$granted" ] && [ -n "$expires" ] || die "the grant has no expiry: $1"
+    [ -n "$deadline" ] || die "the broker did not report the unseal deadline"
+    echo "grant:         expires at the unseal's deadline ($((expires - granted)) s from approval)"
+    [ "$expires" = "$deadline" ] || die "the WSL grant expires at $expires, not at the unseal deadline $deadline"
 }
 
 case $command in
@@ -414,6 +437,156 @@ write-once)
     [ -n "$second" ] || die "the next write did not ask again: $reply"
     factorseal permissions deny "$second" >/dev/null
     echo "second write:  asked again ($second, denied)"
+    echo "PASS"
+    ;;
+secretspec-wsl)
+    linux_cli=${FACTORSEAL_LINUX_CLI:-$repo/target/debug/factorseal}
+    [ -x "$linux_cli" ] || die "no Linux CLI at $linux_cli; build it with: cargo build --bin factorseal"
+    linux_cli=$(readlink -f "$linux_cli")
+    secretspec=${FACTORSEAL_SECRETSPEC:-}
+    if [ -z "$secretspec" ]; then
+        # The release matching Factorseal's provider protocol, from the
+        # flake's own nixpkgs; --no-link leaves no GC root.
+        rev=$(sed -n '/"nixpkgs": {/,/}/s/.*"rev": "\([0-9a-f]*\)".*/\1/p' "$repo/flake.lock" | head -1)
+        [ -n "$rev" ] || die "no nixpkgs revision in flake.lock"
+        out=$(nix build --no-link --print-out-paths --impure --expr \
+            "(builtins.getFlake \"github:NixOS/nixpkgs/$rev\").legacyPackages.x86_64-linux.callPackage $repo/nix/secretspec.nix {}") ||
+            die "could not build SecretSpec from nix/secretspec.nix"
+        secretspec="$out/bin/secretspec"
+    fi
+    echo "secretspec:    $secretspec"
+
+    # Everything the provider in WSL needs, in a scratch directory, so the
+    # person's own configuration stays untouched.
+    base=$(mktemp -d "${TMPDIR:-/tmp}/factorseal-secretspec-wsl.XXXXXX")
+    trap 'rm -rf "$base"' EXIT
+    project="wsl-secretspec-$(date +%H%M%S)"
+    key="WSL_$(date +%H%M%S)"
+    for folder in one two; do
+        mkdir -p "$base/$folder"
+        printf '[project]\nname = "%s"\nrevision = "1.0"\n\n[profiles.default]\n%s = { description = "WSL check", required = false }\n' \
+            "$project" "$key" >"$base/$folder/secretspec.toml"
+    done
+    printf '{"broker":"%s","pipe":"%s","distro":"%s"}\n' "$broker" "${pipe//\\/\\\\}" "$distro" >"$base/wsl.json"
+    install -d -m 700 "$base/xdg/secretspec/providers.d"
+    printf '{"executable":"%s","environment":["FACTORSEAL_WSL_CONFIG","WSL_INTEROP","WSL_DISTRO_NAME"]}\n' \
+        "$linux_cli" >"$base/xdg/secretspec/providers.d/factorseal.secretspec.json"
+    chmod 600 "$base/xdg/secretspec/providers.d/factorseal.secretspec.json"
+    secretspec_in() {
+        local folder=$1
+        shift
+        (cd "$base/$folder" && XDG_CONFIG_HOME="$base/xdg" FACTORSEAL_WSL_CONFIG="$base/wsl.json" \
+            timeout 90 "$secretspec" --file "$base/$folder/secretspec.toml" --reason wsl-check \
+            "$@" --provider factorseal://default 2>&1)
+    }
+    # The pending request for this run's key, once the vault holds it.
+    pending_request() {
+        local id
+        for _ in $(seq 60); do
+            for id in $(factorseal permissions list | grep -F -B1 "\\\"key\\\":\\\"$key\\\"" |
+                sed -n 's/^"\(prm_[^"]*\)".*/\1/p'); do
+                if permission "$id" | grep -q pending; then
+                    echo "$id"
+                    return
+                fi
+            done
+            sleep 0.5
+        done
+    }
+    popup_tree() {
+        local tree
+        for _ in $(seq 10); do
+            tree=$(powershell uia-dump.ps1 -DesktopPid "$pid" || true)
+            grep -q "Text name='When the vault seals'" <<<"$tree" && break
+            sleep 1
+        done
+        echo "$tree"
+    }
+    windows_folder="\\\\wsl.localhost\\$distro${base//\//\\}\\one"
+
+    # 1. A write, granted until the vault seals.
+    secretspec_in one set "$key" wsl-value >"$base/set.out" &
+    setter=$!
+    id=$(pending_request)
+    [ -n "$id" ] || die "the write did not reach the vault: $(cat "$base/set.out")"
+    record=$(permission "$id")
+    grep -q "relayed from WSL distro: \"$distro\"" <<<"$record" || die "the write is not tagged with $distro: $record"
+    # The listing prints the folder JSON-escaped, each backslash doubled.
+    grep -qF "base directory: \"${windows_folder//\\/\\\\}\"" <<<"$record" ||
+        die "the folder is not $windows_folder: $record"
+    tree=$(popup_tree)
+    grep -q "Text name='When the vault seals'" <<<"$tree" || die "the popup does not say access ends when the vault seals"
+    grep -q "RadioButton name='Until the vault seals'" <<<"$tree" || die "the popup does not offer Until the vault seals"
+    grep -q "RadioButton name='1 hour'" <<<"$tree" && die "the popup offers 1 hour for a WSL request"
+    echo "write:         asked ($id); popup offers Until the vault seals, folder $windows_folder"
+    result=$(powershell drive.ps1 -Action press -Name 'Until the vault seals' -NoWait -DesktopPid "$pid" -PasswordFile "$test_password" || true)
+    grep -q '^clicked=' <<<"$result" || die "the driver could not pick Until the vault seals: $result"
+    result=$(powershell drive.ps1 -Action grant -DesktopPid "$pid" -PasswordFile "$test_password" || true)
+    grep -q '^popup_closed=True' <<<"$result" || die "the driver could not grant the write: $result"
+    wait "$setter" || die "secretspec set failed: $(cat "$base/set.out")"
+    check_ends_with_unseal "$(permission "$id")"
+    echo "write:         stored"
+
+    # 2. A read, granted with the popup's default.
+    secretspec_in one get "$key" >"$base/get.out" &
+    getter=$!
+    id=$(pending_request)
+    [ -n "$id" ] || die "the read did not reach the vault: $(cat "$base/get.out")"
+    tree=$(popup_tree)
+    grep -q "RadioButton name='Until the vault seals' .* selected=True" <<<"$tree" ||
+        die "the popup did not select Until the vault seals for the read"
+    result=$(powershell drive.ps1 -Action grant -DesktopPid "$pid" -PasswordFile "$test_password" || true)
+    grep -q '^popup_closed=True' <<<"$result" || die "the driver could not grant the read: $result"
+    wait "$getter" || die "secretspec get failed: $(cat "$base/get.out")"
+    [ "$(tail -1 "$base/get.out")" = wsl-value ] || die "secretspec get returned: $(cat "$base/get.out")"
+    check_ends_with_unseal "$(permission "$id")"
+    echo "read:          granted until the vault seals; value matches"
+
+    # 3. Again, without a popup.
+    started=$(date +%s%N)
+    reply=$(secretspec_in one get "$key") || die "the second read failed: $reply"
+    elapsed=$((($(date +%s%N) - started) / 1000000))
+    [ "$(tail -1 <<<"$reply")" = wsl-value ] || die "the second read returned: $reply"
+    echo "read again:    no popup, $elapsed ms for the whole secretspec command"
+
+    # 4. Another folder of the same project asks again.
+    secretspec_in two get "$key" >"$base/other.out" &
+    other=$!
+    id=$(pending_request)
+    [ -n "$id" ] || die "another folder did not ask again: $(cat "$base/other.out")"
+    factorseal permissions deny "$id" >/dev/null
+    wait "$other" && die "the denied read succeeded: $(cat "$base/other.out")"
+    echo "other folder:  asked again ($id, denied)"
+
+    # 5. The native provider in the translated folder reads the same value,
+    # after its own approval: the caller is not the broker.
+    probe() {
+        powershell provider-probe.ps1 -Cli "$(wslpath -w "$cli")" -Root "$test_root" -Method get \
+            -Project "$project" -Key "$key" -Directory "$windows_folder" -Seconds 5
+    }
+    reply=$(probe)
+    asked=$(sed -n 's/.*"interaction":{"kind":"authorization","id":"\(prm_[^"]*\)".*/\1/p' <<<"$reply")
+    [ -n "$asked" ] || die "the native provider did not ask for its own approval: $reply"
+    result=$(powershell drive.ps1 -Action grant -DesktopPid "$pid" -PasswordFile "$test_password" || true)
+    grep -q '^popup_closed=True' <<<"$result" || die "the driver could not grant the native read: $result"
+    probe | grep -q 'wsl-value' || die "the native provider did not read the value"
+    echo "native:        its own approval ($asked), same value"
+
+    # 6. After a seal and unlock the WSL grants are gone.
+    factorseal seal >/dev/null
+    for _ in $(seq 50); do
+        [ "$(state)" = sealed ] && break
+        sleep 0.2
+    done
+    "$0" test-desktop >/dev/null || die "could not unlock the test vault again"
+    pid=$(desktop_pid)
+    secretspec_in one get "$key" >"$base/sealed.out" &
+    after=$!
+    id=$(pending_request)
+    [ -n "$id" ] || die "the read after the seal did not ask again: $(cat "$base/sealed.out")"
+    factorseal permissions deny "$id" >/dev/null
+    wait "$after" || true
+    echo "after a seal:  asked again ($id, denied)"
     echo "PASS"
     ;;
 esac

@@ -28,11 +28,6 @@ pub const SINGLE_USE_GRANT_SECONDS: u64 = 300;
 /// Maximum number of executables in
 /// [`VaultApplicationContext::declared_launch_chain`].
 pub const MAX_DECLARED_LAUNCH_CHAIN: usize = 4;
-/// The former five-minute lifetime of a grant approved for a WSL-relayed
-/// request. The vault no longer applies it: such a grant now ends with the
-/// unseal (see [`VaultApplicationContext::declared_wsl_origin`]). Desktop's
-/// approval popup still quotes it until the popup offers the new choices.
-pub const MAX_WSL_GRANT_SECONDS: u64 = 300;
 /// Maximum number of metadata-only entries returned by one list request.
 ///
 /// Eight complete native SecretSpec addresses still fit below the one-MiB

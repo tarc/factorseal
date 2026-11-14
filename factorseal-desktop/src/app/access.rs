@@ -985,6 +985,9 @@ enum GrantChoice {
     ThisWriteOnly,
     Hour,
     UntilRevoked,
+    /// For requests relayed from WSL: the vault ends their grant when it
+    /// seals, whatever duration is asked for.
+    UntilSeal,
 }
 
 impl GrantChoice {
@@ -993,9 +996,19 @@ impl GrantChoice {
         match self {
             Self::ThisWriteOnly => (None, true),
             Self::Hour => (Some(3600), false),
-            Self::UntilRevoked => (None, false),
+            // The vault clamps a WSL grant to the end of the unseal.
+            Self::UntilRevoked | Self::UntilSeal => (None, false),
         }
     }
+}
+
+// Every request comes through the WSL broker, so every grant ends when the
+// vault seals and the native durations would only overstate it.
+fn all_relayed_from_wsl(grants: &[factorseal::Permission]) -> bool {
+    !grants.is_empty()
+        && grants
+            .iter()
+            .all(|grant| grant.application.declared_wsl_origin.is_some())
 }
 
 // The vault takes a single-use approval only for a SecretSpec write.
@@ -1018,6 +1031,7 @@ fn grant_choice(grants: &[factorseal::Permission], choice: Option<GrantChoice>) 
         {
             GrantChoice::ThisWriteOnly
         }
+        None if all_relayed_from_wsl(grants) => GrantChoice::UntilSeal,
         None => GrantChoice::Hour,
     }
 }
@@ -1124,6 +1138,7 @@ impl Render for AccessView {
         let theme = cx.theme().clone();
         let busy = self.approving || matches!(self.snapshot, Snapshot::Unlocking { .. });
         let choice = grant_choice(&self.grants, self.choice);
+        let relayed = all_relayed_from_wsl(&self.grants);
         if !self.grants.is_empty() {
             self.choice = Some(choice);
         }
@@ -1465,21 +1480,12 @@ impl Render for AccessView {
                 // Caller-declared, not authenticated -- see
                 // `VaultApplicationContext::declared_wsl_origin`. Shown
                 // prominently because it changes what this approval actually
-                // grants: a short-lived lease regardless of the duration
-                // chosen below, since this caller has none of the
-                // executable-identity assurance a native one has. The
-                // expiry row says so, so the duration buttons don't
-                // overstate the grant.
+                // grants: access only until the vault seals, whatever is
+                // chosen below, since every WSL caller is the broker and has
+                // none of the executable-identity assurance a native one has.
                 card = card
                     .child(detail("WSL distro", distro.clone(), cx))
-                    .child(detail(
-                        "Access expires",
-                        format!(
-                            "After {} minutes, whichever duration you choose",
-                            factorseal::MAX_WSL_GRANT_SECONDS / 60
-                        ),
-                        cx,
-                    ));
+                    .child(detail("Access expires", "When the vault seals", cx));
             }
             card = card.child(detail(
                 "Requested by",
@@ -1684,8 +1690,9 @@ impl Render for AccessView {
                 .when(metadata.is_some_and(|metadata| metadata.unlock_policy().groups().len() > 1), |element| element.child(groups))
                 .when((!self.grants.is_empty() || !self.requests.is_empty()) && self.inputs.is_empty(), |element| element.child(field_label("Allow access for", h_flex().id("grant-lifetime").role(gpui::Role::RadioGroup).aria_label("Allow access for").gap_2()
                     .when(single_write_allowed(&self.grants), |row| row.child(button("grant-once").label("This write only").role(Some(gpui::Role::RadioButton)).toggled(choice == GrantChoice::ThisWriteOnly).selected(choice == GrantChoice::ThisWriteOnly).disabled(busy).on_click(cx.listener(|view, _, _, cx| { view.choice = Some(GrantChoice::ThisWriteOnly); cx.notify(); }))))
-                    .child(button("grant-hour").label("1 hour").role(Some(gpui::Role::RadioButton)).toggled(choice == GrantChoice::Hour).selected(choice == GrantChoice::Hour).disabled(busy).on_click(cx.listener(|view, _, _, cx| { view.choice = Some(GrantChoice::Hour); cx.notify(); })))
-                    .child(button("grant-persistent").label("Until revoked").role(Some(gpui::Role::RadioButton)).toggled(choice == GrantChoice::UntilRevoked).selected(choice == GrantChoice::UntilRevoked).disabled(busy).on_click(cx.listener(|view, _, _, cx| { view.choice = Some(GrantChoice::UntilRevoked); cx.notify(); }))))))
+                    .when(!relayed, |row| row.child(button("grant-hour").label("1 hour").role(Some(gpui::Role::RadioButton)).toggled(choice == GrantChoice::Hour).selected(choice == GrantChoice::Hour).disabled(busy).on_click(cx.listener(|view, _, _, cx| { view.choice = Some(GrantChoice::Hour); cx.notify(); }))))
+                    .when(!relayed, |row| row.child(button("grant-persistent").label("Until revoked").role(Some(gpui::Role::RadioButton)).toggled(choice == GrantChoice::UntilRevoked).selected(choice == GrantChoice::UntilRevoked).disabled(busy).on_click(cx.listener(|view, _, _, cx| { view.choice = Some(GrantChoice::UntilRevoked); cx.notify(); })))))
+                    .when(relayed, |row| row.child(button("grant-until-seal").label("Until the vault seals").role(Some(gpui::Role::RadioButton)).toggled(choice == GrantChoice::UntilSeal).selected(choice == GrantChoice::UntilSeal).disabled(busy).on_click(cx.listener(|view, _, _, cx| { view.choice = Some(GrantChoice::UntilSeal); cx.notify(); }))))))
                 .when(!self.inputs.is_empty() && !busy, |element| element.child(field_label("Secret value", self.editor.value.clone())))
                 .when(needs_password && !busy, |element| element.child(field_label("Vault password", self.password.clone())))
                 .when_some(self.error.clone(), |element, error| element.child(error_banner(error, theme.danger)))
@@ -1806,6 +1813,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn secretspec_requests_name_secretspec_and_where_it_was_launched_from() {
         let path = |name: &str| {
             std::env::temp_dir()
@@ -1904,6 +1912,33 @@ mod tests {
                 Some(GrantChoice::UntilRevoked)
             ),
             GrantChoice::UntilRevoked
+        );
+
+        // A request relayed from WSL ends when the vault seals: that is its
+        // default, except that a plain write still asks for that write only.
+        let relayed = |mut permission: factorseal::Permission| {
+            permission.application = permission
+                .application
+                .with_declared_wsl_origin(Some("NixOS".to_owned()))
+                .expect("a valid distro");
+            permission
+        };
+        let wsl_read = relayed(mixed[1].clone());
+        assert!(all_relayed_from_wsl(std::slice::from_ref(&wsl_read)));
+        assert_eq!(
+            grant_choice(std::slice::from_ref(&wsl_read), None),
+            GrantChoice::UntilSeal
+        );
+        assert_eq!(GrantChoice::UntilSeal.lifetime(), (None, false));
+        assert_eq!(
+            grant_choice(std::slice::from_ref(&relayed(write.clone())), None),
+            GrantChoice::ThisWriteOnly
+        );
+        // Mixed with a native request, the native durations stay.
+        assert!(!all_relayed_from_wsl(&[wsl_read.clone(), mixed[1].clone()]));
+        assert_eq!(
+            grant_choice(&[wsl_read, mixed[1].clone()], None),
+            GrantChoice::Hour
         );
         grant.scope = Some(factorseal::DocumentKind::LinuxSecretService);
 
