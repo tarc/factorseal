@@ -7,8 +7,9 @@
 #       Refuses to start while Desktop or the CLI runs, since Windows locks
 #       their executables.
 #   build-windows.sh check [--broker]
-#       Mirror, then run clippy and Desktop's tests natively. Leaves the
-#       release executables alone, so it can run while Desktop is open.
+#       Mirror, then run clippy, Desktop's tests and the WSL relay's tests
+#       natively. Leaves the release executables alone, so it can run while
+#       Desktop is open.
 #   --broker also cross-compiles the WSL broker on the WSL side.
 #
 # Desktop cannot be cross-compiled (its renderer needs Windows' shader
@@ -23,7 +24,7 @@ for argument in "$@"; do
     case $argument in
         release | check) mode=$argument ;;
         --broker) broker=yes ;;
-        *) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+        *) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
     esac
 done
 
@@ -81,6 +82,10 @@ check)
     windows "cargo clippy --locked --no-default-features --features $cli_features --bins -- -D warnings"
     echo "Running Desktop's tests"
     windows "cargo test --locked -p factorseal-desktop"
+    # The broker's own view of a relayed request (Windows folder, the
+    # broker's distro) is checked only where Windows paths are absolute.
+    echo "Running the WSL relay's tests"
+    windows "cargo test --locked --lib --features vault-client -- protocol::wsl"
     ;;
 esac
 

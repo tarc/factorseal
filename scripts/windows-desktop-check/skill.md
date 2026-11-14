@@ -5,8 +5,9 @@ script, the flow, and the pitfalls. This file is the order of work.
 
 ## Build
 
-- `./scripts/windows-desktop-check/build-windows.sh check` for clippy and
-  Desktop's tests natively (safe while Desktop runs).
+- `./scripts/windows-desktop-check/build-windows.sh check` for clippy,
+  Desktop's tests and the WSL relay's tests natively (safe while Desktop
+  runs).
 - `./scripts/windows-desktop-check/build-windows.sh --broker` for release
   binaries. If it refuses because Desktop is running, ask the user to quit
   Desktop from its tray icon, then rerun.
