@@ -127,8 +127,10 @@ pub(super) fn setup(windows_install: Option<&Path>, remove: bool) -> Result<(), 
 /// `%LOCALAPPDATA%\Programs\FactorSeal`, where the Windows installation
 /// lives by default, as WSL sees it.
 fn default_install() -> Result<PathBuf, CliError> {
+    // `/u` makes cmd.exe write UTF-16LE instead of the OEM code page, which
+    // would mangle a profile folder named outside it.
     let output = Command::new("cmd.exe")
-        .args(["/d", "/c", "echo %LOCALAPPDATA%"])
+        .args(["/u", "/d", "/c", "echo %LOCALAPPDATA%"])
         .current_dir("/")
         .output()
         .map_err(|error| {
@@ -136,7 +138,7 @@ fn default_install() -> Result<PathBuf, CliError> {
                 "could not ask Windows for %LOCALAPPDATA% (is WSL interop enabled?): {error}"
             ))
         })?;
-    let local = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let local = windows_output(&output.stdout).unwrap_or_default();
     if !output.status.success() || local.is_empty() || local.contains('%') {
         return Err(CliError::WslSetup(
             "Windows did not report %LOCALAPPDATA%; pass --windows-install".to_owned(),
@@ -155,6 +157,18 @@ fn default_install() -> Result<PathBuf, CliError> {
     Ok(PathBuf::from(
         String::from_utf8_lossy(&output.stdout).trim(),
     ))
+}
+
+/// Output of `cmd.exe /u`: UTF-16LE, trimmed. `None` if it isn't.
+fn windows_output(bytes: &[u8]) -> Option<String> {
+    let (units, rest) = bytes.as_chunks::<2>();
+    if !rest.is_empty() {
+        return None;
+    }
+    let units: Vec<u16> = units.iter().map(|unit| u16::from_le_bytes(*unit)).collect();
+    String::from_utf16(&units)
+        .ok()
+        .map(|text| text.trim().to_owned())
 }
 
 /// The Windows vault's installation id, from `factorseal.exe status`, which
@@ -278,6 +292,25 @@ mod tests {
         write_private(&created.join("wsl.json"), b"{}").unwrap();
         assert_eq!(mode(&created), 0o700);
         assert_eq!(mode(&created.join("wsl.json")), 0o600);
+    }
+
+    /// `cmd.exe /u` writes UTF-16LE, so a profile folder outside the OEM
+    /// code page survives.
+    #[test]
+    fn wsl_setup_reads_windows_output_as_utf16() {
+        let local = r"C:\Users\João\AppData\Local";
+        let mut bytes: Vec<u8> = format!("{local}\r\n")
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert_eq!(windows_output(&bytes).as_deref(), Some(local));
+        bytes.push(0);
+        assert_eq!(windows_output(&bytes), None);
+        let unpaired: Vec<u8> = [0xD800_u16]
+            .iter()
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect();
+        assert_eq!(windows_output(&unpaired), None);
     }
 
     #[test]
