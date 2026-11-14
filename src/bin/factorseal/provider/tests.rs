@@ -62,6 +62,7 @@ fn application_context() -> VaultApplicationContext {
 struct MemoryVault {
     values: Mutex<HashMap<CacheKey, Vec<u8>>>,
     last_evict_at: Mutex<Option<u64>>,
+    dialog_writes: AtomicU64,
 }
 
 impl VaultClient for MemoryVault {
@@ -93,6 +94,9 @@ impl VaultClient for MemoryVault {
                 evict_at,
             } => {
                 assert_eq!(project, "demo");
+                if matches!(request.action, VaultAction::WriteCacheFromDialog { .. }) {
+                    self.dialog_writes.fetch_add(1, Ordering::Relaxed);
+                }
                 self.values
                     .lock()
                     .unwrap()
@@ -252,6 +256,75 @@ async fn reject_cross_project_addresses(client: &Client) {
             .unwrap_err();
         assert_eq!(error.rpc_kind(), Some(ErrorKind::InvalidParams), "{method}");
     }
+}
+
+/// Serve `provider` over an in-memory stream and initialize it as
+/// SecretSpec would for project `demo` in the current folder.
+async fn connected(
+    provider: FactorsealProvider,
+) -> (
+    Client,
+    tokio::task::JoinHandle<Result<(), secretspec_ipc::error::Error>>,
+) {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let (client_read, client_write) = tokio::io::split(client_io);
+    let (server_read, server_write) = tokio::io::split(server_io);
+    let server = tokio::spawn(serve_provider(
+        server_read,
+        server_write,
+        provider,
+        ServerConfig::default(),
+    ));
+    let initialize = InitializeParams {
+        protocol: PROVIDER_PROTOCOL.to_owned(),
+        versions: vec![PROTOCOL_VERSION],
+        client: Product {
+            name: "factorseal-provider-test".to_owned(),
+            version: "1".to_owned(),
+        },
+        limits: Limits {
+            max_frame_bytes: 32 * 1024,
+            max_in_flight: 8,
+        },
+        client_methods: Vec::new(),
+        application: InitializeApplication {
+            scheme: "factorseal".to_owned(),
+            uri: PROVIDER_URI.to_owned(),
+            context: ApplicationContext {
+                project: Some("demo".to_owned()),
+                profile: Some("default".to_owned()),
+                base_dir: application_context().base_dir,
+                reason: Some("test".to_owned()),
+                requested_authorization_duration_ms: None,
+            },
+        },
+    };
+    let (client, _) = Client::connect::<_, _, _, InitializedApplication>(
+        client_read,
+        client_write,
+        initialize,
+        deadline(),
+    )
+    .await
+    .unwrap();
+    (client, server)
+}
+
+/// Through the WSL broker the vault is the Windows one: a write takes the
+/// grant path even when a Linux Desktop on this session could show its
+/// secure-entry dialog, since that dialog belongs to no vault here.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_relayed_provider_writes_through_grants_not_the_linux_dialog() {
+    let vault = Arc::new(MemoryVault::default());
+    let mut provider = FactorsealProvider::with_client(vault.clone());
+    provider.relayed = true;
+    let (client, server) = connected(provider).await;
+    store(&client, address(), "secret").await;
+    assert_eq!(vault.dialog_writes.load(Ordering::Relaxed), 0);
+    assert_eq!(vault.values.lock().unwrap().len(), 1);
+    client.close(deadline()).await.unwrap();
+    server.await.unwrap().unwrap();
 }
 
 #[tokio::test]

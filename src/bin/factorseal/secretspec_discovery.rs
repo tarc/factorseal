@@ -24,6 +24,18 @@ const CLAIM_FILE: &str = "factorseal.secretspec.json";
 /// releases ignore the field.
 const PROVIDER_ENVIRONMENT: &[&str] = &["FACTORSEAL_ROOT", "FACTORSEAL_SOCKET"];
 
+/// In WSL the provider also needs to run the Windows broker, which goes
+/// through the interop socket named by `WSL_INTEROP`, and may be pointed at
+/// another configuration (`wsl::CONFIG_ENVIRONMENT`).
+#[cfg(target_os = "linux")]
+const WSL_PROVIDER_ENVIRONMENT: &[&str] = &[
+    "FACTORSEAL_ROOT",
+    "FACTORSEAL_SOCKET",
+    super::wsl::CONFIG_ENVIRONMENT,
+    "WSL_INTEROP",
+    "WSL_DISTRO_NAME",
+];
+
 #[derive(Serialize)]
 struct ProviderClaim<'a> {
     executable: &'a Path,
@@ -44,7 +56,20 @@ pub(super) fn publish_for_default_root(root: &Path) -> Result<(), CliError> {
     let directory = provider_directory().ok_or_else(|| {
         CliError::SecretSpecDiscovery("the user configuration directory is unavailable".to_owned())
     })?;
-    write_claim(&directory, &executable)
+    write_claim(&directory, &executable, PROVIDER_ENVIRONMENT)
+}
+
+/// Publish the claim for this executable as the provider SecretSpec runs in
+/// WSL, whatever vault root it would use natively (`factorseal wsl-setup`).
+#[cfg(target_os = "linux")]
+pub(super) fn publish_for_wsl() -> Result<(), CliError> {
+    let executable = std::env::current_exe()
+        .and_then(fs::canonicalize)
+        .map_err(|error| CliError::CurrentExecutable(error.to_string()))?;
+    let directory = provider_directory().ok_or_else(|| {
+        CliError::SecretSpecDiscovery("the user configuration directory is unavailable".to_owned())
+    })?;
+    write_claim(&directory, &executable, WSL_PROVIDER_ENVIRONMENT)
 }
 
 fn provider_directory() -> Option<PathBuf> {
@@ -73,7 +98,7 @@ fn provider_directory() -> Option<PathBuf> {
     }
 }
 
-fn write_claim(directory: &Path, executable: &Path) -> Result<(), CliError> {
+fn write_claim(directory: &Path, executable: &Path, environment: &[&str]) -> Result<(), CliError> {
     super::timing::result("secretspec_claim", "prepare_directory", || {
         fs::create_dir_all(directory)?;
         #[cfg(unix)]
@@ -89,7 +114,7 @@ fn write_claim(directory: &Path, executable: &Path) -> Result<(), CliError> {
     let destination = directory.join(CLAIM_FILE);
     let bytes = serde_json::to_vec(&ProviderClaim {
         executable,
-        environment: PROVIDER_ENVIRONMENT,
+        environment,
     })?;
     #[cfg(unix)]
     let bytes = {
@@ -186,7 +211,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
 
-        write_claim(directory.path(), &executable).unwrap();
+        write_claim(directory.path(), &executable, PROVIDER_ENVIRONMENT).unwrap();
 
         let claim =
             fs::read_to_string(directory.path().join("factorseal.secretspec.json")).unwrap();
@@ -215,7 +240,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
         let claim = directory.path().join("factorseal.secretspec.json");
-        write_claim(directory.path(), &executable).unwrap();
+        write_claim(directory.path(), &executable, PROVIDER_ENVIRONMENT).unwrap();
         let file = fs::OpenOptions::new().write(true).open(&claim).unwrap();
         let old_time = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000);
         file.set_times(fs::FileTimes::new().set_modified(old_time))
@@ -225,7 +250,7 @@ mod tests {
         #[cfg(unix)]
         let directory_before = fs::metadata(directory.path()).unwrap();
 
-        write_claim(directory.path(), &executable).unwrap();
+        write_claim(directory.path(), &executable, PROVIDER_ENVIRONMENT).unwrap();
 
         let after = fs::metadata(&claim).unwrap();
         assert_eq!(before.modified().unwrap(), after.modified().unwrap());
@@ -251,8 +276,8 @@ mod tests {
         let first = directory.path().join("first-factorseal");
         let second = directory.path().join("second-factorseal");
         let claim = directory.path().join("factorseal.secretspec.json");
-        write_claim(directory.path(), &first).unwrap();
-        write_claim(directory.path(), &second).unwrap();
+        write_claim(directory.path(), &first, PROVIDER_ENVIRONMENT).unwrap();
+        write_claim(directory.path(), &second, PROVIDER_ENVIRONMENT).unwrap();
         let expected = serde_json::json!({
             "executable": second,
             "environment": ["FACTORSEAL_ROOT", "FACTORSEAL_SOCKET"],
@@ -262,7 +287,7 @@ mod tests {
             expected
         );
         fs::write(&claim, b"invalid claim").unwrap();
-        write_claim(directory.path(), &second).unwrap();
+        write_claim(directory.path(), &second, PROVIDER_ENVIRONMENT).unwrap();
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&fs::read(&claim).unwrap()).unwrap(),
             expected
@@ -273,7 +298,7 @@ mod tests {
             serde_json::to_vec(&serde_json::json!({ "executable": second })).unwrap(),
         )
         .unwrap();
-        write_claim(directory.path(), &second).unwrap();
+        write_claim(directory.path(), &second, PROVIDER_ENVIRONMENT).unwrap();
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&fs::read(&claim).unwrap()).unwrap(),
             expected
@@ -287,10 +312,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let executable = directory.path().join("factorseal");
         let claim = directory.path().join("factorseal.secretspec.json");
-        write_claim(directory.path(), &executable).unwrap();
+        write_claim(directory.path(), &executable, PROVIDER_ENVIRONMENT).unwrap();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
         fs::set_permissions(&claim, fs::Permissions::from_mode(0o644)).unwrap();
-        write_claim(directory.path(), &executable).unwrap();
+        write_claim(directory.path(), &executable, PROVIDER_ENVIRONMENT).unwrap();
         assert_eq!(
             fs::metadata(directory.path()).unwrap().permissions().mode() & 0o7777,
             0o700
@@ -309,11 +334,11 @@ mod tests {
         let executable = directory.path().join("factorseal");
         let claim = directory.path().join("factorseal.secretspec.json");
         let target = directory.path().join("original-claim");
-        write_claim(directory.path(), &executable).unwrap();
+        write_claim(directory.path(), &executable, PROVIDER_ENVIRONMENT).unwrap();
         fs::rename(&claim, &target).unwrap();
         let before = fs::read(&target).unwrap();
         symlink(&target, &claim).unwrap();
-        write_claim(directory.path(), &executable).unwrap();
+        write_claim(directory.path(), &executable, PROVIDER_ENVIRONMENT).unwrap();
         assert!(fs::symlink_metadata(&claim).unwrap().is_file());
         assert_eq!(fs::read(&target).unwrap(), before);
         assert_eq!(fs::read(&claim).unwrap(), before);

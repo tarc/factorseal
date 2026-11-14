@@ -24,6 +24,9 @@ mod provider;
 mod secretspec_discovery;
 #[path = "../timing.rs"]
 mod timing;
+#[cfg(all(target_os = "linux", feature = "secretspec-provider"))]
+#[path = "factorseal/wsl.rs"]
+mod wsl;
 
 use cli::{Cli, Command};
 use commands::{
@@ -135,6 +138,10 @@ enum CliError {
 
     #[error("diagnostics failed: {0}")]
     Diagnostics(std::io::Error),
+
+    #[cfg(all(target_os = "linux", feature = "secretspec-provider"))]
+    #[error("WSL setup failed: {0}")]
+    WslSetup(String),
 
     #[cfg(feature = "secretspec-provider")]
     #[error("SecretSpec provider protocol failed: {0}")]
@@ -303,6 +310,11 @@ fn run(cli: Cli) -> Result<(), CliError> {
         }
         #[cfg(feature = "secretspec-provider")]
         Command::Provider => provider::serve(&root, socket),
+        #[cfg(all(target_os = "linux", feature = "secretspec-provider"))]
+        Command::WslSetup {
+            windows_install,
+            remove,
+        } => wsl::setup(windows_install.as_deref(), remove),
     }
 }
 

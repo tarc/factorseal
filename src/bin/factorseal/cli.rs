@@ -325,6 +325,24 @@ pub(super) enum Command {
     /// Serve the SecretSpec external-provider protocol over standard I/O.
     #[cfg(feature = "secretspec-provider")]
     Provider,
+
+    /// Use the FactorSeal vault on Windows for SecretSpec in this WSL distro.
+    ///
+    /// Records the Windows broker and the vault's pipe in
+    /// ~/.config/factorseal/wsl.json and publishes the SecretSpec claim, so
+    /// `secretspec --provider factorseal://default` here reaches the Windows
+    /// vault. Approvals happen in FactorSeal Desktop on Windows and last
+    /// until its vault seals.
+    #[cfg(all(target_os = "linux", feature = "secretspec-provider"))]
+    WslSetup {
+        /// Folder of the Windows installation, as WSL sees it. Defaults to
+        /// %LOCALAPPDATA%\Programs\FactorSeal.
+        #[arg(long, value_name = "PATH")]
+        windows_install: Option<std::path::PathBuf>,
+        /// Remove the configuration, so the provider uses a Linux vault again.
+        #[arg(long, conflicts_with = "windows_install")]
+        remove: bool,
+    },
 }
 
 impl Command {
@@ -353,6 +371,8 @@ impl Command {
             Self::Permissions { .. } => "permissions",
             #[cfg(feature = "secretspec-provider")]
             Self::Provider => "provider",
+            #[cfg(all(target_os = "linux", feature = "secretspec-provider"))]
+            Self::WslSetup { .. } => "wsl_setup",
         }
     }
 }

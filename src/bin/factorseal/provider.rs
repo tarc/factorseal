@@ -57,6 +57,11 @@ fn check_request_live(context: &RequestContext) -> RpcResult<()> {
 /// One Factorseal process acting as a SecretSpec provider endpoint.
 pub(super) struct FactorsealProvider {
     client: Arc<dyn VaultClient>,
+    /// The vault is the Windows one, reached through the WSL broker
+    /// (`factorseal wsl-setup`). Linux Desktop's secure-entry dialog belongs
+    /// to no vault here, so writes take the grant path, as on Windows.
+    #[cfg(target_os = "linux")]
+    relayed: bool,
     #[cfg(all(test, target_os = "linux"))]
     test_input: bool,
     application: OnceLock<VaultApplicationContext>,
@@ -64,8 +69,24 @@ pub(super) struct FactorsealProvider {
 
 impl FactorsealProvider {
     fn new(root: &Path, socket: Option<&Path>) -> Result<Self, CliError> {
+        // An explicit socket names a Linux vault; otherwise a WSL setup
+        // sends requests to the Windows vault.
+        #[cfg(target_os = "linux")]
+        if socket.is_none()
+            && let Some(config) = super::wsl::load()?
+        {
+            return Ok(Self {
+                client: Arc::new(config.client()?),
+                relayed: true,
+                #[cfg(test)]
+                test_input: false,
+                application: OnceLock::new(),
+            });
+        }
         Ok(Self {
             client: Arc::new(super::platform::native_client(root, socket)?),
+            #[cfg(target_os = "linux")]
+            relayed: false,
             #[cfg(all(test, target_os = "linux"))]
             test_input: false,
             application: OnceLock::new(),
@@ -76,6 +97,8 @@ impl FactorsealProvider {
     fn with_client(client: Arc<dyn VaultClient>) -> Self {
         Self {
             client,
+            #[cfg(target_os = "linux")]
+            relayed: false,
             #[cfg(target_os = "linux")]
             test_input: true,
             application: OnceLock::new(),
@@ -365,7 +388,7 @@ impl FactorsealProvider {
         check_request_live(context)?;
         let project = self.project()?.to_owned();
         #[cfg(target_os = "linux")]
-        if self.supports_desktop_input(context).await? {
+        if !self.relayed && self.supports_desktop_input(context).await? {
             let initial = WireSecret::new(value.expose().as_bytes().to_vec())
                 .map_err(|error| map_vault_error(&error))?;
             let value = self.edit_secret(context, &address, initial).await?;
