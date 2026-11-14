@@ -471,6 +471,15 @@ secretspec-wsl)
         for child in $(ps -o pid= --ppid "$1" 2>/dev/null); do kill_tree "$child"; done
         kill "$1" 2>/dev/null || true
     }
+    # This run's pending requests right now, one per line.
+    pending_now() {
+        local id
+        for id in $(factorseal permissions list | grep -F -B1 "\\\"key\\\":\\\"$key\\\"" |
+            sed -n 's/^"\(prm_[^"]*\)".*/\1/p'); do
+            permission "$id" | grep -q pending && echo "$id"
+        done
+        return 0
+    }
     # On any exit, Ctrl-C included: stop the secretspec runs still waiting
     # and deny this run's pending requests, which would otherwise keep a
     # popup open with "Unlock to continue" once the test vault seals.
@@ -478,9 +487,8 @@ secretspec-wsl)
         set +e
         local job id
         for job in $(jobs -p); do kill_tree "$job"; done
-        for id in $(factorseal permissions list | grep -F -B1 "\\\"key\\\":\\\"$key\\\"" |
-            sed -n 's/^"\(prm_[^"]*\)".*/\1/p'); do
-            permission "$id" | grep -q pending && factorseal permissions deny "$id" >/dev/null
+        for id in $(pending_now); do
+            factorseal permissions deny "$id" >/dev/null
         done
         rm -rf "$base"
     }
@@ -514,13 +522,11 @@ secretspec-wsl)
     pending_request() {
         local id
         for _ in $(seq 60); do
-            for id in $(factorseal permissions list | grep -F -B1 "\\\"key\\\":\\\"$key\\\"" |
-                sed -n 's/^"\(prm_[^"]*\)".*/\1/p'); do
-                if permission "$id" | grep -q pending; then
-                    echo "$id"
-                    return
-                fi
-            done
+            id=$(pending_now | head -1)
+            if [ -n "$id" ]; then
+                echo "$id"
+                return
+            fi
             sleep 0.5
         done
     }
@@ -573,11 +579,12 @@ secretspec-wsl)
     check_ends_with_unseal "$(permission "$id")"
     echo "read:          granted until the vault seals; value matches"
 
-    # 3. Again, without a popup.
+    # 3. Again, without a popup: no new request reaches the vault.
     started=$(date +%s%N)
     reply=$(secretspec_in one get "$key") || die "the second read failed: $reply"
     elapsed=$((($(date +%s%N) - started) / 1000000))
     [ "$(tail -1 <<<"$reply")" = wsl-value ] || die "the second read returned: $reply"
+    [ -z "$(pending_now)" ] || die "the second read asked for approval again ($(pending_now))"
     echo "read again:    no popup, $elapsed ms for the whole secretspec command"
 
     # 4. Another folder of the same project asks again.
