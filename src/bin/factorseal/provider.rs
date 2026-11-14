@@ -171,8 +171,15 @@ impl FactorsealProvider {
         #[cfg(target_os = "linux")]
         let first = if matches!(&first, Err(error) if error.data.kind == ErrorKind::InteractionRequired && error.data.interaction.is_none())
         {
-            *_opened_desktop = true;
-            self.unlock_desktop(context, address).await?;
+            if self.relayed {
+                // The Windows vault is sealed or not running, and the broker
+                // has brought Windows Desktop forward. A Linux Desktop on this
+                // session bus hosts another vault, so don't ask it.
+                self.wait_for_unseal(context).await?;
+            } else {
+                *_opened_desktop = true;
+                self.unlock_desktop(context, address).await?;
+            }
             self.request_once(action().map_err(|error| map_vault_error(&error))?)
                 .await
         } else {
@@ -198,6 +205,36 @@ impl FactorsealProvider {
             // on. The approval stays pending, so a retry after it is granted
             // succeeds.
             PermissionWaitStatus::Pending => Err(RpcError::interaction_required(Some(interaction))),
+        }
+    }
+
+    /// Poll the Windows vault through the broker until it answers `Status`,
+    /// which only an unsealed vault does. Gives up with "interaction
+    /// required" shortly before the caller's deadline, like
+    /// [`Self::wait_for_permission`].
+    #[cfg(target_os = "linux")]
+    async fn wait_for_unseal(&self, context: &RequestContext) -> RpcResult<()> {
+        const POLL: std::time::Duration = std::time::Duration::from_millis(500);
+        let Some(answer_by) = context.deadline.checked_sub(APPROVAL_ANSWER_MARGIN) else {
+            return Err(RpcError::interaction_required(None));
+        };
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= answer_by {
+                return Err(RpcError::interaction_required(None));
+            }
+            tokio::select! {
+                () = context.cancellation.cancelled() => return Err(RpcError::new(ErrorKind::Cancelled)),
+                () = tokio::time::sleep_until(answer_by.min(now + POLL)) => {}
+            }
+            match self.request_once(VaultAction::Status).await {
+                Ok(VaultResponseBody::Status { .. }) => return Ok(()),
+                Err(error)
+                    if error.data.kind == ErrorKind::InteractionRequired
+                        && error.data.interaction.is_none() => {}
+                Ok(_) => return Err(RpcError::new(ErrorKind::OperationFailed)),
+                Err(error) => return Err(error),
+            }
         }
     }
 

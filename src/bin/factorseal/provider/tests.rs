@@ -327,6 +327,146 @@ async fn a_relayed_provider_writes_through_grants_not_the_linux_dialog() {
     server.await.unwrap().unwrap();
 }
 
+/// A Windows vault behind the WSL broker that stays sealed for its first
+/// `sealed_for` requests, then answers.
+#[cfg(target_os = "linux")]
+struct SealedWindowsVault {
+    sealed_for: u64,
+    requests: AtomicU64,
+    actions: Mutex<Vec<&'static str>>,
+}
+
+#[cfg(target_os = "linux")]
+impl VaultClient for SealedWindowsVault {
+    fn request(&self, request: &VaultRequest) -> factorseal::VaultResult<VaultResponse> {
+        let action = match &request.action {
+            VaultAction::Status => "status",
+            VaultAction::GetCache { .. } => "get",
+            _ => "other",
+        };
+        self.actions.lock().unwrap().push(action);
+        if self.requests.fetch_add(1, Ordering::Relaxed) < self.sealed_for {
+            return Ok(VaultResponse::failure(
+                request.request_id(),
+                VaultResponseError {
+                    code: VaultResponseErrorCode::Sealed,
+                    message: "unlock FactorSeal Desktop on Windows, then try again".to_owned(),
+                    interaction: None,
+                },
+            ));
+        }
+        let body = match &request.action {
+            VaultAction::Status => VaultResponseBody::Status {
+                installation_id: "windows".to_owned(),
+                device_vault_id: "vault".to_owned(),
+                device_key_id: "key".to_owned(),
+                hardware_backend: "test".to_owned(),
+                idle_deadline: 1,
+                absolute_deadline: 2,
+            },
+            VaultAction::GetCache { .. } => VaultResponseBody::Secret { value: None },
+            _ => return Err(VaultError::Protocol("unexpected action".to_owned())),
+        };
+        Ok(VaultResponse::success(request.request_id(), body))
+    }
+}
+
+/// A Linux FactorSeal host on the session bus: counts the unlock and
+/// finish calls the provider makes to it.
+#[cfg(target_os = "linux")]
+struct LinuxDesktop(Arc<AtomicU64>);
+
+#[cfg(target_os = "linux")]
+#[zbus::interface(name = "org.freedesktop.Secret.Service")]
+#[allow(clippy::needless_pass_by_value)] // D-Bus dispatch methods.
+impl LinuxDesktop {
+    fn unlock_for_ipc(&self, attributes: HashMap<String, String>) {
+        let _ = attributes;
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+    fn finish_ipc_access(&self, attributes: HashMap<String, String>) {
+        let _ = attributes;
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Run `secretspec get` through a relayed provider against `vault`, with a
+/// Linux Desktop on the private session bus when the test runs under
+/// `scripts/test-with-dbus.sh`. Returns the result and the calls the Linux
+/// Desktop received.
+#[cfg(target_os = "linux")]
+async fn relayed_get(
+    vault: Arc<SealedWindowsVault>,
+    within_ms: u64,
+) -> (Result<GetResult, secretspec_ipc::Error>, u64) {
+    let calls = Arc::new(AtomicU64::new(0));
+    let _desktop = if std::env::var_os("FACTORSEAL_TEST_PRIVATE_DBUS").is_some() {
+        Some(
+            zbus::connection::Builder::session()
+                .name("org.freedesktop.secrets")
+                .serve_at("/org/freedesktop/secrets", LinuxDesktop(Arc::clone(&calls)))
+                .build()
+                .await
+                .unwrap(),
+        )
+    } else {
+        None
+    };
+    let mut provider = FactorsealProvider::with_client(vault);
+    provider.relayed = true;
+    let (client, server) = connected(provider).await;
+    let result = client
+        .call::<_, GetResult>(
+            wire::method::GET,
+            &AddressParams { address: address() },
+            unix_time_ms().unwrap() + within_ms,
+        )
+        .await;
+    client.close(deadline()).await.unwrap();
+    server.await.unwrap().unwrap();
+    (result, calls.load(Ordering::Relaxed))
+}
+
+/// The Windows vault is sealed: the broker brings Windows Desktop forward,
+/// so the relayed provider waits for the unseal and retries once. It never
+/// asks a Linux Desktop on the WSL session bus, which hosts another vault.
+/// One test, since both cases own the same name on the private bus.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_relayed_provider_waits_for_the_windows_unseal_not_a_linux_desktop() {
+    let sealed = |sealed_for| {
+        Arc::new(SealedWindowsVault {
+            sealed_for,
+            requests: AtomicU64::new(0),
+            actions: Mutex::new(Vec::new()),
+        })
+    };
+    let vault = sealed(2);
+    let (result, linux_calls) = relayed_get(Arc::clone(&vault), 10_000).await;
+    assert_eq!(linux_calls, 0);
+    assert_eq!(result.unwrap(), GetResult::Missing);
+    assert_eq!(
+        *vault.actions.lock().unwrap(),
+        ["get", "status", "status", "get"]
+    );
+
+    // Left sealed, it asks for interaction before the caller's deadline.
+    let vault = sealed(u64::MAX);
+    let started = std::time::Instant::now();
+    let (result, linux_calls) = relayed_get(Arc::clone(&vault), 3_000).await;
+    assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    assert_eq!(linux_calls, 0);
+    let Err(secretspec_ipc::Error::Remote(error)) = result else {
+        panic!("expected the provider to ask for interaction, got {result:?}");
+    };
+    assert_eq!(error.data.kind, ErrorKind::InteractionRequired);
+    assert!(error.data.interaction.is_none());
+    let actions = vault.actions.lock().unwrap();
+    assert_eq!(actions.first(), Some(&"get"));
+    assert!(actions.len() > 2);
+    assert!(actions[1..].iter().all(|action| *action == "status"));
+}
+
 #[tokio::test]
 async fn provider_uses_cache_actions_for_crud_and_expiry() {
     let vault = Arc::new(MemoryVault::default());
