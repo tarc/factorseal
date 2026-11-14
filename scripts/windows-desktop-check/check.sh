@@ -459,9 +459,32 @@ secretspec-wsl)
     # Everything the provider in WSL needs, in a scratch directory, so the
     # person's own configuration stays untouched.
     base=$(mktemp -d "${TMPDIR:-/tmp}/factorseal-secretspec-wsl.XXXXXX")
-    trap 'rm -rf "$base"' EXIT
     project="wsl-secretspec-$(date +%H%M%S)"
     key="WSL_$(date +%H%M%S)"
+    # A process and everything it started: `timeout` puts secretspec in its
+    # own process group, so stopping the background subshell alone would
+    # leave secretspec, the provider and the broker waiting.
+    kill_tree() {
+        local child
+        for child in $(ps -o pid= --ppid "$1" 2>/dev/null); do kill_tree "$child"; done
+        kill "$1" 2>/dev/null || true
+    }
+    # On any exit, Ctrl-C included: stop the secretspec runs still waiting
+    # and deny this run's pending requests, which would otherwise keep a
+    # popup open with "Unlock to continue" once the test vault seals.
+    cleanup() {
+        set +e
+        local job id
+        for job in $(jobs -p); do kill_tree "$job"; done
+        for id in $(factorseal permissions list | grep -F -B1 "\\\"key\\\":\\\"$key\\\"" |
+            sed -n 's/^"\(prm_[^"]*\)".*/\1/p'); do
+            permission "$id" | grep -q pending && factorseal permissions deny "$id" >/dev/null
+        done
+        rm -rf "$base"
+    }
+    trap cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     for folder in one two; do
         mkdir -p "$base/$folder"
         printf '[project]\nname = "%s"\nrevision = "1.0"\n\n[profiles.default]\n%s = { description = "WSL check", required = false }\n' \
@@ -585,7 +608,7 @@ secretspec-wsl)
     id=$(pending_request)
     [ -n "$id" ] || die "the read after the seal did not ask again: $(cat "$base/sealed.out")"
     factorseal permissions deny "$id" >/dev/null
-    wait "$after" || true
+    wait "$after" && die "the denied read after the seal succeeded: $(cat "$base/sealed.out")"
     echo "after a seal:  asked again ($id, denied)"
     echo "PASS"
     ;;
