@@ -370,7 +370,10 @@ WSL2-relayed request lasts only until the vault seals, whatever duration is
 chosen at approval, including “until revoked”. The grant expires at the unseal
 lease's absolute deadline, and if the vault seals before that (idle timeout,
 Seal, or a stopped worker), the next unseal removes it before serving any
-request. The stored grant and the permission record shown in Desktop both carry
+request. If the vault cannot read its permission registry then (a newer
+release's format after a downgrade, or a damaged document), it records an
+integrity failure and opens anyway rather than lock the person out; leftover
+WSL2 grants then last until their absolute deadline. The stored grant and the permission record shown in Desktop both carry
 the clamped expiry, so neither overstates how long access lasts.
 
 In relay mode (`factorseal-wsl-broker.exe <pipe> <distro> relay`) the broker

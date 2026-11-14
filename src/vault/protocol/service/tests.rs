@@ -2000,6 +2000,93 @@ fn reopen_after_seal(
     VaultService::new(store, now, UnsealLeasePolicy::default()).unwrap()
 }
 
+/// The sweep at unseal must not lock the person out: a permission registry
+/// this build cannot read (a newer release's version after a downgrade, or
+/// a damaged document) is recorded as an integrity failure and the vault
+/// opens anyway. A WSL grant left behind then lasts until its absolute
+/// deadline, as the vault set it when approving.
+#[test]
+fn wsl_sweep_does_not_block_unseal_on_an_unreadable_registry() {
+    use super::super::grant::GRANT_DOCUMENT_NAMESPACE;
+    use crate::vault::DocumentOperation;
+    use zeroize::Zeroizing;
+    let now = wall_clock();
+    let (directory, service) = service(now, UnsealLeasePolicy::default());
+    let provider = caller();
+    let manager = permission_manager();
+    service.authorize_permission_manager(&manager, now).unwrap();
+    let wsl_request = || {
+        VaultRequest::new_with_application(
+            VaultAction::GetCache {
+                project: "relayed".to_owned(),
+                address: project_address("relayed"),
+            },
+            VaultApplicationContext::new(Some("relayed".to_owned()), None, None, None)
+                .unwrap()
+                .with_declared_wsl_origin(Some("NixOS".to_owned()))
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    let interaction = service
+        .handle(&provider, wsl_request(), now + 1)
+        .result
+        .unwrap_err()
+        .interaction
+        .unwrap();
+    approve_pending(&service, &manager, &directory, &interaction.id, now + 1);
+    assert!(
+        service
+            .handle(&provider, wsl_request(), now + 2)
+            .result
+            .is_ok()
+    );
+
+    service.seal().unwrap();
+    let started = Instant::now();
+    while !service.is_seal_complete() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "seal did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(service);
+    let root = directory.path().join("factorseal");
+    let store = VaultStore::open(&root, Vault::unseal_for_test(&root).unwrap()).unwrap();
+    store
+        .mutate(
+            DocumentKind::Authorization,
+            GRANT_DOCUMENT_NAMESPACE,
+            vec![DocumentOperation::Put {
+                address: SecretAddress::new("permissions", None).unwrap(),
+                value: Zeroizing::new(br#"{"version":2,"permissions":[]}"#.to_vec()),
+                evict_at: None,
+            }],
+            &Provenance::service(ServiceReason::GrantStorage),
+            now + 3,
+        )
+        .unwrap();
+    let integrity_failures = || {
+        crate::security::events::snapshot()
+            .into_iter()
+            .find(|event| event.kind == crate::security::events::Kind::IntegrityFailure)
+            .unwrap()
+            .count
+    };
+    let before = integrity_failures();
+    let service = VaultService::new(store, now + 10, UnsealLeasePolicy::default())
+        .expect("an unreadable registry must not stop the vault from opening");
+    assert!(integrity_failures() > before);
+    assert!(
+        service
+            .handle(&provider, wsl_request(), now + 11)
+            .result
+            .is_ok(),
+        "the leftover WSL grant lasts until its absolute deadline"
+    );
+}
+
 /// Real time: a reopened store sweeps expired records by the system clock.
 fn wall_clock() -> u64 {
     std::time::SystemTime::now()

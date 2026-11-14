@@ -53,12 +53,20 @@ impl ServiceState {
     pub(super) fn new(store: VaultStore, now: u64, policy: UnsealLeasePolicy) -> VaultResult<Self> {
         let seal_handle = store.clone();
         // WSL-relayed grants end with the unseal that created them; remove
-        // any an earlier seal left behind before serving a request.
-        revoke_wsl_grants(
+        // any an earlier seal left behind before serving a request. A
+        // registry this build cannot read must not lock the person out of
+        // every secret: record it and open anyway. Leftover WSL grants then
+        // last until their absolute deadline, the most the vault gave them
+        // when approving.
+        if revoke_wsl_grants(
             &store,
             now,
             &Provenance::service(ServiceReason::GrantStorage),
-        )?;
+        )
+        .is_err()
+        {
+            crate::security::events::record(crate::security::events::Kind::IntegrityFailure);
+        }
         let lease = UnsealLease::new(now, policy)?;
         store.set_deadline(lease.expires_at())?;
         // Requests still waiting for review when the vault last sealed.
