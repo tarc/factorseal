@@ -173,51 +173,131 @@ fn accept_until_sealed(
     // kept while this server serves.
     let _parser = crate::isolation::parser::keep_code();
     let active = AtomicUsize::new(0);
+    // Clients are accepted on a thread of their own that waits in a blocking
+    // accept, so a request is served as soon as it connects. Polling a
+    // nonblocking accept made a request after a quiet moment wait for the
+    // rest of the poll interval. This loop keeps checking the lease and the
+    // stop flag at that interval.
+    listener
+        .set_nonblocking(false)
+        .map_err(|error| io_error("configure named-pipe listener", &error))?;
+    let done = AtomicBool::new(false);
     std::thread::scope(|scope| {
-        while !stopping.load(Ordering::Acquire) {
-            if service.expire_if_needed(unix_time()?)? {
-                service.seal()?;
-                return Ok(());
+        let (connections, accepted) = sync_channel::<io::Result<BytePipe>>(0);
+        let (taking, poll_interval) = ((&done, &active), options.poll_interval);
+        let accepting = std::thread::Builder::new()
+            .name("factorseal-ipc-accept".to_owned())
+            .spawn_scoped(scope, move || {
+                accept_clients(listener, taking.0, taking.1, &connections, poll_interval);
+            })
+            .map_err(|error| {
+                VaultError::Protocol(format!("could not start IPC accept: {error}"))
+            })?;
+        let served = serve_accepted(
+            service,
+            options,
+            &caller_cache,
+            &active,
+            &accepted,
+            stopping,
+            scope,
+        );
+        // Stop the accept thread: no more connections are taken, and one
+        // connection of our own wakes a blocking accept. It stays open until
+        // the thread is done, since accept skips a connection already closed.
+        done.store(true, Ordering::Release);
+        drop(accepted);
+        let mut wake = None;
+        while !accepting.is_finished() {
+            if wake.is_none() {
+                wake = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&options.pipe_name)
+                    .ok();
             }
-            if active.load(Ordering::Acquire) >= MAX_ACTIVE_CONNECTIONS {
-                std::thread::sleep(options.poll_interval);
-                continue;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(wake);
+        served
+    })
+}
+
+/// Accept clients until `done`, handing each to the serving loop, never more
+/// than [`MAX_ACTIVE_CONNECTIONS`] at once.
+fn accept_clients(
+    listener: &ByteListener,
+    done: &AtomicBool,
+    active: &AtomicUsize,
+    connections: &SyncSender<io::Result<BytePipe>>,
+    poll_interval: Duration,
+) {
+    while !done.load(Ordering::Acquire) {
+        if active.load(Ordering::Acquire) >= MAX_ACTIVE_CONNECTIONS {
+            std::thread::sleep(poll_interval);
+            continue;
+        }
+        let accepted = listener.accept();
+        if done.load(Ordering::Acquire) {
+            return;
+        }
+        let failed = accepted.is_err();
+        if connections.send(accepted).is_err() || failed {
+            return;
+        }
+    }
+}
+
+fn serve_accepted<'scope>(
+    service: &'scope VaultService,
+    options: &WindowsVaultOptions,
+    caller_cache: &'scope CallerIdentityCache,
+    active: &'scope AtomicUsize,
+    accepted: &std::sync::mpsc::Receiver<io::Result<BytePipe>>,
+    stopping: &AtomicBool,
+    scope: &'scope std::thread::Scope<'scope, '_>,
+) -> VaultResult<()> {
+    use std::sync::mpsc::RecvTimeoutError;
+    while !stopping.load(Ordering::Acquire) {
+        if service.expire_if_needed(unix_time()?)? {
+            service.seal()?;
+            return Ok(());
+        }
+        match accepted.recv_timeout(options.poll_interval) {
+            Ok(Ok(mut stream)) => {
+                active.fetch_add(1, Ordering::AcqRel);
+                if let Err(error) = std::thread::Builder::new()
+                    .name("factorseal-ipc".to_owned())
+                    .spawn_scoped(scope, move || {
+                        let _active = ActiveConnection(active);
+                        // A malformed or disconnected client must not
+                        // terminate the per-user vault. Still counted, so
+                        // a client's undifferentiated transport timeout
+                        // has a corresponding operator-visible signal.
+                        if handle_connection(service, caller_cache, &mut stream).is_err() {
+                            crate::security::events::record(
+                                crate::security::events::Kind::ConnectionFailed,
+                            );
+                        }
+                    })
+                {
+                    active.fetch_sub(1, Ordering::AcqRel);
+                    return Err(VaultError::Protocol(format!(
+                        "could not start bounded IPC worker: {error}"
+                    )));
+                }
             }
-            match listener.accept() {
-                Ok(mut stream) => {
-                    active.fetch_add(1, Ordering::AcqRel);
-                    let active = &active;
-                    let caller_cache = &caller_cache;
-                    if let Err(error) = std::thread::Builder::new()
-                        .name("factorseal-ipc".to_owned())
-                        .spawn_scoped(scope, move || {
-                            let _active = ActiveConnection(active);
-                            // A malformed or disconnected client must not
-                            // terminate the per-user vault. Still counted, so
-                            // a client's undifferentiated transport timeout
-                            // has a corresponding operator-visible signal.
-                            if handle_connection(service, caller_cache, &mut stream).is_err() {
-                                crate::security::events::record(
-                                    crate::security::events::Kind::ConnectionFailed,
-                                );
-                            }
-                        })
-                    {
-                        active.fetch_sub(1, Ordering::AcqRel);
-                        return Err(VaultError::Protocol(format!(
-                            "could not start bounded IPC worker: {error}"
-                        )));
-                    }
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(options.poll_interval);
-                }
-                Err(error) => return Err(io_error("accept named-pipe client", &error)),
+            Ok(Err(error)) => return Err(io_error("accept named-pipe client", &error)),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(VaultError::Protocol(
+                    "the IPC accept thread stopped".to_owned(),
+                ));
             }
         }
-        service.seal()?;
-        Ok(())
-    })
+    }
+    service.seal()?;
+    Ok(())
 }
 
 pub(crate) fn private_listener(path: &Path) -> VaultResult<ByteListener> {
@@ -940,6 +1020,55 @@ mod tests {
             .unwrap();
         assert!(matches!(sealed.result, Ok(VaultResponseBody::Sealed)));
         server.join().unwrap().unwrap();
+    }
+
+    /// A request after a quiet moment is served at once, not after the rest
+    /// of a poll interval (here the longest allowed, 1 s), and the server
+    /// still stops when the vault seals.
+    #[test]
+    #[cfg(feature = "hardware")]
+    fn a_request_after_a_quiet_moment_is_served_at_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("factorseal");
+        let unsealed = Vault::create_for_test(&root).unwrap();
+        let store = VaultStore::open(&root, unsealed).unwrap();
+        let service = Arc::new(
+            VaultService::new(store, unix_time().unwrap(), UnsealLeasePolicy::default()).unwrap(),
+        );
+        let pipe_name = format!(
+            r"\\.\pipe\factorseal-test-{}",
+            InstallationId::random().unwrap()
+        );
+        let options = WindowsVaultOptions {
+            pipe_name: pipe_name.clone(),
+            poll_interval: Duration::from_secs(1),
+            install_signal_handler: false,
+            install_lifecycle_monitor: false,
+        };
+        let server_service = Arc::clone(&service);
+        let server = std::thread::spawn(move || serve_windows_vault(&server_service, &options));
+        let client = WindowsVaultClient::new(pipe_name);
+        let server = wait_until_ready(&client, server);
+
+        let mut elapsed = Duration::ZERO;
+        for _ in 0..5 {
+            std::thread::sleep(Duration::from_millis(300));
+            let started = std::time::Instant::now();
+            client
+                .request(&VaultRequest::new(VaultAction::Status).unwrap())
+                .unwrap();
+            elapsed += started.elapsed();
+        }
+        // Polling the accept cost about half the interval per request.
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "five requests took {elapsed:?}"
+        );
+
+        service.seal().unwrap();
+        let stopped = std::time::Instant::now();
+        server.join().unwrap().unwrap();
+        assert!(stopped.elapsed() < Duration::from_secs(5));
     }
 
     /// Wait for the server thread to reach its accept loop.
