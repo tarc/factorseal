@@ -3,7 +3,8 @@
 Status, 2026-11-15: steps 1–5 and 7 implemented (de2780e..3b49775), then
 the implementation review acted on (fc49f02..3555cbd), the review of
 those fixes (cbada0a..d03d54a), a third review (bf0e7e6..b927d1b) and a
-fourth (after b927d1b); steps 6, 8 and 9 remain. All reviews
+fourth (after b927d1b); step 6 implemented (b3429f9, 6539cb5), not yet
+reviewed; steps 8 and 9 remain. All reviews
 are folded in (see "Review record" and "Implementation
 record" at the end). Branch: `feature/wsl2-keyring` (the WSL keyring this
 targets lives there). The Windows installer that hands off to it is planned
@@ -445,6 +446,43 @@ until the user has seen it in the native build.
      duplicate can differ between Check (first seen, no modified times
      while locked) and Move (newest usable), so the UI doesn't key on the
      collection.
+
+   As implemented (b3429f9, 6539cb5; `factorseal-desktop/src/wsl_keyring_import.rs`):
+   - The command also passes `--wsl-distro $1`, with the distro as
+     `sh`'s positional argument (`sh -lc '<script>' sh <distro>`), so the
+     archive is always for the keyring Desktop compared against. The
+     distro is never pasted into the script, and no quote reaches
+     `wsl.exe`'s command-line parsing; distro names (letters, digits,
+     `.`, `-`, `_`) stay one word unquoted.
+   - The backstop's collection count comes from a new inventory field,
+     `locked_collections` (b3429f9): `read_all` prompts for every locked
+     collection, empty ones too, which the items alone don't show. A
+     record from an older CLI falls back to counting every collection
+     with an item. The limit is three minutes (also the inventory's)
+     plus five minutes five seconds per locked collection.
+   - Desktop refuses a record whose `target` isn't `wsl:<distro>`, and an
+     archive holding any entry outside that distro's keyring (another
+     partition or document kind): otherwise a process in the distro could
+     add any vault entry through a manager's restore.
+   - The one-time passphrase is the personal generator's random style,
+     32 letters and digits.
+   - Errors: exit 127 (no `factorseal`), "no Secret Service" or "no
+     session bus", "unrecognized subcommand" (a CLI too old), else the
+     first three lines of stderr, or of stdout when stderr is empty
+     (where `wsl.exe` writes its UTF-16 messages).
+   - Cancel kills `wsl.exe`; a cancel that arrives after the archive was
+     decrypted no longer stops the restore, whose result is shown.
+   - Sealed: the buttons are disabled and a note asks for the unlock;
+     the page doesn't start one itself.
+   - After a move Desktop reads the vault again, so the moved items show
+     under System keyring.
+   - Known gap: the text under a row is not exposed to UI Automation,
+     like the page's other notes.
+   - Seen natively (2026-11-15, test vault): the Check reached poita's
+     installed CLI through `wsl.exe` with its arguments intact and showed
+     "cannot identify the Secret Service: Permission denied", as expected
+     from 5dffff3 (before 4d5dde5). A successful native Check needs the
+     NixOS input past 4d5dde5; Move is left to step 8.
 7. **Integration check** (Linux, private bus, never the user's bus or
    keyring):
    1. A throwaway `gnome-keyring-daemon --components=secrets --unlock` (nix
@@ -630,10 +668,23 @@ mutation, and the gate:
 | 1fdad6a | test fix: the id-collision test no longer assumes an id order |
 | b0b7a9e | fix found by step 7: a locked generic item's plain `xdg:schema` counts |
 | 3b49775 | 7: `scripts/test-keyring-import.sh` |
+| b3429f9 | 6: the inventory names its locked collections; import types deserialize |
+| 6539cb5 | 6: Desktop's Check and Move |
 
 `fuzz/Cargo.lock` gained only the `md-5` entry; it already failed
 `cargo metadata --locked` at 4ed2d2d (missing `embed-resource`), which is
 left for a separate fix.
+
+Step 6's gate: fmt, workspace clippy, lib 557 passed, 0 failed, 6 ignored,
+CLI 93 passed, Desktop 204 passed, 1 ignored;
+`scripts/test-keyring-import.sh` passes; natively on Windows, clippy,
+Desktop 189 passed, 1 ignored, and the WSL relay's 14. The library test
+failed before its fix; the Desktop tests were written with the code and
+checked by mutation instead (no exact frame length, no entry check, no
+target check, every item missing, one fingerprint page): each fails a
+test. The exact-length mutation first survived, since base64 and the end
+line also reject most wrong lengths; cases off by a whole base64 group
+and with the end marker glued to the body now catch it.
 
 ### Implementation review
 
