@@ -1,17 +1,11 @@
 //! Read the NM schema used by libsecret clients. Never enumerate unrelated
 //! credentials, unlock a collection implicitly, or delete an unverified item.
 
-use super::{
-    BTreeMap, Connection, OwnedObjectPath, OwnedVariant, Property, Variant, WireSecret, fdo, proxy,
-};
+pub(crate) use crate::vault::secret_service::legacy::Legacy;
+
+use super::{BTreeMap, OwnedObjectPath, Property, WireSecret, proxy};
 use std::collections::HashMap;
 use zeroize::Zeroizing;
-
-pub(crate) struct Legacy {
-    connection: Connection,
-    owner: String,
-    session: OwnedObjectPath,
-}
 
 fn attributes(uuid: &str, property: Property) -> BTreeMap<String, String> {
     BTreeMap::from([
@@ -22,49 +16,6 @@ fn attributes(uuid: &str, property: Property) -> BTreeMap<String, String> {
 }
 
 impl Legacy {
-    pub(super) async fn connect() -> zbus::Result<Self> {
-        let connection = Connection::session().await?;
-        let bus = fdo::DBusProxy::new(&connection).await?;
-        let owner = bus
-            .get_name_owner("org.freedesktop.secrets".try_into()?)
-            .await?
-            .to_string();
-        drop(bus);
-        Self::connect_on(connection, owner).await
-    }
-
-    pub(super) async fn connect_on(connection: Connection, owner: String) -> zbus::Result<Self> {
-        let service = proxy(
-            &connection,
-            &owner,
-            "/org/freedesktop/secrets",
-            "org.freedesktop.Secret.Service",
-        )
-        .await?;
-        let (_, session): (OwnedVariant, OwnedObjectPath) = service
-            .call("OpenSession", &("plain", Variant::from("")))
-            .await?;
-        drop(service);
-        Ok(Self {
-            connection,
-            owner,
-            session,
-        })
-    }
-
-    pub(super) async fn close(self) {
-        if let Ok(session) = proxy(
-            &self.connection,
-            &self.owner,
-            self.session.as_str(),
-            "org.freedesktop.Secret.Session",
-        )
-        .await
-        {
-            let _ = session.call::<_, _, ()>("Close", &()).await;
-        }
-    }
-
     pub(super) async fn find(
         &self,
         uuid: &str,

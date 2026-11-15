@@ -146,20 +146,7 @@ pub(in crate::vault::secret_service) async fn run(
     Ok(report)
 }
 
-async fn proxy<'a>(
-    connection: &'a Connection,
-    owner: &'a str,
-    path: &'a str,
-    interface: &'a str,
-) -> zbus::Result<zbus::Proxy<'a>> {
-    zbus::proxy::Builder::new(connection)
-        .destination(owner)
-        .path(path)
-        .interface(interface)
-        .cache_properties(zbus::proxy::CacheProperties::No)
-        .build()
-        .await
-}
+use crate::vault::secret_service::legacy::proxy;
 
 struct Copy {
     property: Property,

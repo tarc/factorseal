@@ -40,6 +40,7 @@ use super::{
 
 mod agent;
 mod interfaces;
+pub(crate) mod legacy;
 mod network_manager;
 pub use network_manager::migration::{WifiMigrationEntry, WifiMigrationReport};
 
