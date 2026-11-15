@@ -2,8 +2,8 @@
 
 Status, 2026-11-15: steps 1–5 and 7 implemented (de2780e..3b49775), then
 the implementation review acted on (fc49f02..3555cbd), the review of
-those fixes (cbada0a..d03d54a) and a third review (after d03d54a); steps
-6, 8 and 9 remain. All reviews
+those fixes (cbada0a..d03d54a), a third review (bf0e7e6..b927d1b) and a
+fourth (after b927d1b); steps 6, 8 and 9 remain. All reviews
 are folded in (see "Review record" and "Implementation
 record" at the end). Branch: `feature/wsl2-keyring` (the WSL keyring this
 targets lives there). The Windows installer that hands off to it is planned
@@ -242,14 +242,28 @@ until the user has seen it in the native build.
    3. **No match:** added under its own id, as today.
 
    An incoming item **without attributes** answers no lookup, so rule 1
-   doesn't apply to it. It follows its id's relocation chain
-   (`relocation_chain`): the first attribute-less item on it is the match;
-   ids held by items with attributes are passed over; the first free id
-   is where it is added. So its own copy is found on every restore,
-   moved or not, and no other item can stand in for it. (Matching by
-   label, content type and creation time, tried in 94a0252 and cbada0a,
-   let an unrelated look-alike from the same backup match: fixes review
-   N1, third review R1.)
+   doesn't apply to it. It walks its id's whole relocation chain
+   (`relocation_chain`, up to 64 links): the first attribute-less item on
+   it is the match, past free ids too, since an item it moved past may
+   have been deleted since; ids held by items with attributes are passed
+   over; the first free id is where it is added when nothing matches. So
+   its own copy is found on every restore, moved or not, and no unrelated
+   item can stand in for it. (Matching by label, content type and
+   creation time, tried in 94a0252 and cbada0a, let an unrelated
+   look-alike from the same backup match: fixes review N1, third review
+   R1.) An item with attributes computes its chain only when no item has
+   its attributes, and stops at the first free id.
+
+   **Known limitation** (fourth review F1, accepted): a backup holding an
+   attribute-less item at an id and another at that id's relocated id
+   (both from one item's history in the source keyring: a relocation, a
+   deletion and another restore there), restored where an item with
+   attributes holds the id, keeps only one of them (the other is kept
+   existing, or with `replace_existing` overwrites it). Deriving the
+   relocated id from the label and times as well would avoid it, but then
+   a backup restored again after a label change adds a copy, a far more
+   common case. A test pins the behaviour so a change to it is
+   deliberate.
 
    Other attribute-identical duplicates already in the vault are left
    alone. Tests in `service/tests.rs`, native and WSL partition:
@@ -264,7 +278,9 @@ until the user has seen it in the native build.
      both added (with and without `replace_existing`), the exact id wins
      over a look-alike earlier in the index, and an item whose id is taken
      is added beside a look-alike from the same backup and found again on
-     a second restore.
+     a second restore; an item found past a freed link of its chain (the
+     item at its id deleted, or a middle link); the known limitation,
+     pinned.
 
    Mutation: match by id only.
 2. **Shared Secret Service reader.** Move the session-bus reader out of the
@@ -457,7 +473,8 @@ until the user has seen it in the native build.
    - the restore rule from step 1 in the backup docs and in `CHANGELOG.md`,
      since it changes backup restores for everyone (no release from this
      branch before that); the attribute-less rule as it stands after the
-     third review's R1 (relocation chain), not 94a0252's or cbada0a's;
+     third review's R1 and the fourth review's F2 (the whole relocation
+     chain), not 94a0252's or cbada0a's, with F1's known limitation;
    - the native recipe only now that a Nix-wrapped Desktop is recognized as
      FactorSeal (implementation review D1);
    - `wsl2-keyring-design.md` decision 3 pointing here.
@@ -784,3 +801,38 @@ the record's hashes and its completeness.
 **Risks:** step 6 takes the backstop's collection count from the
 inventory (in step 6); step 8 nothing new; step 9 documents the rule after
 R1 (in step 9).
+
+### Fourth review
+
+An independent review of bf0e7e6..b927d1b (2026-11-15), asked to report
+behaviour only, found R1 fixed and two low-severity gaps, both shown with
+temporary tests on both partitions. Every point and what became of it, so
+the review file was removed. Gate after the fix: fmt, clippy, lib 553
+passed, 1 failed, 6 ignored (`libsecret_store_seal_lookup` times out, as
+on main), CLI 93 passed; `scripts/test-keyring-import.sh` passes.
+
+- **F1, low: two attribute-less items of one backup, one at an id and one
+  at its relocated id, can merge** when an item with attributes holds the
+  id in the target (`Added, KeptExisting`, or `Added, Replaced` with
+  replace, in either order). Accepted as a known limitation, as the
+  reviewer recommended (step 1 gives the trade-off), and pinned by
+  `known_limitation_one_lineage_items_of_one_backup_can_merge` in 8d3d08c,
+  which reproduced the reviewer's result. Not a regression against a
+  release: the random relocation it replaced was never released
+  (installed build e226a2e).
+- **F2, low: a freed link made the next restore add a duplicate** (a
+  middle link deleted; or the item at the id itself, which predates
+  bf0e7e6). Fixed in 8d3d08c: an attribute-less item walks the whole
+  chain, ids looked up in a map. The new test failed before; stopping at
+  the first free id again fails it.
+- **Chain limit (checked, no finding):** the 64-link error could refuse an
+  item with attributes that matched by attributes, with a hand-crafted
+  backup only. 8d3d08c computes such an item's chain only after the
+  attribute match fails, which also removes the unreachable "matched
+  inconsistently" branch.
+- **Checked, no finding:** `replace_existing` never overwrites items with
+  attributes on a chain; restores in either order are stable after the
+  first pass (run); derived ids are 32 lowercase hex and the index format
+  is unchanged; gnome-keyring imports (always with attributes, ids under
+  another tag) can't collide with relocated ids; 9a98b33 and b927d1b
+  change no behaviour.
