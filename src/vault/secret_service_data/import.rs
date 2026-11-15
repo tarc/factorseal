@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::hash::BuildHasher;
 
 use md5::{Digest as _, Md5};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
@@ -122,7 +122,7 @@ pub struct KeyringSourceItem {
 }
 
 /// Why an item is not imported.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KeyringSkipReason {
     /// No program can look it up by attributes.
@@ -150,7 +150,7 @@ impl std::fmt::Display for KeyringSkipReason {
 }
 
 /// An item the import brings, without its value.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct KeyringImportItem {
     /// 64 lowercase hex digits.
     pub fingerprint: String,
@@ -163,7 +163,7 @@ pub struct KeyringImportItem {
 }
 
 /// An item the import leaves out, and why.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct KeyringSkippedItem {
     pub collection: String,
     #[serde(skip_serializing_if = "Option::is_none")]

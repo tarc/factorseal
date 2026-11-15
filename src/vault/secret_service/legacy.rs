@@ -74,6 +74,9 @@ pub(crate) type LegacyItem = crate::vault::KeyringSourceItem;
 pub struct SecretServiceRead {
     pub items: Vec<crate::vault::KeyringSourceItem>,
     pub skipped_collections: Vec<(String, String)>,
+    /// In an inventory, the collections that are locked, empty ones too:
+    /// reading values prompts once for each of them.
+    pub locked_collections: Vec<String>,
 }
 
 /// Read the Secret Service on the session bus, refusing FactorSeal itself:
@@ -328,10 +331,14 @@ impl Legacy {
     }
 
     /// Every item of every collection, locked ones included, with what the
-    /// service shows without an unlock. Never unlocks, never reads a secret.
+    /// service shows without an unlock, and which collections are locked.
+    /// Never unlocks, never reads a secret.
     pub(crate) async fn inventory(&self) -> zbus::Result<SecretServiceRead> {
         let mut read = SecretServiceRead::default();
         for path in self.collections().await? {
+            if self.collection_locked(&path).await? {
+                read.locked_collections.push(collection_name(path.as_str()));
+            }
             read.items
                 .extend(self.items(&path).await?.into_iter().map(|(_, item)| item));
         }
