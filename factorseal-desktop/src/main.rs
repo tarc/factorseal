@@ -18,6 +18,7 @@ mod settings_view;
 mod theming;
 mod timing;
 mod unlock_animation;
+mod wsl_distros;
 
 use std::{borrow::Cow, path::PathBuf};
 

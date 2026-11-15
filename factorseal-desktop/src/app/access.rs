@@ -835,10 +835,36 @@ fn application_name(path: &std::path::Path) -> String {
         .into_owned()
 }
 
+/// Marks a program that WSL declared (the WSL keyring host names the
+/// program behind a keyring call; the vault only sees the WSL broker).
+const DECLARED_BY_WSL: &str = " (from WSL, unverified)";
+
+/// Whether the requesting program is one WSL declared, not one the vault
+/// identified: a Linux program in a request relayed from WSL.
+fn declared_by_wsl(grant: &factorseal::Permission) -> bool {
+    grant.application.declared_wsl_origin.is_some()
+        && grant.principal.platform == factorseal::CallerPlatform::Linux
+}
+
+/// The requesting program's name, marked when WSL declared it.
+fn requester_name(grant: &factorseal::Permission) -> String {
+    let name = application_name(std::path::Path::new(&grant.principal.application_id));
+    if declared_by_wsl(grant) {
+        format!("{name}{DECLARED_BY_WSL}")
+    } else {
+        name
+    }
+}
+
 fn requester_label(grants: &[&factorseal::Permission]) -> Option<String> {
     single(grants.iter().map(|grant| &grant.principal)).map(|principal| {
         if grants.iter().all(|grant| is_secretspec_request(grant)) {
             "SecretSpec".to_owned()
+        } else if grants.iter().all(|grant| declared_by_wsl(grant)) {
+            format!(
+                "{}{DECLARED_BY_WSL}",
+                visible_text(&principal.application_id)
+            )
         } else {
             visible_text(&principal.application_id)
         }
@@ -1513,11 +1539,7 @@ impl Render for AccessView {
                     .child(detail("WSL distro", distro.clone(), cx))
                     .child(detail("Access expires", "When the vault seals", cx));
             }
-            card = card.child(detail(
-                "Requested by",
-                application_name(std::path::Path::new(&grant.principal.application_id)),
-                cx,
-            ));
+            card = card.child(detail("Requested by", requester_name(grant), cx));
             grant_technical = grant_technical.child(detail(
                 "Executable",
                 display_executable(&grant.principal.application_id),
@@ -1889,6 +1911,29 @@ mod tests {
             Some(path("factorseal.exe").as_str())
         );
         assert!(grant_scope_note(std::slice::from_ref(&grant)).contains("entries, app, folder"));
+
+        // A WSL keyring request names a program WSL declared, not one the
+        // vault saw; the WSL broker of a SecretSpec request is still named
+        // as itself.
+        let mut from_wsl = grant.clone();
+        from_wsl.application = from_wsl
+            .application
+            .with_declared_wsl_origin(Some("NixOS".to_owned()))
+            .expect("a valid distro");
+        assert_eq!(
+            requester_label(&[&from_wsl]).as_deref(),
+            Some(path("factorseal.exe").as_str())
+        );
+        from_wsl.principal.platform = factorseal::CallerPlatform::Linux;
+        from_wsl.principal.application_id = "/usr/bin/secret-tool".to_owned();
+        assert_eq!(
+            requester_label(&[&from_wsl]).as_deref(),
+            Some("/usr/bin/secret-tool (from WSL, unverified)")
+        );
+        assert_eq!(
+            requester_name(&from_wsl),
+            "secret-tool (from WSL, unverified)"
+        );
 
         // A SecretSpec write defaults to this write only. An incompatible
         // request must not silently broaden that choice to an hour.

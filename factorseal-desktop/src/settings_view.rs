@@ -105,14 +105,22 @@ pub(crate) enum Section {
     Appearance,
     Security,
     Browsers,
+    WslKeyrings,
     Diagnostics,
 }
 
 impl Section {
     pub(crate) fn visible(browsers: bool) -> Vec<Self> {
+        Self::visible_with(browsers, cfg!(windows))
+    }
+
+    /// The sections shown, with the browser extensions only when a browser
+    /// bridge is available and WSL keyrings only on Windows.
+    fn visible_with(browsers: bool, wsl: bool) -> Vec<Self> {
         [Self::Appearance, Self::Security]
             .into_iter()
             .chain(browsers.then_some(Self::Browsers))
+            .chain(wsl.then_some(Self::WslKeyrings))
             .chain([Self::Diagnostics])
             .collect()
     }
@@ -122,6 +130,7 @@ impl Section {
             Self::Appearance => "Appearance",
             Self::Security => "Security",
             Self::Browsers => "Browser extensions",
+            Self::WslKeyrings => "WSL keyrings",
             Self::Diagnostics => "Diagnostics",
         }
     }
@@ -131,6 +140,7 @@ impl Section {
             Self::Appearance => IconName::Palette.into(),
             Self::Security => Glyph::Lock.into(),
             Self::Browsers => IconName::Globe.into(),
+            Self::WslKeyrings => Glyph::Key.into(),
             Self::Diagnostics => Glyph::Bug.into(),
         }
     }
@@ -146,6 +156,8 @@ pub(crate) struct SettingsView {
     error: Option<&'static str>,
     export_busy: bool,
     export_complete: bool,
+    /// Read when WSL keyrings is first opened.
+    wsl_distros: Option<crate::wsl_distros::WslDistros>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -238,6 +250,7 @@ impl SettingsView {
             error: None,
             export_busy: false,
             export_complete: false,
+            wsl_distros: None,
             _subscriptions: subscriptions,
         }
     }
@@ -253,7 +266,21 @@ impl SettingsView {
     pub(crate) fn set_section(&mut self, section: Section, cx: &mut Context<Self>) {
         self.section = section;
         self.error = None;
+        if section == Section::WslKeyrings {
+            Self::load_wsl_distros(cx);
+        }
         cx.notify();
+    }
+
+    fn load_wsl_distros(cx: &mut Context<Self>) {
+        cx.spawn(async move |view, cx| {
+            let distros = smol::unblock(crate::wsl_distros::WslDistros::load).await;
+            let _ = view.update(cx, |view, cx| {
+                view.wsl_distros = Some(distros);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn save(&mut self, settings: DesktopSettings, window: &mut Window, cx: &mut Context<Self>) {
@@ -340,7 +367,7 @@ impl SettingsView {
         )
     }
 
-    fn setting(label: &'static str, control: impl IntoElement, cx: &App) -> Div {
+    fn setting(label: impl Into<SharedString>, control: impl IntoElement, cx: &App) -> Div {
         h_flex()
             .w_full()
             .min_h_12()
@@ -352,7 +379,7 @@ impl SettingsView {
                 div()
                     .min_w_0()
                     .text_color(cx.theme().muted_foreground)
-                    .child(label),
+                    .child(label.into()),
             )
             .child(control)
     }
@@ -515,6 +542,85 @@ impl SettingsView {
             .collect()
     }
 
+    /// The distros listed: those registered, then any switched on that are
+    /// no longer registered, so they can still be switched off.
+    fn wsl_rows(registered: &[String], saved: &[String]) -> Vec<(String, bool)> {
+        registered
+            .iter()
+            .chain(saved.iter().filter(|distro| !registered.contains(distro)))
+            .map(|distro| (distro.clone(), saved.contains(distro)))
+            .collect()
+    }
+
+    fn wsl_switch(
+        distro: String,
+        checked: bool,
+        broker_installed: bool,
+        cx: &mut Context<Self>,
+    ) -> crate::controls::ToggleFrame {
+        let id = SharedString::from(format!("wsl-keyring-{distro}"));
+        crate::controls::toggle_frame(
+            SharedString::from(format!("{id}-frame")),
+            Switch::new(id)
+                .accessibility_label(format!("Use this vault as the keyring of {distro}"))
+                .checked(checked)
+                // Without the broker, a distro can only be switched off.
+                .disabled(!broker_installed && !checked)
+                .on_click(cx.listener(move |view, checked: &bool, window, cx| {
+                    let mut settings = appearance::current(cx).clone();
+                    settings.wsl_keyrings.retain(|saved| saved != &distro);
+                    if *checked {
+                        settings.wsl_keyrings.push(distro.clone());
+                    }
+                    view.save(settings, window, cx);
+                })),
+        )
+    }
+
+    fn wsl_keyrings(&self, cx: &mut Context<Self>) -> Div {
+        let panel = v_flex().gap_3();
+        let Some(distros) = self.wsl_distros.clone() else {
+            return panel.child(Self::note("Looking for WSL distros…", cx));
+        };
+        let saved = appearance::current(cx).wsl_keyrings.clone();
+        let registered = distros.registered.as_deref().unwrap_or_default();
+        let rows: Vec<_> = Self::wsl_rows(registered, &saved)
+            .into_iter()
+            .map(|(distro, checked)| {
+                let switch =
+                    Self::wsl_switch(distro.clone(), checked, distros.broker_installed, cx);
+                Self::setting(distro, switch, cx)
+            })
+            .collect();
+        let danger = cx.theme().danger;
+        panel
+            .when(rows.is_empty(), |panel| {
+                panel.child(Self::note(
+                    "No WSL distros are installed for this Windows user.",
+                    cx,
+                ))
+            })
+            .when(!rows.is_empty(), |panel| panel.child(Self::list(rows, cx)))
+            .child(Self::note(
+                "Programs in a distro switched on here use this vault as their keyring (org.freedesktop.secrets) through factorseal wsl-keyring, set up in the distro with factorseal wsl-setup. Each program asks here before it reads or writes an item, and its access ends when the vault seals.",
+                cx,
+            ))
+            .child(Self::note(
+                "FactorSeal cannot verify which program in WSL is asking: the name it shows comes from WSL, and any program there can act as another.",
+                cx,
+            ))
+            .when(!distros.broker_installed, |panel| {
+                panel.child(div().text_body().text_color(danger).child(
+                    "The WSL broker (factorseal-wsl-broker.exe) is not installed beside FactorSeal, so no distro can use this vault.",
+                ))
+            })
+            .when_some(distros.registered.err(), |panel, error| {
+                panel.child(div().text_body().text_color(danger).child(format!(
+                    "Could not list the WSL distros: {error}"
+                )))
+            })
+    }
+
     fn diagnostics(&self, cx: &mut Context<Self>) -> Div {
         let crash_reports = Self::crash_reports_row(cx);
         let export = self.export_button(cx);
@@ -574,6 +680,7 @@ impl SettingsView {
                 ))
                 .child(h_flex().text_body().child(protection)),
             Section::Browsers => browsers.map_or_else(div, |browsers| Self::browsers(browsers, cx)),
+            Section::WslKeyrings => self.wsl_keyrings(cx),
             Section::Diagnostics => self.diagnostics(cx),
         };
         let danger = cx.theme().danger;
@@ -659,7 +766,7 @@ mod tests {
 
     #[test]
     fn browser_extensions_tab_shows_only_when_available() {
-        let sections = Section::visible;
+        let sections = |browsers| Section::visible_with(browsers, false);
         assert_eq!(
             sections(false),
             [Section::Appearance, Section::Security, Section::Diagnostics]
@@ -671,6 +778,33 @@ mod tests {
                 Section::Security,
                 Section::Browsers,
                 Section::Diagnostics
+            ]
+        );
+        assert_eq!(
+            Section::visible_with(false, true),
+            [
+                Section::Appearance,
+                Section::Security,
+                Section::WslKeyrings,
+                Section::Diagnostics
+            ]
+        );
+    }
+
+    #[test]
+    fn wsl_keyrings_list_registered_distros_and_switched_on_leftovers() {
+        let names = |names: &[&str]| {
+            names
+                .iter()
+                .map(|&name| name.to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            SettingsView::wsl_rows(&names(&["NixOS", "Ubuntu"]), &names(&["Ubuntu", "Gone"])),
+            [
+                ("NixOS".to_owned(), false),
+                ("Ubuntu".to_owned(), true),
+                ("Gone".to_owned(), true),
             ]
         );
     }

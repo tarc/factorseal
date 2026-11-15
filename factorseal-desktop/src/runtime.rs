@@ -1245,6 +1245,20 @@ fn live_status(
     }
 }
 
+/// Whether the WSL broker is installed beside the CLI that runs this
+/// Desktop's worker: the only broker the worker grants WSL keyrings to.
+#[cfg(windows)]
+pub(crate) fn wsl_broker_installed() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|desktop| cli_executable(&desktop).ok().flatten())
+        .and_then(|cli| {
+            cli.parent()
+                .map(|folder| folder.join("factorseal-wsl-broker.exe"))
+        })
+        .is_some_and(|broker| broker.is_file())
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn native_client(config: &RuntimeConfig, _metadata: &VaultMetadata) -> NativeVaultClient {
     NativeVaultClient::new(
