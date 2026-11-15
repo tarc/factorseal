@@ -39,9 +39,10 @@ const PROMPT_LIMIT: Duration = Duration::from_secs(5 * 60 + 5);
 
 /// How long a move may take: an inventory's time for starting WSL,
 /// reading values and the archive's key derivation, plus one prompt's
-/// limit per locked collection, since the prompts come one after another.
-pub(crate) fn move_limit(locked_collections: usize) -> Duration {
-    INVENTORY_LIMIT + PROMPT_LIMIT * u32::try_from(locked_collections).unwrap_or(u32::MAX / 400)
+/// limit per collection that may prompt, since the prompts come one after
+/// another.
+pub(crate) fn move_limit(prompt_collections: usize) -> Duration {
+    INVENTORY_LIMIT + PROMPT_LIMIT * u32::try_from(prompt_collections).unwrap_or(u32::MAX / 400)
 }
 
 /// The script `sh -lc` runs. The distro is `$1`, never pasted into the
@@ -197,6 +198,9 @@ struct Record {
     /// Absent from a CLI older than Desktop's check.
     #[serde(default)]
     locked_collections: Option<Vec<String>>,
+    /// Every collection the inventory visited; absent from an older CLI.
+    #[serde(default)]
+    collections: Option<Vec<String>>,
     #[serde(default)]
     archive: Option<String>,
 }
@@ -287,27 +291,38 @@ pub(crate) struct Check {
     pub(crate) missing: Vec<KeyringImportItem>,
     pub(crate) skipped: Vec<KeyringSkippedItem>,
     pub(crate) skipped_collections: Vec<SkippedCollection>,
-    /// How many gnome-keyring password prompts a move may bring.
+    /// How many collections are locked now.
     pub(crate) locked_collections: usize,
+    /// How many password prompts a move may bring: every collection, since
+    /// any may be locked by then, and at least one.
+    pub(crate) prompt_collections: usize,
 }
 
 /// Compare an inventory with the vault's fingerprints. Only fingerprints
 /// count: the collection and label of a duplicate may differ between
 /// Check and Move.
 fn compare(record: Record, vault: &HashSet<String>) -> Check {
-    let locked_collections = record.locked_collections.map_or_else(
-        // An older CLI: every collection with an item may be locked.
-        || {
-            record
-                .items
-                .iter()
-                .map(|item| &item.collection)
-                .chain(record.skipped.iter().map(|item| &item.collection))
-                .collect::<BTreeSet<_>>()
-                .len()
-        },
-        |locked| locked.iter().collect::<BTreeSet<_>>().len(),
-    );
+    let locked = record.locked_collections.clone().unwrap_or_else(|| {
+        // An older CLI: the collections of its locked items.
+        record
+            .items
+            .iter()
+            .filter(|item| item.locked)
+            .map(|item| item.collection.clone())
+            .collect()
+    });
+    let locked_collections = locked.iter().collect::<BTreeSet<_>>().len();
+    // Every collection seen may be locked by the time of the move.
+    let prompt_collections = record
+        .collections
+        .iter()
+        .flatten()
+        .chain(&locked)
+        .chain(record.items.iter().map(|item| &item.collection))
+        .chain(record.skipped.iter().map(|item| &item.collection))
+        .collect::<BTreeSet<_>>()
+        .len()
+        .max(1);
     let missing = record
         .items
         .iter()
@@ -320,6 +335,7 @@ fn compare(record: Record, vault: &HashSet<String>) -> Check {
         skipped: record.skipped,
         skipped_collections: record.skipped_collections,
         locked_collections,
+        prompt_collections,
     }
 }
 
@@ -390,7 +406,7 @@ fn check_entries(archive: &VaultArchive, distro: &str) -> Result<(), String> {
 pub(crate) fn move_items(
     wsl: &dyn Wsl,
     distro: &str,
-    locked_collections: usize,
+    prompt_collections: usize,
     restore: impl FnOnce(VaultArchive) -> Result<(usize, usize), String>,
     cancel: &AtomicBool,
 ) -> Result<MoveReport, String> {
@@ -403,7 +419,7 @@ pub(crate) fn move_items(
         EXPORT_SCRIPT,
         "export",
         Some(&stdin),
-        move_limit(locked_collections),
+        move_limit(prompt_collections),
         cancel,
     )?;
     let encrypted = record
@@ -747,6 +763,7 @@ mod tests {
             ],
             "skipped_collections": [],
             "locked_collections": ["login", "other", "empty"],
+            "collections": ["login", "other", "empty", "unlocked"],
         })
     }
 
@@ -790,12 +807,52 @@ mod tests {
         );
         assert_eq!(check.skipped.len(), 1);
         assert_eq!(check.locked_collections, 3);
+        assert_eq!(check.prompt_collections, 4, "the unlocked one may lock");
     }
 
     #[test]
-    fn an_older_cli_counts_every_collection_with_an_item_as_locked() {
+    fn a_move_may_prompt_for_every_collection_even_unlocked_ones() {
+        let unlocked = serde_json::json!({
+            "target": "wsl:NixOS",
+            "items": [
+                {"fingerprint": fingerprint('a'), "collection": "login", "locked": false, "label": "gh"},
+            ],
+            "skipped": [{"collection": "other", "label": "bare", "reason": "no_attributes"}],
+            "skipped_collections": [],
+            "locked_collections": [],
+            "collections": ["login", "other", "empty"],
+        });
+        let wsl = FakeWsl::new(vec![output(framed("inventory", &unlocked), "", 0)]);
+        let first = check(
+            &wsl,
+            "NixOS",
+            || Ok(HashSet::new()),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(first.locked_collections, 0);
+        assert_eq!(first.prompt_collections, 3);
+        let mut empty = unlocked;
+        empty["items"] = serde_json::json!([]);
+        empty["skipped"] = serde_json::json!([]);
+        empty["collections"] = serde_json::json!([]);
+        let wsl = FakeWsl::new(vec![output(framed("inventory", &empty), "", 0)]);
+        let check = check(
+            &wsl,
+            "NixOS",
+            || Ok(HashSet::new()),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(check.prompt_collections, 1, "at least one");
+    }
+
+    #[test]
+    fn an_older_cli_counts_every_collection_with_an_item() {
         let mut record = inventory();
-        record.as_object_mut().unwrap().remove("locked_collections");
+        let record_map = record.as_object_mut().unwrap();
+        record_map.remove("locked_collections");
+        record_map.remove("collections");
         record["skipped"][0]["collection"] = "third".into();
         let wsl = FakeWsl::new(vec![output(framed("inventory", &record), "", 0)]);
         let check = check(
@@ -805,7 +862,11 @@ mod tests {
             &AtomicBool::new(false),
         )
         .unwrap();
-        assert_eq!(check.locked_collections, 3);
+        assert_eq!(
+            check.locked_collections, 2,
+            "login and other have locked items"
+        );
+        assert_eq!(check.prompt_collections, 3);
         assert_eq!(check.missing.len(), 3);
     }
 

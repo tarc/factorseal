@@ -765,7 +765,7 @@ impl SettingsView {
             return;
         };
         let cancel = Arc::new(AtomicBool::new(false));
-        let locked = check.locked_collections;
+        let locked = check.prompt_collections;
         self.keyring_moves.insert(
             distro.clone(),
             KeyringMove::Moving(check.clone(), Arc::clone(&cancel)),

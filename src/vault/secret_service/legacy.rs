@@ -77,6 +77,9 @@ pub struct SecretServiceRead {
     /// In an inventory, the collections that are locked, empty ones too:
     /// reading values prompts once for each of them.
     pub locked_collections: Vec<String>,
+    /// In an inventory, every collection visited: any of them may be
+    /// locked by the time values are read.
+    pub collections: Vec<String>,
 }
 
 /// Read the Secret Service on the session bus, refusing FactorSeal itself:
@@ -356,6 +359,7 @@ impl Legacy {
     pub(crate) async fn inventory(&self) -> zbus::Result<SecretServiceRead> {
         let mut read = SecretServiceRead::default();
         for path in self.collections().await? {
+            read.collections.push(collection_name(path.as_str()));
             if self.collection_locked(&path).await? {
                 read.locked_collections.push(collection_name(path.as_str()));
             }

@@ -14,7 +14,8 @@
 //! ```
 //!
 //! The record has `target`, `items`, `skipped` and `skipped_collections`,
-//! and also `locked_collections` in an inventory and `archive` in an export.
+//! and also `locked_collections` and `collections` in an inventory, and
+//! `archive` in an export.
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -101,6 +102,9 @@ struct Record<'a> {
     /// each, which Desktop's time limit on it counts.
     #[serde(skip_serializing_if = "Option::is_none")]
     locked_collections: Option<&'a [String]>,
+    /// In an inventory, every collection: any may be locked by the move.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    collections: Option<&'a [String]>,
     /// The encrypted archive, base64, in an export.
     #[serde(skip_serializing_if = "Option::is_none")]
     archive: Option<String>,
@@ -111,7 +115,7 @@ fn record<'a>(
     items: &'a [KeyringImportItem],
     skipped: &'a [KeyringSkippedItem],
     skipped_collections: &'a [(String, String)],
-    locked_collections: Option<&'a [String]>,
+    collections: Option<(&'a [String], &'a [String])>,
     archive: Option<String>,
 ) -> Record<'a> {
     Record {
@@ -122,7 +126,8 @@ fn record<'a>(
             .iter()
             .map(|(collection, reason)| SkippedCollection { collection, reason })
             .collect(),
-        locked_collections,
+        locked_collections: collections.map(|(locked, _)| locked),
+        collections: collections.map(|(_, all)| all),
         archive,
     }
 }
@@ -213,7 +218,7 @@ pub(super) fn run(
             &import.items,
             &import.skipped,
             &read.skipped_collections,
-            Some(&read.locked_collections),
+            Some((&read.locked_collections, &read.collections)),
             None,
         ))
         .map_err(transfer_error)?;
@@ -320,6 +325,7 @@ mod tests {
             ],
             skipped_collections: vec![("other".to_owned(), "unlock dismissed".to_owned())],
             locked_collections: Vec::new(),
+            collections: Vec::new(),
         })
     }
 
@@ -341,6 +347,7 @@ mod tests {
             items: vec![item],
             skipped_collections: Vec::new(),
             locked_collections: vec!["login".to_owned()],
+            collections: vec!["login".to_owned(), "other".to_owned()],
         })
     }
 
@@ -456,6 +463,7 @@ mod tests {
         );
         assert!(record.get("archive").is_none());
         assert_eq!(record["locked_collections"], serde_json::json!(["login"]));
+        assert_eq!(record["collections"], serde_json::json!(["login", "other"]));
         assert!(stderr.contains("1 item(s) to import"), "{stderr}");
     }
 
@@ -486,6 +494,7 @@ mod tests {
         let (kind, record) = unframe(&stdout);
         assert_eq!(kind, "export");
         assert!(record.get("locked_collections").is_none());
+        assert!(record.get("collections").is_none());
         assert_eq!(record["items"][0]["label"], "gh");
         assert_eq!(record["skipped"][0]["label"], "bare");
         assert_eq!(record["skipped"][0]["reason"], "no_attributes");

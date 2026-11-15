@@ -430,6 +430,7 @@ async fn inventory_lists_locked_items_without_unlocking_or_reading_secrets() {
     );
     assert_eq!(read.skipped_collections, []);
     assert_eq!(read.locked_collections, ["login", "other"]);
+    assert_eq!(read.collections, ["login", "other"]);
     {
         let fake = shared.lock().unwrap();
         assert_eq!(fake.calls.unlocks, 0);
@@ -457,6 +458,7 @@ async fn inventory_names_every_locked_collection_even_an_empty_one() {
     let (_server, legacy, _shared) = serve(fake).await;
     let read = legacy.inventory().await.unwrap();
     assert_eq!(read.locked_collections, ["login", "empty"]);
+    assert_eq!(read.collections, ["login", "other", "empty"]);
     legacy.close().await;
 }
 
