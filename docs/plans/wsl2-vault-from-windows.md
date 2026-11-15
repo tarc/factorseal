@@ -5,7 +5,9 @@ Status, 2026-11-15: milestone 1 (SecretSpec in WSL) is done on
 3ecbb9a, no PR), and the fixes from its independent review are committed
 on top (see "Review fixes" below), the Desktop popup fix (finding 1)
 included once the user saw it in the native build.
-Milestone 2 (the WSL keyring) is planned below and not started. This branch
+Milestone 2 (the WSL keyring) is implemented and committed, except its
+Desktop UI, which waits for the user's review in the native build (see
+"Milestone 2: progress" below). Nothing is pushed. This branch
 sits on `stack/7-browser-windows`, the top of the WSL2 PR stack (#42 → #43 →
 #44 → #46 → #47, index #40); rebase it with `git rebase --onto` when the stack
 changes or merges.
@@ -157,6 +159,61 @@ accepts longer WSL durations, clamped) were acceptable in the review.
 `single_use_write_permission_allows_exactly_one_write` (native, older)
 asserts the same exact approval time that made 3c7c41a flaky.
 
+## Milestone 2: progress (2026-11-15)
+
+Design: [wsl2-keyring-design.md](wsl2-keyring-design.md). Decisions the user
+took this session: a Settings switch takes effect at once; `Lock` from WSL is
+refused; items in gnome-keyring are left alone; the broker learns the vault
+root from `wsl.json` (so `check.sh keyring` can use the broker beside the test
+Desktop's CLI); the Projects/Provider-cache copy splits the two flows (see
+"Separate" below). Each commit passed the gate (fmt, workspace clippy, the
+`wsl protocol::wsl` lib tests under a private bus, the `relayed wsl
+grant_lifetime` CLI tests, plus the filters of what it touched), and its tests
+were seen failing without the change, by a mutation of the code each guards
+where the change added new types (every mutation listed in the session was
+caught).
+
+| Commit | What, and how it was verified |
+|---|---|
+| fc3fc0b | This design note and the decisions. |
+| c6631da | Protocol v20 `WslKeyringAccess` (declared caller, distro and folder from the broker's context, host grant on `factorseal/wsl-secret-service/v1/<distro>`, action confined to it, `wsl:<distro>:uid:<n>` principal, until-seal lifetime); `KeyringAccess` and it share one path. Vault tests + 8 mutations. |
+| 35574d2 | `set_wsl_keyring_hosts` (Get/Put/Delete until the absolute deadline, a `wsl-keyring-hosts` record to revoke) and manager-only `SetWslKeyrings`. Tests incl. a session sealed early (real clock: the store's open purge uses it) + 5 mutations. |
+| fde20ca | New, found while building: export looked keyring items up in the native index only, so one WSL keyring item broke every backup; import, archive check and inventory labels fixed too. Test seen failing first + 4 mutations. |
+| 2026ae6 | Worker: `wsl_keyrings` in the bootstrap, broker beside the CLI identified on Windows, applied at every unlock (non-fatal), no write when there is nothing to change. Shared `test_vault` fixture for CLI tests. Tests + 3 mutations; `cargo xwin clippy` of the CLI caught a Windows-only type error before commit. |
+| 3181c6d | Broker allowlist per namespace: `WslKeyringAccess` only for its distro, plain `Get` only of that keyring's index, never Seal. Test seen failing against the old allowlist + 3 mutations; broker cross-clippy. |
+| 4b2fdd9 | Host: store with namespace and caller declarer, `install_wsl`, `start_with_options` (no NetworkManager agent; not unit-testable, spawned under `cfg(not(test))`), `Lock` locks nothing for WSL, and new: a WSL `CreateItem` names its item first (the vault approves writes to named items only, so `secret-tool store` could never have been approved). End-to-end D-Bus test with a simulated broker + declarer test + planned-item test + 6 mutations. |
+| 669e425 | `factorseal wsl-keyring` (state machine, sealed detection by idle deadline and by `Sealed` answers, unlock through a fresh broker). Unit tests + 4 mutations; smoke run without `wsl.json`. |
+| db4ae0e | New, user's decision: `wsl.json` records `windows_root`, the client passes `relay --root`, the broker starts Desktop on that vault. Tests + 3 mutations; broker cross-clippy. |
+| ed28f3b | NixOS `mode = "wsl"` (user service + activation file, TPM/polkit/tss only for agent/desktop). New flake check `nixos-module-wsl` (failed before the change); agent-mode VM test derivation unchanged. |
+| 3fe57bd | Desktop non-UI: `wsl_keyrings` in preferences (validated), bootstrap, live `SetWslKeyrings`, hidden `--wsl-keyring`. Tests + 3 mutations. |
+| f8a862d | `build-windows.sh` skips `.boostgraph/` (a Unix socket robocopy cannot copy, exit 9). Verified by the next mirror. |
+| 7d40aeb | The `relay --root` test is Linux-only (it broke `build-windows.sh check`'s relay tests on Windows). |
+| (packaging) | `build-windows.ps1` builds and ships the broker; the built unsigned ZIP lists `factorseal-wsl-broker.exe` (the old script built none). |
+
+Verified natively and live: `build-windows.sh check` (clippy, Desktop 172
+tests, relay 13 tests); `build-windows.sh release --broker`; **`check.sh
+keyring` PASS** on the test vault: store and lookup each asked in the popup,
+which names "secret-tool (from WSL, unverified)" and "When the vault seals";
+the lookup's grant expires at the unseal deadline; a second lookup without a
+popup (1.9 s: each Secret Service call resolves the caller and crosses the
+broker); another program asked for itself (denied); the collection locked
+after a seal; a lookup after the unlock asked again. Settings → WSL keyrings
+seen through UI Automation in the test Desktop (switches for NixOS,
+docker-desktop, podman-machine-default). Full suites: lib 506 passed (5
+ignored), CLI 79, Desktop 187. poita built (`nix build --no-link`) with the
+proposed system-flakes edit: the activation file runs `factorseal
+wsl-keyring`, no gnome-keyring unit.
+
+Uncommitted, for the user's review in the native build: Settings → WSL
+keyrings and the popup's "(from WSL, unverified)"; the Projects/Provider
+cache copy; `check.sh keyring` (asserts the popup text); the docs (SECURITY.md,
+architecture, usage), which describe the Settings switch. The system-flakes edit (poita) is a proposal, not
+committed there.
+
+Notes for later: libsecret clients give up after D-Bus's 25 s while an
+approval waits (the request stays pending); the native headless agent has the
+same unnamed-`CreateItem` limitation as WSL had (not changed: out of scope).
+
 ## Milestone 2: the WSL keyring (planned)
 
 The design, its re-checked facts and the user's decisions of 2026-11-15
@@ -251,6 +308,16 @@ that stores under Provider cache, whose page calls its values "expiring local
 copies" (~1142) though a plain set never expires. Fix: Projects points to
 `factorseal set --project`; Provider cache says it also holds values stored by
 `secretspec set`, which do not expire. UI change: validate natively first.
+
+2026-11-15: the provider reads only Provider cache (`GetCache`; a throwaway
+test showed a `PutProject` value found by `GetProject` and not by
+`GetCache`), so Projects must not keep the SecretSpec steps. The user chose to
+split the flows: Projects = `factorseal set/get --project` for scripts, with a
+line that SecretSpec does not read these; Provider cache = what SecretSpec
+stores through factorseal://default (`secretspec set` values do not expire),
+with the init/set/run steps and the cache alias; the links follow
+(FactorSeal's usage docs, SecretSpec's Quick Start). Done, uncommitted until
+the user has seen it.
 
 ## Working notes for the next session
 
