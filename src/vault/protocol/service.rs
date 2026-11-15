@@ -1041,10 +1041,17 @@ fn import_secret_service_item(
     let mut index = secret_service_index(store, partition, now)?;
     // An item that answers the same lookup is the existing one, matched as
     // CreateItem with replace=true matches: the first in index order. An
-    // item without attributes answers no lookup, so it matches by id only.
+    // item without attributes answers no lookup, so it matches by id, or,
+    // once a taken id gave it a fresh one, by label, content type and
+    // creation time, so a repeated restore keeps it instead of adding it
+    // again.
     let existing = index.items.iter().position(|item| {
         if portable.item.attributes.is_empty() {
-            item.id == portable.item.id && item.attributes.is_empty()
+            item.attributes.is_empty()
+                && (item.id == portable.item.id
+                    || (item.label == portable.item.label
+                        && item.content_type == portable.item.content_type
+                        && item.created == portable.item.created))
         } else {
             item.attributes == portable.item.attributes
         }

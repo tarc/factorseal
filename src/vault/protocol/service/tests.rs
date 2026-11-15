@@ -5697,3 +5697,25 @@ fn vault_keyring_fingerprints_never_read_attributes_as_gnome_keyring_hashes() {
         [hex::encode(plain)]
     );
 }
+
+#[test]
+fn restoring_an_attribute_less_item_whose_id_is_taken_twice_adds_it_once() {
+    for partition in keyring_partitions() {
+        let (_directory, service) = service(100, UnsealLeasePolicy::default());
+        let manager = caller();
+        service.authorize_permission_manager(&manager, 100).unwrap();
+        let id = "11111111111111111111111111111111";
+        let taken = keyring_item(id, GH, "taken", 5);
+        let bare = keyring_item(id, &[], "bare", 6);
+        import_keyring_item(&service, &manager, &partition, &taken, b"one", false, 101);
+        assert_eq!(
+            import_keyring_item(&service, &manager, &partition, &bare, b"two", false, 102),
+            VaultEntryImportStatus::Added
+        );
+        assert_eq!(
+            import_keyring_item(&service, &manager, &partition, &bare, b"two", false, 103),
+            VaultEntryImportStatus::KeptExisting
+        );
+        assert_eq!(keyring_items(&service, &manager, &partition, 104).len(), 2);
+    }
+}
