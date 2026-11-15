@@ -4,7 +4,8 @@ Status, 2026-11-15: steps 1–5 and 7 implemented (de2780e..3b49775), then
 the implementation review acted on (fc49f02..3555cbd), the review of
 those fixes (cbada0a..d03d54a), a third review (bf0e7e6..b927d1b) and a
 fourth (after b927d1b); step 6 implemented (b3429f9, 6539cb5) and its
-review acted on (4cfeaa0..84ef1d7, see "Step 6 review"); steps 8 and 9
+review acted on (4cfeaa0..84ef1d7, see "Step 6 review"), then a review
+of those fixes (1b1ab6d..8cfd413, "Step 6 fixes review"); steps 8 and 9
 remain. All reviews
 are folded in (see "Review record" and "Implementation
 record" at the end). Branch: `feature/wsl2-keyring` (the WSL keyring this
@@ -321,7 +322,12 @@ until the user has seen it in the native build.
    distro). It starts locked, so nothing is asked. dbus-daemon answers
    `ServiceUnknown` without a service file even while the name has an
    owner (seen on the test bus), so that answer leaves the owner lookup to
-   decide.
+   decide. In a distro already switched to FactorSeal's keyring the
+   activation file is FactorSeal's, so this starts FactorSeal's own
+   service and the export then refuses it ("is FactorSeal itself"):
+   accepted, since any libsecret client there starts the same service and
+   the export reads nothing from it; Desktop names the case (fixes review
+   F6-2).
 
    An unlock prompt unanswered for five minutes is dismissed
    (`Prompt.Dismiss`) and its collection reported as "unlock timed out": a
@@ -484,7 +490,8 @@ until the user has seen it in the native build.
    - The one-time passphrase is the personal generator's random style,
      32 letters and digits.
    - Errors: exit 127 (no `factorseal`), "no Secret Service" or "no
-     session bus" ("none can be started there"), "unrecognized
+     session bus" ("none can be started there"), "is FactorSeal itself"
+     ("already uses FactorSeal's keyring", F6-2), "unrecognized
      subcommand" (a CLI too old), else the CLI's own lines (`factorseal:`
      or `error:`), or the last three lines, of stderr, or of stdout when
      stderr is empty (where `wsl.exe` writes its UTF-16 messages). A login
@@ -495,10 +502,14 @@ until the user has seen it in the native build.
      after any Move that reached the restore, since a failed one may have
      added items (S6-7).
    - The frame parser looks for a header's newline only within 64 bytes,
-     so its scan is linear (S6-2). `wsl.exe`'s stderr is kept up to 64
-     KiB, its stdout up to 464 MiB (the largest valid frame); output past
-     a cap is read to the end and dropped, so the child isn't blocked on
-     a full pipe (S6-8).
+     and checks a body against the base64 alphabet before decoding it
+     (the decoder first zeroes a buffer the size of the body), so its scan
+     is linear (S6-2, F6-1). `wsl.exe`'s stderr is kept as its last 64
+     KiB, where the CLI's error is (F6-3); its stdout up to
+     `MAX_KEYRING_FRAME_BYTES` (512 MiB of frame body) plus a MiB, a limit
+     the CLI shares and refuses to exceed with an error the row shows
+     (F6-4). Output past a cap is read to the end and dropped, so the
+     child isn't blocked on a full pipe (S6-8).
    - Sealed: the buttons are disabled and a note asks for the unlock;
      the page doesn't start one itself.
    - After a move Desktop reads the vault again, so the moved items show
@@ -711,6 +722,10 @@ mutation, and the gate:
 | e45811d | S6-8: stderr cap, drain past the caps |
 | 3750863 | S6-6: the CLI's own error line on the row |
 | 84ef1d7 | S6-7: a failed restore is reported and the vault read again |
+| 1b1ab6d | fixes review F6-1: base64 check before decoding a frame body |
+| f73a05e | F6-3: keep the end of stderr |
+| 8cfd413 | F6-4: one frame limit shared by the CLI and Desktop |
+| (pending) | F6-2: Desktop names a distro on FactorSeal's keyring (uncommitted until the user's OK) |
 
 `fuzz/Cargo.lock` gained only the `md-5` entry; it already failed
 `cargo metadata --locked` at 4ed2d2d (missing `embed-resource`), which is
@@ -977,8 +992,10 @@ relay's 14.
 - **S6-2, medium (ran): quadratic frame parser.** Fixed in 0c3c6a2 (step
   6). The test (1.3 MB of markers; 16384 candidates whose lengths all end
   at one end line) took 64 s before. A base64 check before decoding,
-  for the overlapping candidates, was tried and dropped: its mutation
-  survived, the decoder already failing fast on such bodies.
+  for the overlapping candidates, was tried and dropped because its
+  mutation survived. That was wrong: the test was too small, and glibc
+  hides the decoder's zeroed buffer; the fixes review (F6-1) measured it
+  on Windows, and 1b1ab6d restores the check.
 - **S6-3, medium (read): Move's limit fell to 3 minutes when a
   collection locked after Check.** Fixed in e851d9f (step 6, the inventory
   lists every collection).
@@ -1003,7 +1020,8 @@ relay's 14.
 - **S6-8, low (read): output caps allowed ~2 GiB.** Fixed in e45811d.
   Reading the runner for it showed it stopped reading at the cap, leaving
   a child blocked on a full pipe until the time limit; output past a cap
-  is now drained, with a test that fails without it.
+  is now drained, with a test that fails without it. The fixes review
+  found two side effects of the caps, F6-3 and F6-4.
 
 **Checked and fine** (the reviewer's list, not repeated here in full): the
 gate at e7c3020; the parser's functional rules; the record and archive
@@ -1012,6 +1030,54 @@ pipes, stdin EOF, argument passing, exit 127 and its UTF-16 messages
 (run from PowerShell with the same Win32 calls); 20,000 passphrases;
 `locked_collections`; the backstop arithmetic; paging; the UI's stale-run
 guard.
+
+### Step 6 fixes review
+
+An independent review of the fixes 4cfeaa0..84ef1d7 (2026-11-15, at
+ab9de61), behaviour only, on private buses (the user's `Default.keyring`
+mtime equal before and after, checked again here). Its verdict: S6-1,
+S6-3, S6-4, S6-5, S6-6 and S6-7 resolved, S6-2 partly, S6-8 resolved
+with two side effects; four findings. Every point and what became of it,
+so the review file was removed. Gate after the fixes: fmt, workspace
+clippy, lib 557 passed, 1 failed, 6 ignored (`libsecret_store_seal_lookup`
+times out, as on main), CLI 94 passed, Desktop 211 passed, 1 ignored;
+`scripts/test-keyring-import.sh` passes; natively on Windows, clippy,
+Desktop 196 passed, 1 ignored, and the WSL relay's 14.
+
+- **F6-1, medium (ran): the frame scan was still quadratic.** Every
+  candidate ending at an end line reached `STANDARD.decode`, which
+  allocates and zeroes a buffer the size of the body before reading it;
+  natively on Windows, 477 MB of output held the parser for 82–110 s.
+  Fixed in 1b1ab6d with the reviewer's first option, the base64 check
+  before decoding. The test repeats a 30,000-candidate window 20 times
+  (22 MB): natively on Windows it took 4.9 s without the check and
+  fails; on Linux it passes either way (glibc's fresh zero pages), so
+  `build-windows.sh check` is where it guards the fix.
+- **F6-2, low (ran): on a distro switched to FactorSeal's keyring, the
+  export starts FactorSeal's own service and refuses it.** The start is
+  kept (step 2 gives why); Desktop names the case instead of the generic
+  row (pending commit). Its test failed before. Reading which service
+  file D-Bus would start, the reviewer's other option, was not taken:
+  the reviewer called it fragile, and the start does no harm there.
+- **F6-3, low (ran): past 64 KiB of stderr the row lost the CLI's
+  error.** Fixed in f73a05e: the last 64 KiB are kept. The test (3000
+  warning lines, then the error) fails when the head is kept.
+- **F6-4, low (read): a valid export could exceed 464 MiB.** Fixed in
+  8cfd413 with a limit the CLI and Desktop share
+  (`MAX_KEYRING_FRAME_BYTES`, 512 MiB of frame body), the CLI refusing a
+  larger export with an error naming both sizes, rather than a bigger
+  cap alone: item labels are unbounded, so no cap Desktop picks on its
+  own holds every valid record. Dropping the CLI's check fails its test.
+
+**Checked and fine** (the reviewer's list): the gate at ab9de61; each
+fix's test fails with its fix removed; `StartServiceByName` when
+gnome-keyring owns the name with no service file (`ServiceUnknown`
+falls through), when activation never takes the name (fails after the
+bus's timeout, 25 s on the test bus, 120 s in NixOS's session config,
+within the 3-minute limit), when the service can't be spawned, and with
+a broken service file for an owned name; the header bound (the longest
+valid header is 20 bytes); the old-CLI fallback in `compare`; S6-5's
+paging over mixed-case ids.
 
 ### Live check on poita
 
