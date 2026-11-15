@@ -5669,33 +5669,57 @@ fn a_keyring_fingerprint_cursor_must_be_a_lowercase_item_id() {
 }
 
 #[test]
-fn vault_keyring_fingerprints_never_read_attributes_as_gnome_keyring_hashes() {
+fn vault_keyring_fingerprints_count_gkr_compat_names_as_restore_does() {
     // FactorSeal's own Secret Service does not reserve gkr:compat:, so a
-    // program can store such a name; the vault fingerprints it plainly.
-    let (_directory, service) = service(100, UnsealLeasePolicy::default());
-    let manager = caller();
-    service.authorize_permission_manager(&manager, 100).unwrap();
-    let partition = keyring_partitions()[0].clone();
-    let item = keyring_item(
-        "22222222222222222222222222222222",
-        &[("gkr:compat:hashed:x", "zz"), ("service", "gh")],
-        "odd",
-        9,
-    );
-    import_keyring_item(&service, &manager, &partition, &item, b"x", false, 101);
-    let (fingerprints, _, _) = keyring_fingerprints(&service, &manager, None, None, 102).unwrap();
-    let plain = crate::vault::keyring_fingerprint(&std::collections::HashMap::from([(
-        "service".to_owned(),
-        "gh".to_owned(),
-    )]))
-    .unwrap();
-    assert_eq!(
-        fingerprints
-            .iter()
-            .map(|f| f.fingerprint.clone())
-            .collect::<Vec<_>>(),
-        [hex::encode(plain)]
-    );
+    // program can store such a name. The vault fingerprints it plainly,
+    // never as a gnome-keyring hash, and keeps it, as restore compares the
+    // whole attributes: Check then counts an item without that name as
+    // missing, and Move adds it.
+    for (distro, partition) in [
+        (None, keyring_partitions()[0].clone()),
+        (Some("NixOS"), keyring_partitions()[1].clone()),
+    ] {
+        let (_directory, service) = service(100, UnsealLeasePolicy::default());
+        let manager = caller();
+        service.authorize_permission_manager(&manager, 100).unwrap();
+        let attributes = [("gkr:compat:hashed:x", "zz"), ("service", "gh")];
+        let item = keyring_item("22222222222222222222222222222222", &attributes, "odd", 9);
+        import_keyring_item(&service, &manager, &partition, &item, b"x", false, 101);
+        let (fingerprints, _, _) =
+            keyring_fingerprints(&service, &manager, distro, None, 102).unwrap();
+        let plain = |attributes: &[(&str, &str)]| {
+            hex::encode(
+                crate::vault::vault_keyring_fingerprint(
+                    &attributes
+                        .iter()
+                        .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                        .collect::<std::collections::HashMap<_, _>>(),
+                )
+                .unwrap(),
+            )
+        };
+        let listed: Vec<_> = fingerprints.iter().map(|f| f.fingerprint.clone()).collect();
+        assert_eq!(listed, [plain(&attributes)]);
+        let incoming = keyring_item(
+            "33333333333333333333333333333333",
+            &[("service", "gh")],
+            "gh",
+            10,
+        );
+        let incoming_fingerprint = hex::encode(
+            crate::vault::keyring_fingerprint(&std::collections::HashMap::from([(
+                "service".to_owned(),
+                "gh".to_owned(),
+            )]))
+            .unwrap(),
+        );
+        assert!(!listed.contains(&incoming_fingerprint), "Check: missing");
+        assert_eq!(
+            import_keyring_item(&service, &manager, &partition, &incoming, b"y", false, 103),
+            VaultEntryImportStatus::Added,
+            "Move: added"
+        );
+    }
 }
 
 #[test]

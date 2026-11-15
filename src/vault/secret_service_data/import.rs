@@ -42,8 +42,10 @@ pub const MAX_IMPORTED_VALUE_BYTES: usize = 256 * 1024;
 /// counts except the names gnome-keyring reserves (`gkr:compat:*`).
 ///
 /// `source` says the attributes come from another Secret Service; the
-/// vault's own items always take the plain rule, since FactorSeal does not
-/// reserve `gkr:compat:` and a program may store such a name.
+/// vault's own items always take the plain rule over every attribute,
+/// `gkr:compat:*` included: FactorSeal does not reserve the prefix, a
+/// program may store such a name, and a restore compares the whole
+/// attributes, so Check must count such an item apart as Move does.
 fn pairs<S: BuildHasher>(
     attributes: &HashMap<String, String, S>,
     source: bool,
@@ -66,7 +68,7 @@ fn pairs<S: BuildHasher>(
             } else if name == SCHEMA && !hashed_schema {
                 pairs.insert(name.as_str(), Md5::digest(value.as_bytes()).into());
             }
-        } else if !name.starts_with(RESERVED_PREFIX) {
+        } else if !(source && name.starts_with(RESERVED_PREFIX)) {
             pairs.insert(name.as_str(), Md5::digest(value.as_bytes()).into());
         }
     }
@@ -97,8 +99,8 @@ pub fn keyring_fingerprint<S: BuildHasher>(
         .map(|pairs| digest(&pairs))
 }
 
-/// The fingerprint of a FactorSeal keyring item: always the plain rule
-/// (every attribute but `gkr:compat:*`). `None` without attributes.
+/// The fingerprint of a FactorSeal keyring item: always the plain rule,
+/// over every attribute. `None` without attributes.
 #[must_use]
 pub fn vault_keyring_fingerprint<S: BuildHasher>(
     attributes: &HashMap<String, String, S>,
