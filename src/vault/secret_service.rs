@@ -168,12 +168,15 @@ impl SecretServiceHost {
     /// through the WSL broker (`client`). Each caller is resolved here, in
     /// WSL, from its D-Bus connection and declared to the vault, which cannot
     /// see it; the broker must hold that distro's keyring grant.
+    ///
+    /// Blocks until the collection has loaded, and fails if it cannot (for
+    /// one, while the distro is switched off in Desktop). Not for use from
+    /// an async runtime.
     #[cfg(feature = "vault")]
     pub fn install_wsl(&self, client: Box<dyn VaultClient>, distro: &str) -> VaultResult<()> {
-        self.send(Command::Install {
-            store: Box::new(Store::wsl(client, distro, Arc::new(declare_dbus_caller))?),
-            reply: None,
-        })
+        self.install_store(Store::wsl(client, distro, Arc::new(declare_dbus_caller))?)?
+            .blocking_recv()
+            .map_err(|_| stopped())?
     }
 
     /// Back the collection with an unsealed vault reached through `client`.
@@ -188,7 +191,6 @@ impl SecretServiceHost {
         })
     }
 
-    #[cfg(any(feature = "vault", test))]
     fn install_store(&self, store: Store) -> VaultResult<oneshot::Receiver<VaultResult<()>>> {
         let (reply, done) = oneshot::channel();
         self.send(Command::Install {

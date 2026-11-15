@@ -30,6 +30,13 @@ mod timing;
 #[cfg(all(target_os = "linux", feature = "secretspec-provider"))]
 #[path = "factorseal/wsl.rs"]
 mod wsl;
+#[cfg(all(
+    target_os = "linux",
+    feature = "secretspec-provider",
+    feature = "vault"
+))]
+#[path = "factorseal/wsl_keyring.rs"]
+mod wsl_keyring;
 
 use cli::{Cli, Command};
 use commands::{
@@ -319,6 +326,12 @@ fn run(cli: Cli) -> Result<(), CliError> {
             windows_root,
             remove,
         } => wsl::setup(windows_install.as_deref(), windows_root.as_deref(), remove),
+        #[cfg(all(
+            target_os = "linux",
+            feature = "secretspec-provider",
+            feature = "vault"
+        ))]
+        Command::WslKeyring => wsl_keyring::serve(),
     }
 }
 

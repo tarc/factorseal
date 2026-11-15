@@ -347,6 +347,20 @@ pub(super) enum Command {
         #[arg(long, conflicts_with_all = ["windows_install", "windows_root"])]
         remove: bool,
     },
+
+    /// Serve this WSL distro's keyring (org.freedesktop.secrets) from the
+    /// FactorSeal vault on Windows.
+    ///
+    /// Uses the configuration `wsl-setup` wrote. Switch the distro on in
+    /// FactorSeal Desktop (Settings, WSL keyrings) first. Each program's
+    /// access is approved in Desktop's popup and lasts until the vault
+    /// seals. Runs until stopped; usually started by D-Bus activation.
+    #[cfg(all(
+        target_os = "linux",
+        feature = "secretspec-provider",
+        feature = "vault"
+    ))]
+    WslKeyring,
 }
 
 impl Command {
@@ -377,6 +391,12 @@ impl Command {
             Self::Provider => "provider",
             #[cfg(all(target_os = "linux", feature = "secretspec-provider"))]
             Self::WslSetup { .. } => "wsl_setup",
+            #[cfg(all(
+                target_os = "linux",
+                feature = "secretspec-provider",
+                feature = "vault"
+            ))]
+            Self::WslKeyring => "wsl_keyring",
         }
     }
 }

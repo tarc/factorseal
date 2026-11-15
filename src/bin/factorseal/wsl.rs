@@ -23,7 +23,7 @@ const BROKER: &str = "factorseal-wsl-broker.exe";
 const WINDOWS_CLI: &str = "factorseal.exe";
 const PIPE_PREFIX: &str = r"\\.\pipe\factorseal-";
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct WslConfig {
     /// `factorseal-wsl-broker.exe`, as WSL sees it (`/mnt/c/...`).
@@ -35,6 +35,12 @@ pub(super) struct WslConfig {
 }
 
 impl WslConfig {
+    /// The distro this configuration declares.
+    #[cfg(feature = "vault")]
+    pub(super) fn distro(&self) -> &str {
+        &self.distro
+    }
+
     pub(super) fn client(self) -> Result<BrokerVaultClient, CliError> {
         Ok(BrokerVaultClient::new(self.broker, self.pipe, self.distro)?)
     }
