@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future as _;
+use std::os::unix::ffi::OsStrExt as _;
 use std::time::Duration;
 
 use zbus::export::futures_core::Stream;
@@ -124,9 +125,44 @@ pub(crate) async fn is_factorseal(connection: &Connection, owner: &str) -> zbus:
     let pid = bus
         .get_connection_unix_process_id(owner.try_into()?)
         .await?;
-    let executable = std::fs::read_link(format!("/proc/{pid}/exe"))
-        .map_err(|error| zbus::Error::Failure(error.to_string()))?;
-    Ok(executable.file_name().is_some_and(is_factorseal_executable))
+    is_factorseal_process(pid).map_err(|error| zbus::Error::Failure(error.to_string()))
+}
+
+/// Whether process `pid` is FactorSeal, by its executable's file name.
+///
+/// A process that isn't dumpable hides `/proc/<pid>/exe` even from its own
+/// user: gnome-keyring behind NixOS's capability wrapper (`cap_ipc_lock`),
+/// and FactorSeal's own agent (`harden_key_owner`). Then the names that stay
+/// readable decide: `comm` and the first word of `cmdline`, FactorSeal if
+/// either looks like it. The process sets both itself; the check guards
+/// against reading FactorSeal's own items by accident, and erring toward
+/// FactorSeal only refuses.
+pub(crate) fn is_factorseal_process(pid: u32) -> std::io::Result<bool> {
+    match std::fs::read_link(format!("/proc/{pid}/exe")) {
+        Ok(executable) => Ok(executable.file_name().is_some_and(is_factorseal_executable)),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            let comm = std::fs::read(format!("/proc/{pid}/comm"))?;
+            let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))?;
+            Ok(readable_names(&comm, &cmdline)
+                .iter()
+                .any(|name| is_factorseal_executable(name.as_ref())))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// The process names `comm` (one line) and `cmdline` (NUL-separated
+/// arguments, the first being the program as started) give.
+fn readable_names(comm: &[u8], cmdline: &[u8]) -> Vec<String> {
+    let comm = String::from_utf8_lossy(comm)
+        .trim_end_matches('\n')
+        .to_owned();
+    let program = cmdline.split(|byte| *byte == 0).next().unwrap_or_default();
+    let program = std::path::Path::new(std::ffi::OsStr::from_bytes(program))
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    vec![comm, program]
 }
 
 /// Whether an executable file name is FactorSeal's. Nix wraps programs by

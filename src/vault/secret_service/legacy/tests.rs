@@ -668,3 +668,91 @@ async fn a_prompt_answered_within_the_limit_unlocks() {
     assert_eq!(shared.lock().unwrap().calls.dismissed, Vec::<&str>::new());
     legacy.close().await;
 }
+
+/// A non-dumpable owner hides `/proc/<pid>/exe` even from its own user:
+/// gnome-keyring behind NixOS's capability wrapper (`cap_ipc_lock`), and
+/// FactorSeal's own agent (`harden_key_owner`). Its name must still be
+/// found, from `comm` and `cmdline`.
+#[test]
+fn a_non_dumpable_owner_is_still_identified() {
+    use std::io::{BufRead as _, Write as _};
+    const CHILD: &str = "FACTORSEAL_TEST_NON_DUMPABLE_OWNER";
+    if std::env::var_os(CHILD).is_some() {
+        // SAFETY: PR_SET_DUMPABLE takes an integer and no pointer arguments.
+        #[allow(unsafe_code)]
+        let set = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+        assert_eq!(set, 0);
+        println!("ready");
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).unwrap();
+        return;
+    }
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "vault::secret_service::legacy::tests::a_non_dumpable_owner_is_still_identified",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    while !line.contains("ready") {
+        line.clear();
+        assert_ne!(
+            stdout.read_line(&mut line).unwrap(),
+            0,
+            "the child ended early"
+        );
+    }
+    let pid = child.id();
+    // The kernel hides it, as for gnome-keyring on NixOS.
+    assert_eq!(
+        std::fs::read_link(format!("/proc/{pid}/exe"))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    let identified = is_factorseal_process(pid);
+    child.stdin.take().unwrap().write_all(b"\n").unwrap();
+    child.wait().unwrap();
+    // This test binary is factorseal-<hash>.
+    assert!(identified.unwrap());
+}
+
+#[test]
+fn readable_names_come_from_comm_and_the_program_started() {
+    // gnome-keyring on NixOS, as seen on poita: comm is cut at 15 bytes.
+    assert_eq!(
+        readable_names(
+            b".gnome-keyring-\n",
+            b"/nix/store/x-gnome-keyring-50.0/bin/gnome-keyring-daemon\0--start\0"
+        ),
+        [".gnome-keyring-", "gnome-keyring-daemon"]
+    );
+    assert!(
+        !readable_names(
+            b".gnome-keyring-\n",
+            b"/nix/store/x/bin/gnome-keyring-daemon\0"
+        )
+        .iter()
+        .any(|name| is_factorseal_executable(name.as_ref()))
+    );
+    // A wrapped Desktop's comm is cut too, but still unwraps to factorseal.
+    assert!(
+        readable_names(b".factorseal-des\n", b"")
+            .iter()
+            .any(|name| is_factorseal_executable(name.as_ref()))
+    );
+    assert!(
+        readable_names(
+            b"tokio-runtime-w\n",
+            b"/nix/store/y/bin/factorseal\0agent\0"
+        )
+        .iter()
+        .any(|name| is_factorseal_executable(name.as_ref()))
+    );
+}
