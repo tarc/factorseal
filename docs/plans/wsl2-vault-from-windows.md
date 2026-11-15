@@ -2,13 +2,14 @@
 
 Status, 2026-11-15: milestone 1 (SecretSpec in WSL) is done on
 `feature/wsl2-keyring` (backed up on the fork as `wip/wsl2-keyring`,
-last at 8c8bda9 on 2026-11-15, no PR), and the fixes from its independent review are committed
+last at a86f721 on 2026-11-15, no PR), and the fixes from its independent review are committed
 on top (see "Review fixes" below), the Desktop popup fix (finding 1)
 included once the user saw it in the native build.
 Milestone 2 (the WSL keyring) is done and committed, its Desktop UI
 included after the user saw it in the native build (see "Milestone 2:
 progress" below), and so are the fixes from its independent review ("Milestone
-2: review fixes"). Nothing is pushed. This branch
+2: review fixes") and the broker cost fixes ("Broker cost"). Only the backup
+is pushed. This branch
 sits on `stack/7-browser-windows`, the top of the WSL2 PR stack (#42 → #43 →
 #44 → #46 → #47, index #40); rebase it with `git rebase --onto` when the stack
 changes or merges.
