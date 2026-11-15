@@ -27,22 +27,10 @@ pub(crate) struct Legacy {
     pub(in crate::vault::secret_service) session: OwnedObjectPath,
 }
 
-/// One item of the other Secret Service, as it reported it.
-pub(crate) struct LegacyItem {
-    /// The last segment of the collection's object path, such as `login`.
-    pub(crate) collection: String,
-    pub(crate) locked: bool,
-    /// Empty on an item of a collection never unlocked since the daemon
-    /// started; then [`None`].
-    pub(crate) label: Option<String>,
-    /// Zero in the same case; then [`None`].
-    pub(crate) modified: Option<u64>,
-    /// As reported: on a locked gnome-keyring item, hashed values under
-    /// `gkr:compat:hashed:<name>` and a placeholder `xdg:schema`.
-    pub(crate) attributes: HashMap<String, String>,
-    /// The secret and its content type, read by [`Legacy::read_all`] only.
-    pub(crate) secret: Option<(Zeroizing<Vec<u8>>, String)>,
-}
+/// One item of the other Secret Service, as it reported it: on a locked
+/// gnome-keyring item, no label, no modified time, hashed attribute values
+/// under `gkr:compat:hashed:<name>` and a placeholder `xdg:schema`.
+pub(crate) type LegacyItem = crate::vault::KeyringSourceItem;
 
 /// What a read found, and the collections it could not read with why.
 #[derive(Default)]

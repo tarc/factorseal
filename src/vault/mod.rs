@@ -47,6 +47,11 @@ pub use secret_service::{
     NAMESPACE as SECRET_SERVICE_NAMESPACE, SecretServiceHost, SecretServiceHostOptions,
     SecretServicePrompter, WifiMigrationEntry, WifiMigrationReport,
 };
+#[cfg(any(feature = "vault-store", feature = "secret-service-host"))]
+pub use secret_service_data::import::{
+    KeyringImport, KeyringImportItem, KeyringSkipReason, KeyringSkippedItem, KeyringSourceItem,
+    MAX_IMPORTED_VALUE_BYTES, keyring_fingerprint, map_keyring_items,
+};
 #[cfg(feature = "secret-service-host")]
 mod secret_service_prompt;
 #[cfg(feature = "secret-service-host")]

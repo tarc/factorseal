@@ -2997,6 +2997,7 @@ dependencies = [
  "iroh",
  "landlock",
  "libc",
+ "md-5",
  "ml-dsa",
  "network-manager-protocol",
  "nix",

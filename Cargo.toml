@@ -25,6 +25,7 @@ browser = ["vault", "dep:ed25519-dalek"]
 vault-client = ["dep:interprocess", "dep:nix", "dep:nt-token"]
 vault-store = [
     "personal",
+    "dep:md-5",
     "dep:aes",
     "dep:aes-gcm",
     "dep:automerge",
@@ -39,7 +40,7 @@ vault-store = [
 ]
 # The full desktop vault feature remains the default. Mobile embedders use
 # `vault-store` + `key-protection` instead.
-secret-service-host = ["vault-client", "dep:secret-service-protocol", "dep:network-manager-protocol", "dep:tokio", "dep:zbus"]
+secret-service-host = ["vault-client", "dep:md-5", "dep:secret-service-protocol", "dep:network-manager-protocol", "dep:tokio", "dep:zbus"]
 
 vault = [
     "helper-isolation",
@@ -153,6 +154,7 @@ fs2 = { version = "0.4.3", optional = true }
 hardwareseal = { version = "0.1.0", path = "crates/hardwareseal", features = ["apple"], optional = true }
 hex = "0.4.3"
 hmac = { version = "0.12.1", optional = true }
+md-5 = { version = "0.10.6", optional = true }
 image = { version = "0.25.10", default-features = false, features = ["ico", "png"], optional = true }
 iroh = { version = "=1.2.0", default-features = false, features = ["tls-ring"], optional = true }
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"], optional = true }

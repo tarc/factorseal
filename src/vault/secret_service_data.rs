@@ -1,6 +1,9 @@
 //! Portable Secret Service records, independent of the native D-Bus adapter.
 
 use super::{SecretAddress, VaultError, VaultResult, WireSecret};
+
+#[cfg(any(feature = "vault-store", feature = "secret-service-host"))]
+pub(crate) mod import;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
