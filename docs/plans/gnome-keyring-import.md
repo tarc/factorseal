@@ -1,6 +1,8 @@
 # Plan: move gnome-keyring items into FactorSeal
 
-Status, 2026-11-15: planned, not started; review folded in (see "Review
+Status, 2026-11-15: steps 1–5 and 7 implemented (de2780e..3b49775), then
+the implementation review acted on (fc49f02..3555cbd); steps 6, 8 and 9
+remain. Both reviews are folded in (see "Review record" and "Implementation
 record" at the end). Branch: `feature/wsl2-keyring` (the WSL keyring this
 targets lives there). The Windows installer that hands off to it is planned
 in [windows-installer.md](windows-installer.md).
@@ -99,6 +101,12 @@ Two targets:
     Service API only carries `a{ss}`) and is hashed as `md5("8080")` =
     `d4a973e3…`. gnome-keyring's uint32 compat hashing only applies to items
     from its legacy file format, which libsecret over D-Bus never creates.
+  - **Items stored without a schema get the generic one.** An item stored
+    with no `xdg:schema` (as go-keyring, which `gh` uses, and
+    python-keyring do) comes back with `xdg:schema =
+    org.freedesktop.Secret.Generic`, and its locked and unlocked
+    fingerprints agree (implementation review, checked with Python
+    `secretstorage`; step 7 now seeds such an item through libsecret).
   - **gnome-keyring reserves the `gkr:compat:` prefix.** An item stored with
     an attribute named `gkr:compat:hashed:fake` came back unlocked as
     `fake: ""`, so such names never survive a store. Ordinary unlocked items
@@ -139,7 +147,10 @@ of pairs (name, MD5 of the value):
   locked again after an unlock shows plain attributes.
 - **gnome-keyring, unlocked, and the vault:** each attribute gives
   `(name, md5(value))`. Names starting with `gkr:compat:` are left out
-  (gnome-keyring reserves them; this is defensive).
+  (gnome-keyring reserves them; this is defensive). The vault side always
+  takes this plain rule (`vault_keyring_fingerprint`), never the locked
+  one: FactorSeal's Secret Service doesn't reserve `gkr:compat:`, so a
+  vault item may carry such a name.
 
 The fingerprint is SHA-256 over this byte string:
 
@@ -224,6 +235,12 @@ until the user has seen it in the native build.
       disagree with Check, which compares attributes.
    3. **No match:** added under its own id, as today.
 
+   An incoming item **without attributes** answers no lookup, so rule 1
+   doesn't apply to it. It matches an existing attribute-less item with
+   the same id, or with the same label, content type and created time (so
+   that after rule 2 gave it a fresh id, restoring the same backup again
+   keeps it instead of adding a copy).
+
    Other attribute-identical duplicates already in the vault are left
    alone. Tests in `service/tests.rs`, native and WSL partition:
    - keep, and replace;
@@ -252,8 +269,14 @@ until the user has seen it in the native build.
    object path once, so the `aliases/default` alias doesn't read `login`
    twice. They refuse when `org.freedesktop.secrets` is owned by FactorSeal:
    `GetConnectionUnixProcessID`, then the file name of `/proc/<pid>/exe`
-   starting with `factorseal`, never a full path, since NixOS store paths
-   change per build. Tests use a fake Secret Service on a private bus (zbus
+   starting with `factorseal` once Nix's wrapper naming is undone (leading
+   dots and repeated `-wrapped`: a NixOS Desktop runs as
+   `.factorseal-desktop-wrapped`), never a full path, since NixOS store
+   paths change per build.
+
+   An unlock prompt unanswered for five minutes is dismissed
+   (`Prompt.Dismiss`) and its collection reported as "unlock timed out": a
+   gcr prompt with no display never appears, and the wait would never end. Tests use a fake Secret Service on a private bus (zbus
    server in the test) that returns hashed attributes and the placeholder
    `xdg:schema` for a locked collection, has a second locked collection, and
    exposes the default alias. The Wi-Fi migration tests must stay green.
@@ -262,15 +285,21 @@ until the user has seen it in the native build.
    to a list of entries, each with a fingerprint, plus a list of skipped
    items with reasons. Rules:
    - The id comes from the fingerprint.
-   - Items with identical fingerprints across collections collapse to the
-     most recently modified one; the others are reported ("duplicate").
+   - Items with identical fingerprints across collections collapse to one;
+     the others are reported ("duplicate"). The inventory keeps the most
+     recently modified (the first seen on a tie). The export keeps the most
+     recent one that passes the value rules, so an unreadable or too large
+     newest item doesn't lose an older readable one; when none passes, each
+     reports its own reason.
    - Items with no attributes are skipped ("no attributes").
    - The content type defaults to `text/plain`.
    - NetworkManager items (`connection-uuid` + `setting-name`) are skipped,
      with a pointer to "Move existing Wi-Fi passwords". On a locked item the
      rule tests the hashed names, which are visible.
-   - Values over the vault's secret limit are skipped ("too large"). This
-     rule only applies when values are present.
+   - Values over 256 KiB (`MAX_IMPORTED_VALUE_BYTES`) are skipped ("too
+     large"). The vault has no per-secret limit; 256 KiB is what still fits
+     one restore request (the value is base64-encoded twice, ≈1.78×, in a
+     1 MiB message). This rule only applies when values are present.
 
    The same mapping serves the inventory (without values) and the export
    (with values), so Check and Move apply the same rules. The export's
@@ -303,13 +332,19 @@ until the user has seen it in the native build.
      therefore reach Desktop in a form it can read, and no secret is in
      them.
 
-   It prints a human summary to stderr. CLI tests use the fake service and
-   check the frame.
+   It prints a human summary to stderr. CLI tests run the command with an
+   injected reader (a closure standing in for the Secret Service) and check
+   the frame; the D-Bus reader itself is tested against the fake service of
+   step 2.
 5. **Vault: keyring fingerprints for managers** (protocol v21).
-   `ListKeyringFingerprints { distro: Option<String> }`, for permission
-   managers only, returns each item's fingerprint, id and modified time for
-   that distro's keyring (or the native one). It returns no values and no
-   attributes, and is not in the broker's allowlist. Tests: manager only,
+   `ListKeyringFingerprints { distro: Option<String>, cursor:
+   Option<String> }`, for permission managers only, returns each item's
+   fingerprint, id and modified time for that distro's keyring (or the
+   native one), sorted by id, as many as fit one response, with
+   `next_cursor` (the last id) when more remain. The cursor must be a
+   lowercase 32-hex id, since pages are cut by string comparison. It
+   returns no values and no attributes, and is not in the broker's
+   allowlist. Tests: manager only,
    WSL and native partitions, values never in the response, the pinned
    fingerprint from step 3. Mutation: no manager check.
 6. **Desktop: check and move** (Settings → WSL keyrings, per distro row).
@@ -339,6 +374,22 @@ until the user has seen it in the native build.
    Tests cover the comparison and the command lines with a fake runner,
    including garbage and UTF-16 text before the frame and a missing frame.
    UI: the user sees it natively before it is committed.
+
+   From the implementation review:
+   - the CLI dismisses a prompt after five minutes (step 2), so Desktop
+     only needs a backstop: a longer limit on the `wsl.exe` child, killed
+     on cancel too;
+   - the frame parser accepts `\r\n` and garbage before
+     `FACTORSEAL-FRAME` on the same line, and checks `<length>` exactly;
+   - read `ListKeyringFingerprints` page by page until `next_cursor` is
+     absent;
+   - the protocol is 21: Desktop and the CLI must come from the same build
+     (the ZIP and installer ship both; a hand-updated CLI against an old
+     Desktop fails);
+   - Check compares fingerprints; the collection and label shown for a
+     duplicate can differ between Check (first seen, no modified times
+     while locked) and Move (newest usable), so the UI doesn't key on the
+     collection.
 7. **Integration check** (Linux, private bus, never the user's bus or
    keyring):
    1. A throwaway `gnome-keyring-daemon --components=secrets --unlock` (nix
@@ -351,7 +402,13 @@ until the user has seen it in the native build.
    4. FactorSeal's host is served on that private bus, and `secret-tool
       lookup` must return each value.
 
-   Add it to `check.sh`, or a script beside `test-with-dbus.sh`.
+   Done as `scripts/test-keyring-import.sh`. The restore uses the
+   library's test vault (mock key protector) through an ignored lib test,
+   `restored_gnome_keyring_archive_is_found_by_secret_tool`, since a Linux
+   `factorseal init` needs a TPM; it still goes through `ImportVaultEntry`.
+   After the implementation review it also seeds a schema-less item,
+   compares an inventory of a collection locked again after an unlock, and
+   restores a second time (everything kept).
 8. **Live, Windows test vault**: Desktop's check and move against a
    throwaway gnome-keyring in WSL, run as above on a private bus. For this,
    Desktop gets a test hook for the command prefix (`dbus-run-session` +
@@ -366,7 +423,10 @@ until the user has seen it in the native build.
      private-bus recipe with its short runtime dir, delete a hand-made
      archive);
    - the restore rule from step 1 in the backup docs and in `CHANGELOG.md`,
-     since it changes backup restores for everyone;
+     since it changes backup restores for everyone (no release from this
+     branch before that);
+   - the native recipe only now that a Nix-wrapped Desktop is recognized as
+     FactorSeal (implementation review D1);
    - `wsl2-keyring-design.md` decision 3 pointing here.
 
    Done right after step 8, before the installer work starts (see the
@@ -484,3 +544,98 @@ The review's deliberate exclusions stay out of scope here as well:
 - the Check/Move row's copy and layout, left to the native review;
 - native Linux Desktop's restore UX for `--native`, which stays the manual
   path.
+
+## Implementation record
+
+Steps 1–5 and 7, 2026-11-15, each with tests seen failing first or a
+mutation, and the gate:
+
+| Commit | Step |
+|---|---|
+| de2780e | 1: restore matches keyring items by attributes |
+| 314bdb4 | 2: shared Secret Service reader (`inventory`, `read_all`) |
+| 29b8409 | 3: fingerprints and mapping (`md-5` added) |
+| 2eb657e | 4: `factorseal export-secret-service` |
+| 5f66822 | 5: `ListKeyringFingerprints`, protocol v21 |
+| 1fdad6a | test fix: the id-collision test no longer assumes an id order |
+| b0b7a9e | fix found by step 7: a locked generic item's plain `xdg:schema` counts |
+| 3b49775 | 7: `scripts/test-keyring-import.sh` |
+
+`fuzz/Cargo.lock` gained only the `md-5` entry; it already failed
+`cargo metadata --locked` at 4ed2d2d (missing `embed-resource`), which is
+left for a separate fix.
+
+### Implementation review
+
+An independent review of de2780e..3b49775 (2026-11-15) was acted on
+point by point; this records every point, so the review file was
+removed. Gate after the fixes: fmt, clippy, lib 546 passed
+(`libsecret_store_seal_lookup` times out, as on main), CLI 93 passed;
+`scripts/test-keyring-import.sh` passes.
+
+**Defects**
+- **D1, medium: a Nix-wrapped Desktop wasn't recognized as FactorSeal.**
+  Fixed in fc49f02. Confirmed in nixpkgs'
+  make-binary-wrapper-hook (`hidden=".$(basename "$prog")"-wrapped`). The
+  name is unwrapped before the prefix test; unit test of the names (the
+  review's T3), and the old check fails it.
+- **D2, low: an uppercase cursor paged wrongly.** Fixed in 1eae96c: lowercase only;
+  test fails against the old check.
+- **D3, low: a re-restored attribute-less item whose id is taken was
+  copied again.** Fixed in 94a0252 with the review's first option (match by label,
+  content type and created time); the second (always keep) was rejected,
+  since it drops the backup's item and clients can still enumerate a
+  collection's items. Test fails before the fix.
+- **D4, low: a readable older duplicate was lost to an unusable newest
+  one.** Fixed in 711c208, in the export; the inventory still keeps the newest. Test
+  fails before the fix.
+- **D5, low: the vault guessed gnome-keyring's hashed mode.** Fixed in 0ca5554:
+  `vault_keyring_fingerprint` always takes the plain rule. Test failed
+  before the fix with an empty list.
+
+**Conformance**
+- **C1: the unlock prompt had no time limit.** Fixed in 4dddc4e, in the CLI (five
+  minutes, then `Prompt.Dismiss`, "unlock timed out"); step 6 keeps a
+  backstop. The fake gains a prompt that never completes; without the
+  Dismiss call the test fails.
+- **C2: CLI tests use an injected reader, not the fake service.** No
+  change: together with step 2's fake-service tests they cover the same
+  ground. Step 4 now says so.
+- **C3: step 1 changes every backup restore; not yet in `CHANGELOG.md`.**
+  Left to step 9, as planned; step 9 now says no release from this branch
+  before it.
+
+**Deviations** (all accepted by the review except 3 on the vault side)
+1. Attribute-less items match by id, now with D3's rule: step 1.
+2. `cursor` on `ListKeyringFingerprints`, lowercase only (D2): step 5.
+3. Hashed mode chosen by hashed names: kept for gnome-keyring, removed on
+   the vault side (D5): "The fingerprint".
+4. A locked item's plain `xdg:schema` counts without a hashed one: kept;
+   the review's run also showed schema-less items get the generic schema
+   (in "Facts", and seeded in step 7).
+5. 256 KiB "too large": step 3.
+6. Injected CLI reader: step 4 (C2).
+7. Step 7 restores into the library's test vault: step 7.
+8. `fuzz/Cargo.lock` with only `md-5`: above, separate fix.
+
+**Test quality**
+- **T1: reader tests pass vacuously outside the private bus.** That is the
+  repo's convention (`private_bus()`, like the Wi-Fi tests). Every
+  mutation of the reader, the original step 2 ones included, ran under
+  `scripts/test-with-dbus.sh`; the C1 and T2 mutations failed there.
+- **T2: no `GetSecrets` batch boundary.** Added in 1c48fe3: 33 items, two calls, all
+  values; reading one batch fails it.
+- **T3: the owner test couldn't catch D1.** Covered by D1's name test.
+- **T4: step 7 lacked idempotence, the locked-again mode and a schema-less
+  item.** Added all three in 3555cbd; with the restore never matching, the second
+  pass fails.
+- **T5: step 7 isolation holds.** No change.
+- **T6: the pinned fingerprint ties the unit tests to the real daemon.**
+  No change.
+
+**Risks**
+- **R1–R4 (step 6):** the backstop limit on `wsl.exe`, frame parsing,
+  protocol 21 across builds, not keying the UI on the collection: in step
+  6.
+- **R5 (step 9):** the native recipe needed D1, now fixed: in step 9.
+- **R6 (step 8):** nothing blocks `wsl-test-hooks`. No change.
