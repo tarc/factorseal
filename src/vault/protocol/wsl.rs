@@ -200,6 +200,27 @@ pub fn validate_distro(distro: &str) -> VaultResult<()> {
     }
 }
 
+/// Prefix of the keyring namespaces of WSL distros; the distro name follows.
+const WSL_KEYRING_NAMESPACE_PREFIX: &[u8] = b"factorseal/wsl-secret-service/v1/";
+
+/// The vault namespace holding the Secret Service items of one WSL distro,
+/// `factorseal/wsl-secret-service/v1/<distro>`. A distro's name is declared
+/// by the WSL side, so these namespaces keep distros' items apart; they do
+/// not isolate one distro from another.
+pub fn wsl_keyring_namespace(distro: &str) -> VaultResult<Vec<u8>> {
+    validate_distro(distro)?;
+    let mut namespace = WSL_KEYRING_NAMESPACE_PREFIX.to_vec();
+    namespace.extend_from_slice(distro.as_bytes());
+    Ok(namespace)
+}
+
+/// The distro whose keyring namespace this is, if it is one.
+#[must_use]
+pub fn wsl_keyring_distro(namespace: &[u8]) -> Option<&str> {
+    let distro = std::str::from_utf8(namespace.strip_prefix(WSL_KEYRING_NAMESPACE_PREFIX)?).ok()?;
+    validate_distro(distro).ok().map(|()| distro)
+}
+
 /// The Windows form of an absolute Linux folder inside `distro`, as Windows
 /// programs reach it: a folder of a mounted drive (`/mnt/c/...`) is that
 /// drive's folder (`C:\...`), and any other folder is under the distro's
@@ -361,6 +382,22 @@ impl super::wire::VaultClient for BrokerVaultClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_distro_has_its_own_keyring_namespace() {
+        let namespace = wsl_keyring_namespace("NixOS").unwrap();
+        assert_eq!(namespace, b"factorseal/wsl-secret-service/v1/NixOS");
+        assert_eq!(wsl_keyring_distro(&namespace), Some("NixOS"));
+        assert!(wsl_keyring_namespace("../x").is_err());
+        for other in [
+            &b"factorseal/secret-service/v1"[..],
+            b"factorseal/wsl-secret-service/v1/",
+            b"factorseal/wsl-secret-service/v1/a/b",
+            b"factorseal/wsl-secret-service/v1/..",
+        ] {
+            assert_eq!(wsl_keyring_distro(other), None, "{other:?}");
+        }
+    }
 
     #[test]
     fn folders_map_to_what_windows_programs_see() {

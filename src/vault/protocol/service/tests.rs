@@ -4342,3 +4342,244 @@ fn an_expiring_cache_write_is_marked_so_prompts_do_not_default_to_once() {
         .unwrap();
     assert!(plain.defaults_to_single_use());
 }
+
+/// What the WSL keyring host sends for one program, through a broker that
+/// tagged the request with `distro`.
+fn wsl_keyring_request(
+    distro: Option<&str>,
+    executable: &str,
+    item: &str,
+    action: Option<VaultAction>,
+) -> VaultRequest {
+    let application = VaultApplicationContext::new(
+        None,
+        None,
+        Some(format!(
+            "{}/home/tarci/projects/demo",
+            if cfg!(windows) { "C:" } else { "" }
+        )),
+        None,
+    )
+    .unwrap()
+    .with_declared_wsl_origin(distro.map(str::to_owned))
+    .unwrap();
+    VaultRequest::new_with_application(
+        VaultAction::WslKeyringAccess {
+            caller: crate::vault::DeclaredKeyringCaller {
+                uid: 1000,
+                executable: executable.to_owned(),
+                executable_digest: [3; 32],
+            },
+            entry: Some(SecretAddress::new(item, None).unwrap()),
+            service: "demo-service".to_owned(),
+            operation: PermissionOperation::Get,
+            action: action.map(Box::new),
+            pending: None,
+        },
+        application,
+    )
+    .unwrap()
+}
+
+/// Give `broker` the keyring host grant of `distro`, as the desktop worker
+/// does when that distro is switched on.
+fn grant_wsl_keyring_host(service: &VaultService, broker: &CallerIdentity, distro: &str) {
+    let namespace = crate::vault::wsl_relay::wsl_keyring_namespace(distro).unwrap();
+    service
+        .authorize_batch(
+            &[GrantAuthorization {
+                caller: broker,
+                target: GrantAuthorizationTarget::Namespace {
+                    scope: DocumentKind::LinuxSecretService,
+                    namespace: &namespace,
+                },
+                permissions: &[
+                    GrantPermission::Get,
+                    GrantPermission::Put,
+                    GrantPermission::Delete,
+                ],
+                expires_at: None,
+            }],
+            100,
+        )
+        .unwrap();
+}
+
+const WSL_ITEM: &str = "item/0123456789abcdef0123456789abcdef";
+
+#[test]
+fn wsl_keyring_access_is_relayed_only_by_that_distros_host() {
+    let (_directory, service) = service(100, UnsealLeasePolicy::default());
+    let broker = caller();
+    let ask = |distro| {
+        service
+            .handle(
+                &broker,
+                wsl_keyring_request(distro, "/usr/bin/secret-tool", WSL_ITEM, None),
+                101,
+            )
+            .result
+            .unwrap_err()
+    };
+
+    // No host grant: refused outright, without asking anyone.
+    let refused = ask(Some("NixOS"));
+    assert_eq!(refused.code, VaultResponseErrorCode::AuthorizationRequired);
+    assert!(refused.interaction.is_none());
+
+    // Another distro's host grant does not cover this distro.
+    grant_wsl_keyring_host(&service, &broker, "Debian");
+    assert!(ask(Some("NixOS")).interaction.is_none());
+
+    // The distro's own host grant lets the request through to an approval.
+    grant_wsl_keyring_host(&service, &broker, "NixOS");
+    assert!(ask(Some("NixOS")).interaction.is_some());
+
+    // Without the broker's distro tag there is no keyring to check.
+    assert!(ask(None).interaction.is_none());
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn wsl_keyring_access_asks_for_the_declared_program_until_the_seal() {
+    let (directory, service) = service(100, UnsealLeasePolicy::default());
+    let broker = caller();
+    grant_wsl_keyring_host(&service, &broker, "NixOS");
+    let namespace = crate::vault::wsl_relay::wsl_keyring_namespace("NixOS").unwrap();
+    {
+        let state = service.state.lock_live(Instant::now()).unwrap();
+        state
+            .store()
+            .put_at(
+                DocumentKind::LinuxSecretService,
+                &namespace,
+                &SecretAddress::new(WSL_ITEM, None).unwrap(),
+                b"wsl-value",
+                None,
+                &Provenance::caller(&broker, None),
+                100,
+            )
+            .unwrap();
+    }
+    let read = |executable: &str, namespace: &[u8]| {
+        service.handle(
+            &broker,
+            wsl_keyring_request(
+                Some("NixOS"),
+                executable,
+                WSL_ITEM,
+                Some(VaultAction::Get {
+                    namespace: namespace.to_vec(),
+                    address: WireSecretAddress::new(WSL_ITEM, None),
+                }),
+            ),
+            102,
+        )
+    };
+
+    let asked = read("/usr/bin/secret-tool", &namespace).result.unwrap_err();
+    assert!(asked.interaction.is_some());
+
+    let manager = CallerIdentity::new(
+        CallerPlatform::Linux,
+        "uid:1000",
+        "dev.factorseal.cli",
+        [9; 32],
+        None,
+    )
+    .unwrap();
+    service.authorize_permission_manager(&manager, 102).unwrap();
+    let Ok(VaultResponseBody::Permissions { permissions, .. }) = service
+        .handle(
+            &manager,
+            VaultRequest::new(VaultAction::ListPermissions).unwrap(),
+            102,
+        )
+        .result
+    else {
+        panic!("expected the pending approval");
+    };
+    assert_eq!(permissions.len(), 1);
+    let pending = &permissions[0];
+    // The principal is the declared program, kept apart from any
+    // transport-authenticated one by its `wsl:` user ID.
+    assert_eq!(pending.principal.platform, CallerPlatform::Linux);
+    assert_eq!(pending.principal.user_id, "wsl:NixOS:uid:1000");
+    assert_eq!(pending.principal.application_id, "/usr/bin/secret-tool");
+    assert_eq!(pending.principal.executable_digest, [3; 32]);
+    assert_eq!(
+        pending.application.declared_wsl_origin.as_deref(),
+        Some("NixOS")
+    );
+    assert_eq!(pending.scope, Some(DocumentKind::LinuxSecretService));
+
+    let root = directory.path().join("factorseal");
+    let unsealed = Vault::unseal_for_test(&root).unwrap();
+    let PermissionState::Pending { challenge, .. } = &pending.state else {
+        panic!("expected a pending permission");
+    };
+    let day = 24 * 60 * 60;
+    let signature = unsealed
+        .sign_permission_challenge(&pending.id, challenge, Some(day))
+        .unwrap();
+    let approved = service.handle(
+        &manager,
+        VaultRequest::new(VaultAction::ApprovePermission {
+            id: pending.id.clone(),
+            signature,
+            duration_seconds: Some(day),
+            single_use: false,
+        })
+        .unwrap(),
+        103,
+    );
+    assert!(matches!(
+        approved.result,
+        Ok(VaultResponseBody::PermissionChanged {
+            status: PermissionChange::Granted
+        })
+    ));
+    let Ok(VaultResponseBody::Permissions { permissions, .. }) = service
+        .handle(
+            &manager,
+            VaultRequest::new(VaultAction::ListPermissions).unwrap(),
+            103,
+        )
+        .result
+    else {
+        panic!("expected the granted permission");
+    };
+    let PermissionState::Granted { expires_at, .. } = permissions[0].state else {
+        panic!("expected a granted permission");
+    };
+    let (_, absolute_deadline) = service
+        .state
+        .lock_live(Instant::now())
+        .unwrap()
+        .lease_deadlines();
+    assert_eq!(expires_at, Some(absolute_deadline));
+
+    // Granted: the broker reads the item on the program's behalf.
+    let Ok(VaultResponseBody::Secret { value: Some(value) }) =
+        read("/usr/bin/secret-tool", &namespace).result
+    else {
+        panic!("expected the item's value");
+    };
+    assert_eq!(value.expose(), b"wsl-value");
+
+    // The grant is the program's, not the broker's: another program asks.
+    assert!(
+        read("/usr/bin/other-tool", &namespace)
+            .result
+            .unwrap_err()
+            .interaction
+            .is_some()
+    );
+
+    // The action stays in the distro's namespace, even for a broker that
+    // holds another distro's grant too.
+    grant_wsl_keyring_host(&service, &broker, "Debian");
+    let other = crate::vault::wsl_relay::wsl_keyring_namespace("Debian").unwrap();
+    let crossed = read("/usr/bin/secret-tool", &other).result.unwrap_err();
+    assert_eq!(crossed.code, VaultResponseErrorCode::InvalidRequest);
+}

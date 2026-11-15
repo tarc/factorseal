@@ -17,7 +17,7 @@ use crate::vault::{
 // Version 17 adds personal-item usernames and favorites to inventory and marks awaited approvals.
 // Version 18 adds caller-declared launch chains and single-use write approvals.
 // Version 19 adds the caller-declared WSL origin hint on VaultApplicationContext.
-pub(super) const PROTOCOL_VERSION: u8 = 19;
+pub(super) const PROTOCOL_VERSION: u8 = 20;
 pub(super) const REQUEST_ID_BYTES: usize = 16;
 pub(super) const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 /// Maximum bounded wait accepted by [`VaultAction::WaitPermissions`].
@@ -147,6 +147,47 @@ impl CallerIdentity {
             validate_identity_component("signer ID", signer_id)?;
         }
         Ok(())
+    }
+}
+
+/// The program behind a Secret Service call in WSL, as the WSL keyring host
+/// resolved it from the D-Bus peer inside the distro. Declared, never
+/// authenticated: the vault authenticates only the broker that relays it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeclaredKeyringCaller {
+    /// The program's Linux user ID inside the distro.
+    pub uid: u32,
+    /// The program's absolute Linux executable path.
+    pub executable: String,
+    /// SHA-256 of that executable, computed in WSL.
+    pub executable_digest: [u8; 32],
+}
+
+impl DeclaredKeyringCaller {
+    pub(super) fn validate(&self) -> VaultResult<()> {
+        validate_identity_component("declared executable", &self.executable)?;
+        if !self.executable.starts_with('/') || self.executable.chars().any(char::is_control) {
+            return Err(VaultError::Protocol(
+                "a declared keyring caller needs an absolute Linux executable path".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The approval principal for this caller in `distro`: platform Linux,
+    /// the executable path as the application, and a `wsl:` user ID, so its
+    /// grants can never match a transport-authenticated principal.
+    pub fn principal(&self, distro: &str) -> VaultResult<CallerIdentity> {
+        super::wsl::validate_distro(distro)?;
+        self.validate()?;
+        CallerIdentity::new(
+            CallerPlatform::Linux,
+            format!("wsl:{distro}:uid:{}", self.uid),
+            self.executable.clone(),
+            self.executable_digest,
+            None,
+        )
     }
 }
 
@@ -642,6 +683,20 @@ pub enum VaultAction {
         action: Option<Box<VaultAction>>,
         pending: Option<String>,
     },
+    /// `KeyringAccess` for the keyring of a WSL distro, relayed by the WSL
+    /// broker. The caller is declared by the WSL keyring host, the distro and
+    /// folder come from the request's application context (which the broker
+    /// rewrites), and only a holder of that distro's keyring namespace grant
+    /// may send it. Grants it creates last until the vault seals.
+    WslKeyringAccess {
+        caller: DeclaredKeyringCaller,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        entry: Option<SecretAddress>,
+        service: String,
+        operation: PermissionOperation,
+        action: Option<Box<VaultAction>>,
+        pending: Option<String>,
+    },
 
     Status,
     /// List value-free entry metadata across user-facing vault documents.
@@ -860,46 +915,37 @@ impl VaultAction {
                 pending,
                 ..
             } => {
-                if !sender.starts_with(':')
-                    || sender.len() > 255
-                    || service.is_empty()
-                    || service.len() > 1024
-                {
+                if !sender.starts_with(':') || sender.len() > 255 {
                     return Err(VaultError::Protocol(
                         "invalid keyring access target".to_owned(),
                     ));
                 }
-                if let Some(entry) = entry {
-                    entry.validate()?;
-                    if !entry.as_local().is_some_and(|(item, field)| {
-                        field.is_none()
-                            && item.strip_prefix("item/").is_some_and(|id| {
-                                id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit())
-                            })
-                    }) {
-                        return Err(VaultError::Protocol("invalid keyring entry".to_owned()));
-                    }
-                }
-                if let Some(id) = pending {
-                    validate_permission_id(id)?;
-                }
-                if pending.is_some() && action.is_some() {
-                    return Err(VaultError::Protocol("invalid keyring wait".to_owned()));
-                }
-                if let Some(action) = action {
-                    match action.as_ref() {
-                        Self::Get { namespace, .. } | Self::Mutate { namespace, .. }
-                            if namespace == b"factorseal/secret-service/v1" =>
-                        {
-                            action.validate()
-                        }
-                        _ => Err(VaultError::Protocol(
-                            "invalid bridged keyring action".to_owned(),
-                        )),
-                    }
-                } else {
-                    Ok(())
-                }
+                validate_keyring_access(
+                    service,
+                    entry.as_ref(),
+                    pending.as_deref(),
+                    action.as_deref(),
+                    |namespace| namespace == b"factorseal/secret-service/v1",
+                )
+            }
+            Self::WslKeyringAccess {
+                caller,
+                entry,
+                service,
+                action,
+                pending,
+                ..
+            } => {
+                caller.validate()?;
+                // The vault checks that the namespace is the declared
+                // distro's; here it only has to be some distro's.
+                validate_keyring_access(
+                    service,
+                    entry.as_ref(),
+                    pending.as_deref(),
+                    action.as_deref(),
+                    |namespace| super::wsl::wsl_keyring_distro(namespace).is_some(),
+                )
             }
             Self::Status | Self::ListPermissions | Self::ExportRevision => Ok(()),
             Self::ListPermissionsPage { cursor, .. } => validate_permission_id(cursor),
@@ -1538,6 +1584,49 @@ fn validate_identity_component(name: &str, value: &str) -> VaultResult<()> {
     Ok(())
 }
 
+/// The checks `KeyringAccess` and `WslKeyringAccess` share: the service
+/// label, an item entry, a wait or an action but not both, and an action
+/// that is a `Get` or `Mutate` on a namespace `bridged` accepts.
+fn validate_keyring_access(
+    service: &str,
+    entry: Option<&SecretAddress>,
+    pending: Option<&str>,
+    action: Option<&VaultAction>,
+    bridged: impl Fn(&[u8]) -> bool,
+) -> VaultResult<()> {
+    if service.is_empty() || service.len() > 1024 {
+        return Err(VaultError::Protocol(
+            "invalid keyring access target".to_owned(),
+        ));
+    }
+    if let Some(entry) = entry {
+        entry.validate()?;
+        if !entry.as_local().is_some_and(|(item, field)| {
+            field.is_none()
+                && item.strip_prefix("item/").is_some_and(|id| {
+                    id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+        }) {
+            return Err(VaultError::Protocol("invalid keyring entry".to_owned()));
+        }
+    }
+    if let Some(id) = pending {
+        validate_permission_id(id)?;
+    }
+    if pending.is_some() && action.is_some() {
+        return Err(VaultError::Protocol("invalid keyring wait".to_owned()));
+    }
+    match action {
+        None => Ok(()),
+        Some(
+            inner @ (VaultAction::Get { namespace, .. } | VaultAction::Mutate { namespace, .. }),
+        ) if bridged(namespace) => inner.validate(),
+        Some(_) => Err(VaultError::Protocol(
+            "invalid bridged keyring action".to_owned(),
+        )),
+    }
+}
+
 fn validate_namespace(namespace: &[u8]) -> VaultResult<()> {
     if namespace.is_empty() || namespace.len() > MAX_NAMESPACE_BYTES {
         return Err(VaultError::Protocol(
@@ -1825,6 +1914,51 @@ mod entry_access_tests {
         }
         entry.address = SecretAddress::new("TOKEN", None).unwrap();
         assert!(!grant.applies_to_entry(&entry));
+    }
+
+    #[test]
+    fn wsl_keyring_access_carries_an_absolute_program_and_stays_in_wsl_namespaces() {
+        let request = |executable: &str, namespace: &[u8]| {
+            VaultRequest::new(VaultAction::WslKeyringAccess {
+                caller: DeclaredKeyringCaller {
+                    uid: 1000,
+                    executable: executable.to_owned(),
+                    executable_digest: [3; 32],
+                },
+                entry: None,
+                service: "demo".to_owned(),
+                operation: PermissionOperation::Get,
+                action: Some(Box::new(VaultAction::Get {
+                    namespace: namespace.to_vec(),
+                    address: WireSecretAddress::new("index", None),
+                })),
+                pending: None,
+            })
+            .unwrap()
+            .validate_fields()
+        };
+        let wsl = b"factorseal/wsl-secret-service/v1/NixOS";
+        assert!(request("/usr/bin/secret-tool", wsl).is_ok());
+        for executable in ["secret-tool", "", "/usr/bin/a\nb"] {
+            assert!(request(executable, wsl).is_err(), "{executable:?}");
+        }
+        for namespace in [&b"factorseal/secret-service/v1"[..], b"other"] {
+            assert!(request("/usr/bin/secret-tool", namespace).is_err());
+        }
+        // And the native bridge cannot reach a WSL distro's keyring.
+        let native = VaultRequest::new(VaultAction::KeyringAccess {
+            entry: None,
+            sender: ":1.5".to_owned(),
+            service: "demo".to_owned(),
+            operation: PermissionOperation::Get,
+            action: Some(Box::new(VaultAction::Get {
+                namespace: wsl.to_vec(),
+                address: WireSecretAddress::new("index", None),
+            })),
+            pending: None,
+        })
+        .unwrap();
+        assert!(native.validate_fields().is_err());
     }
 
     #[test]

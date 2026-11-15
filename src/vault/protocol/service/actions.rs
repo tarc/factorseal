@@ -135,6 +135,7 @@ pub(super) fn execute_action(
         | VaultAction::AuthorizeSecretInput { .. }
         | VaultAction::WriteCacheFromDialog { .. }
         | VaultAction::KeyringAccess { .. }
+        | VaultAction::WslKeyringAccess { .. }
         | VaultAction::ListPermissions
         | VaultAction::ListPermissionsPage { .. }
         | VaultAction::WaitPermissions { .. }
@@ -568,7 +569,8 @@ pub(super) fn scope_action(action: VaultAction) -> ScopedAction {
         | VaultAction::Clear { ref namespace }
         | VaultAction::Seal { ref namespace }
         | VaultAction::ListHistory { ref namespace, .. }
-            if namespace == b"factorseal/secret-service/v1" =>
+            if namespace == b"factorseal/secret-service/v1"
+                || super::super::wsl::wsl_keyring_distro(namespace).is_some() =>
         {
             DocumentKind::LinuxSecretService
         }

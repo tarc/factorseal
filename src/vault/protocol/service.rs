@@ -7,13 +7,13 @@ use super::wire::PROTOCOL_VERSION;
 #[cfg(all(test, feature = "hardware"))]
 use super::wire::{MAX_MESSAGE_BYTES, REQUEST_ID_BYTES};
 use super::{
-    CallerIdentity, GrantPermission, UnsealLeasePolicy, VaultAction, VaultRequest, VaultResponse,
-    VaultResponseBody, VaultResponseError, VaultResponseErrorCode,
+    CallerIdentity, GrantPermission, UnsealLeasePolicy, VaultAction, VaultApplicationContext,
+    VaultRequest, VaultResponse, VaultResponseBody, VaultResponseError, VaultResponseErrorCode,
 };
 #[cfg(all(test, feature = "hardware"))]
 use super::{
     CallerPlatform, PermissionChange, PermissionState, PermissionWaitStatus, RequestId,
-    VaultApplicationContext, VaultMutation, WireSecret, WireSecretAddress,
+    VaultMutation, WireSecret, WireSecretAddress,
 };
 
 #[cfg(feature = "vault-store")]
@@ -443,48 +443,92 @@ impl VaultService {
                 tighten(valid_until, broker_deadline);
                 clock.check(valid_until.get())?;
                 let (peer, base_dir) = keyring_peer(&sender)?;
-                if let Some(id) = pending {
-                    let status =
-                        state.wait_for_permission(&peer, &id, Duration::from_millis(1), clock)?;
-                    return Ok(VaultResponseBody::PermissionWait { status });
-                }
                 let candidate =
                     ApprovalCandidate::for_keyring(&peer, &service, entry, base_dir, operation);
-                match candidate.require_keyring(state.store(), now) {
-                    Ok(deadline) => {
-                        tighten(valid_until, deadline);
-                        clock.check(valid_until.get())?;
+                return keyring_access(
+                    state,
+                    caller,
+                    &peer,
+                    candidate,
+                    KeyringRequest {
+                        action,
+                        pending,
+                        application: None,
+                    },
+                    clock,
+                    valid_until,
+                );
+            }
+            VaultAction::WslKeyringAccess {
+                caller: declared,
+                entry,
+                service,
+                operation,
+                action,
+                pending,
+            } => {
+                // The distro and folder are the broker's rewrite of the
+                // request's context; the caller is declared by the WSL host.
+                let distro = application
+                    .as_ref()
+                    .and_then(|application| application.declared_wsl_origin.clone())
+                    .ok_or(VaultError::AuthorizationRequired)?;
+                let namespace = super::wsl::wsl_keyring_namespace(&distro)?;
+                // Only the broker the worker granted this distro's keyring
+                // may relay its callers.
+                let broker_deadline = super::grant::require_grant_until(
+                    state.store(),
+                    caller,
+                    super::grant::GrantRequirement {
+                        scope: DocumentKind::LinuxSecretService,
+                        namespace: Some(&namespace),
+                        address: None,
+                        project: None,
+                        base_dir: None,
+                        permission: GrantPermission::Get,
+                    },
+                    now,
+                )?;
+                tighten(valid_until, broker_deadline);
+                clock.check(valid_until.get())?;
+                if let Some(
+                    VaultAction::Get {
+                        namespace: inner, ..
                     }
-                    Err(VaultError::AuthorizationRequired) => {
-                        let interaction = state.create_approval(candidate, now)?;
-                        return Err(RequestFailure {
-                            error: VaultError::AuthorizationRequired,
-                            interaction: Some(interaction),
-                        });
-                    }
-                    Err(error) => return Err(error.into()),
+                    | VaultAction::Mutate {
+                        namespace: inner, ..
+                    },
+                ) = action.as_deref()
+                    && *inner != namespace
+                {
+                    return Err(VaultError::Protocol(
+                        "a WSL keyring action must stay in its distro's namespace".to_owned(),
+                    )
+                    .into());
                 }
-                if let Some(action) = action {
-                    let result = execute_action(
-                        state.store(),
-                        caller,
-                        *action,
-                        state.lease_deadlines(),
-                        &Provenance::caller(&peer, None),
-                        None,
-                        clock,
-                        valid_until,
-                    )?;
-                    clock.check(valid_until.get())?;
-                    if result.1 {
-                        let (now, monotonic_now) = clock.sample();
-                        state.touch(now, monotonic_now)?;
-                    }
-                    return Ok(result.0);
-                }
-                return Ok(VaultResponseBody::PermissionWait {
-                    status: super::PermissionWaitStatus::Granted,
-                });
+                let base_dir = application
+                    .as_ref()
+                    .and_then(|application| application.base_dir.clone())
+                    .ok_or_else(|| {
+                        VaultError::Protocol("a WSL keyring request needs its folder".to_owned())
+                    })?;
+                let peer = declared.principal(&distro)?;
+                let candidate = ApprovalCandidate::for_wsl_keyring(
+                    &peer, &service, entry, base_dir, operation, distro,
+                );
+                return keyring_access(
+                    state,
+                    caller,
+                    &peer,
+                    candidate,
+                    KeyringRequest {
+                        action,
+                        pending,
+                        application: application.as_ref(),
+                    },
+                    clock,
+                    valid_until,
+                );
             }
             VaultAction::ListPermissions | VaultAction::ListPermissionsPage { .. } => {
                 require_live_manager(&state, caller, clock, valid_until)?;
@@ -636,6 +680,70 @@ fn permission_manager_deadline(
         },
         now,
     )
+}
+
+/// What a keyring access asks besides its approval: an action to run once
+/// granted, or a pending approval to wait for.
+struct KeyringRequest<'a> {
+    action: Option<Box<VaultAction>>,
+    pending: Option<String>,
+    /// Recorded as the provenance of a write; the caller's declared context.
+    application: Option<&'a VaultApplicationContext>,
+}
+
+/// The common part of `KeyringAccess` and `WslKeyringAccess`, once the host
+/// is authorized and the peer known: wait for a pending approval, check the
+/// peer's grant (creating an approval when it has none), then run the
+/// action as the host on the peer's behalf.
+fn keyring_access(
+    mut state: LiveStateGuard<'_>,
+    host: &CallerIdentity,
+    peer: &CallerIdentity,
+    candidate: ApprovalCandidate,
+    request: KeyringRequest<'_>,
+    clock: RequestTime,
+    valid_until: &std::cell::Cell<Option<u64>>,
+) -> Result<VaultResponseBody, RequestFailure> {
+    let now = clock.wall();
+    if let Some(id) = request.pending {
+        let status = state.wait_for_permission(peer, &id, Duration::from_millis(1), clock)?;
+        return Ok(VaultResponseBody::PermissionWait { status });
+    }
+    match candidate.require_keyring(state.store(), now) {
+        Ok(deadline) => {
+            tighten(valid_until, deadline);
+            clock.check(valid_until.get())?;
+        }
+        Err(VaultError::AuthorizationRequired) => {
+            let interaction = state.create_approval(candidate, now)?;
+            return Err(RequestFailure {
+                error: VaultError::AuthorizationRequired,
+                interaction: Some(interaction),
+            });
+        }
+        Err(error) => return Err(error.into()),
+    }
+    if let Some(action) = request.action {
+        let result = execute_action(
+            state.store(),
+            host,
+            *action,
+            state.lease_deadlines(),
+            &Provenance::caller(peer, request.application),
+            None,
+            clock,
+            valid_until,
+        )?;
+        clock.check(valid_until.get())?;
+        if result.1 {
+            let (now, monotonic_now) = clock.sample();
+            state.touch(now, monotonic_now)?;
+        }
+        return Ok(result.0);
+    }
+    Ok(VaultResponseBody::PermissionWait {
+        status: super::PermissionWaitStatus::Granted,
+    })
 }
 
 fn require_live_manager(

@@ -133,6 +133,22 @@ impl ApprovalCandidate {
         }
     }
 
+    /// A keyring access from a WSL distro: as [`Self::for_keyring`], tagged
+    /// with the distro so that its grant lasts until the vault seals and the
+    /// popup shows it as declared by WSL.
+    pub(super) fn for_wsl_keyring(
+        caller: &CallerIdentity,
+        service: &str,
+        address: Option<crate::SecretAddress>,
+        base_dir: String,
+        operation: PermissionOperation,
+        distro: String,
+    ) -> Self {
+        let mut candidate = Self::for_keyring(caller, service, address, base_dir, operation);
+        candidate.application.declared_wsl_origin = Some(distro);
+        candidate
+    }
+
     pub(super) fn require_keyring(&self, store: &VaultStore, now: u64) -> VaultResult<Option<u64>> {
         super::super::grant::require_grant_until(
             store,
