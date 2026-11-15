@@ -30,6 +30,14 @@ const PROVIDER_URI: &str = "factorseal://default";
 /// approval, so its answer still arrives in time. SecretSpec gives an
 /// operation a fixed 30 seconds, and a person may take longer to approve.
 const APPROVAL_ANSWER_MARGIN: std::time::Duration = std::time::Duration::from_secs(1);
+/// Through the WSL broker, every request of this provider shares one
+/// broker, and a permission wait holds it for its whole timeout: keep each
+/// wait short, so that keys waiting together take turns, and answer earlier,
+/// since a request may first wait for the others' turns.
+#[cfg(target_os = "linux")]
+const MAX_RELAYED_PERMISSION_WAIT_MS: u64 = 500;
+#[cfg(target_os = "linux")]
+const RELAYED_APPROVAL_ANSWER_MARGIN: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn accepts_provider_uri(uri: &str) -> bool {
     uri == "factorseal://" || uri == PROVIDER_URI
@@ -483,7 +491,18 @@ impl FactorsealProvider {
         context: &RequestContext,
         id: &str,
     ) -> RpcResult<PermissionWaitStatus> {
-        let Some(answer_by) = context.deadline.checked_sub(APPROVAL_ANSWER_MARGIN) else {
+        #[cfg(target_os = "linux")]
+        let (margin, max_wait_ms) = if self.relayed {
+            (
+                RELAYED_APPROVAL_ANSWER_MARGIN,
+                MAX_RELAYED_PERMISSION_WAIT_MS,
+            )
+        } else {
+            (APPROVAL_ANSWER_MARGIN, MAX_PERMISSION_WAIT_MS)
+        };
+        #[cfg(not(target_os = "linux"))]
+        let (margin, max_wait_ms) = (APPROVAL_ANSWER_MARGIN, MAX_PERMISSION_WAIT_MS);
+        let Some(answer_by) = context.deadline.checked_sub(margin) else {
             return Ok(PermissionWaitStatus::Pending);
         };
         loop {
@@ -498,7 +517,7 @@ impl FactorsealProvider {
             };
             let timeout_ms = u64::try_from(remaining.as_millis())
                 .unwrap_or(u64::MAX)
-                .clamp(1, MAX_PERMISSION_WAIT_MS);
+                .clamp(1, max_wait_ms);
             match self
                 .request_once(VaultAction::WaitPermission {
                     id: id.to_owned(),

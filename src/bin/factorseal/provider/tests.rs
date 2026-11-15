@@ -466,6 +466,92 @@ async fn a_relayed_provider_waits_for_the_windows_unseal_not_a_linux_desktop() {
     assert!(actions[1..].iter().all(|action| *action == "status"));
 }
 
+/// A Windows vault behind one WSL broker: every read needs an approval the
+/// person leaves pending, and each permission wait holds the broker for its
+/// whole timeout, as `BrokerVaultClient`'s lock does.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct PendingBehindOneBroker {
+    broker: Mutex<()>,
+    waits: Mutex<Vec<u64>>,
+}
+
+#[cfg(target_os = "linux")]
+impl VaultClient for PendingBehindOneBroker {
+    fn request(&self, request: &VaultRequest) -> factorseal::VaultResult<VaultResponse> {
+        let _broker = self.broker.lock().unwrap();
+        match &request.action {
+            VaultAction::GetCache { .. } => Ok(VaultResponse::failure(
+                request.request_id(),
+                VaultResponseError {
+                    code: VaultResponseErrorCode::AuthorizationRequired,
+                    message: "approve in Desktop".to_owned(),
+                    interaction: Some(factorseal::VaultInteractionReference {
+                        id: "prm_0123456789abcdef0123456789abcdef".to_owned(),
+                        expires_at: u64::MAX,
+                    }),
+                },
+            )),
+            VaultAction::WaitPermission { timeout_ms, .. } => {
+                self.waits.lock().unwrap().push(*timeout_ms);
+                std::thread::sleep(std::time::Duration::from_millis(*timeout_ms));
+                Ok(VaultResponse::success(
+                    request.request_id(),
+                    VaultResponseBody::PermissionWait {
+                        status: PermissionWaitStatus::Pending,
+                    },
+                ))
+            }
+            _ => Err(VaultError::Protocol("unexpected action".to_owned())),
+        }
+    }
+}
+
+/// Finding 12: three keys waiting on one broker. Each wait holds the broker,
+/// so long waits queue and a key misses the caller's deadline ("deadline
+/// exceeded"); short waits and a wider margin let every key answer that it
+/// needs the person, in time.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn relayed_keys_left_pending_all_ask_for_interaction_in_time() {
+    let vault = Arc::new(PendingBehindOneBroker::default());
+    let mut provider = FactorsealProvider::with_client(vault.clone());
+    provider.relayed = true;
+    let (client, server) = connected(provider).await;
+    let within_ms = 4_000;
+    let started = std::time::Instant::now();
+    let call_deadline = unix_time_ms().unwrap() + within_ms;
+    let get = |key: &'static str| {
+        let client = &client;
+        async move {
+            client
+                .call::<_, GetResult>(
+                    wire::method::GET,
+                    &AddressParams {
+                        address: Address::Convention {
+                            project: "demo".to_owned(),
+                            profile: "default".to_owned(),
+                            key: key.to_owned(),
+                        },
+                    },
+                    call_deadline,
+                )
+                .await
+        }
+    };
+    let results = tokio::join!(get("ONE"), get("TWO"), get("THREE"));
+    assert!(started.elapsed() < std::time::Duration::from_millis(within_ms));
+    for result in [results.0, results.1, results.2] {
+        let Err(secretspec_ipc::Error::Remote(error)) = &result else {
+            panic!("expected the provider to ask for interaction, got {result:?}");
+        };
+        assert_eq!(error.data.kind, ErrorKind::InteractionRequired);
+    }
+    assert!(vault.waits.lock().unwrap().iter().all(|&wait| wait <= 500));
+    client.close(deadline()).await.unwrap();
+    server.await.unwrap().unwrap();
+}
+
 /// With a WSL setup and no explicit socket, the provider talks to the
 /// Windows vault through the broker; an explicit socket names a Linux vault
 /// and wins; a damaged setup is an error, not a silent Linux fallback.
