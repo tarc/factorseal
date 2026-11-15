@@ -59,10 +59,11 @@ mkdir -p "$windows_tree"
 echo "Mirroring $repo to $windows_tree"
 set +e
 # devenv's generated .claude/ and .mcp.json link into /nix/store, which Windows
-# cannot open. Robocopy retries an unreadable file a million times by default,
+# cannot open, and a code index's .boostgraph/ holds a Unix socket, which it
+# cannot copy. Robocopy retries an unreadable file a million times by default,
 # so /R and /W make any such file fail within seconds instead of hanging.
 /mnt/c/Windows/System32/robocopy.exe "$(wslpath -w "$repo")" "$(wslpath -w "$windows_tree")" \
-    /MIR /XD .git target .claude .devenv /XF .mcp.json /R:1 /W:1 \
+    /MIR /XD .git target .claude .devenv .boostgraph /XF .mcp.json /R:1 /W:1 \
     /NJH /NJS /NDL /NP /NFL >/dev/null
 copied=$?
 set -e
