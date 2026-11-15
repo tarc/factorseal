@@ -5,7 +5,7 @@ the implementation review acted on (fc49f02..3555cbd), the review of
 those fixes (cbada0a..d03d54a), a third review (bf0e7e6..b927d1b) and a
 fourth (after b927d1b); step 6 implemented (b3429f9, 6539cb5) and its
 review acted on (4cfeaa0..84ef1d7, see "Step 6 review"), then a review
-of those fixes (1b1ab6d..8cfd413, "Step 6 fixes review"); steps 8 and 9
+of those fixes (1b1ab6d..10439e5, "Step 6 fixes review"); steps 8 and 9
 remain. All reviews
 are folded in (see "Review record" and "Implementation
 record" at the end). Branch: `feature/wsl2-keyring` (the WSL keyring this
@@ -725,7 +725,7 @@ mutation, and the gate:
 | 1b1ab6d | fixes review F6-1: base64 check before decoding a frame body |
 | f73a05e | F6-3: keep the end of stderr |
 | 8cfd413 | F6-4: one frame limit shared by the CLI and Desktop |
-| (pending) | F6-2: Desktop names a distro on FactorSeal's keyring (uncommitted until the user's OK) |
+| 10439e5 | F6-2: Desktop names a distro on FactorSeal's keyring |
 
 `fuzz/Cargo.lock` gained only the `md-5` entry; it already failed
 `cargo metadata --locked` at 4ed2d2d (missing `embed-resource`), which is
@@ -1056,7 +1056,7 @@ Desktop 196 passed, 1 ignored, and the WSL relay's 14.
 - **F6-2, low (ran): on a distro switched to FactorSeal's keyring, the
   export starts FactorSeal's own service and refuses it.** The start is
   kept (step 2 gives why); Desktop names the case instead of the generic
-  row (pending commit). Its test failed before. Reading which service
+  row (10439e5). Its test failed before. Reading which service
   file D-Bus would start, the reviewer's other option, was not taken:
   the reviewer called it fragile, and the start does no harm there.
 - **F6-3, low (ran): past 64 KiB of stderr the row lost the CLI's
