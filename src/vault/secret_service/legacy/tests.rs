@@ -22,6 +22,8 @@ struct FakeCollection {
     name: &'static str,
     locked: bool,
     dismiss: bool,
+    /// The prompt never completes, as when gcr has no display.
+    hang: bool,
     items: Vec<FakeItem>,
 }
 
@@ -29,6 +31,7 @@ struct FakeCollection {
 struct Calls {
     unlocks: usize,
     prompts: Vec<&'static str>,
+    dismissed: Vec<&'static str>,
     get_secrets: usize,
 }
 
@@ -209,6 +212,9 @@ impl Prompt {
             let name = fake.collections[self.1].name;
             fake.calls.prompts.push(name);
             let collection = &mut fake.collections[self.1];
+            if collection.hang {
+                return Ok(());
+            }
             if !collection.dismiss {
                 collection.locked = false;
             }
@@ -222,6 +228,11 @@ impl Prompt {
         .await
         .unwrap();
         Ok(())
+    }
+    fn dismiss(&self) {
+        let mut fake = self.0.lock().unwrap();
+        let name = fake.collections[self.1].name;
+        fake.calls.dismissed.push(name);
     }
     #[zbus(signal)]
     async fn completed(
@@ -244,6 +255,7 @@ fn fake(dismiss_other: bool) -> Fake {
                 name: "login",
                 locked: true,
                 dismiss: false,
+                hang: false,
                 items: vec![
                     FakeItem {
                         label: "GitHub CLI",
@@ -271,6 +283,7 @@ fn fake(dismiss_other: bool) -> Fake {
                 name: "session",
                 locked: false,
                 dismiss: false,
+                hang: false,
                 items: vec![FakeItem {
                     label: "in memory",
                     attributes: &[("temporary", "yes")],
@@ -283,6 +296,7 @@ fn fake(dismiss_other: bool) -> Fake {
                 name: "other",
                 locked: true,
                 dismiss: dismiss_other,
+                hang: false,
                 items: vec![FakeItem {
                     label: "VS Code",
                     attributes: &[("service", "vscode")],
@@ -554,4 +568,29 @@ fn wrapped_factorseal_executables_are_recognized() {
     ] {
         assert!(!is_factorseal_executable(name.as_ref()), "{name}");
     }
+}
+
+#[tokio::test]
+async fn an_unlock_prompt_that_never_completes_times_out_and_is_dismissed() {
+    if !private_bus() {
+        return;
+    }
+    let mut hanging = fake(false);
+    hanging.collections[2].hang = true;
+    let (_server, mut legacy, shared) = serve(hanging).await;
+    legacy.unlock_timeout = std::time::Duration::from_millis(300);
+    let read = legacy.read_all(true).await.unwrap();
+    assert_eq!(
+        read.items
+            .iter()
+            .map(|item| item.collection.as_str())
+            .collect::<Vec<_>>(),
+        ["login", "login"]
+    );
+    assert_eq!(
+        read.skipped_collections,
+        [("other".to_owned(), "unlock timed out".to_owned())]
+    );
+    assert_eq!(shared.lock().unwrap().calls.dismissed, ["other"]);
+    legacy.close().await;
 }

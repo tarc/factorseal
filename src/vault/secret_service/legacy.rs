@@ -7,6 +7,8 @@
 //! when the caller asks.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future as _;
+use std::time::Duration;
 
 use zbus::export::futures_core::Stream;
 use zbus::{Connection, OwnedObjectPath, OwnedVariant, Variant, fdo};
@@ -22,6 +24,39 @@ pub(crate) struct Legacy {
     pub(in crate::vault::secret_service) connection: Connection,
     pub(in crate::vault::secret_service) owner: String,
     pub(in crate::vault::secret_service) session: OwnedObjectPath,
+    /// How long an unlock prompt may stay unanswered. A gcr prompt with no
+    /// display never appears, and nothing else would end the wait.
+    pub(in crate::vault::secret_service) unlock_timeout: Duration,
+}
+
+/// What became of one collection's unlock.
+enum Unlock {
+    Unlocked,
+    Dismissed,
+    TimedOut,
+}
+
+const UNLOCK_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// `future`'s output, or `None` once `limit` passes. The timer is a thread,
+/// not a Tokio timer: callers may run on zbus's own executor.
+async fn within<T>(limit: Duration, future: impl std::future::Future<Output = T>) -> Option<T> {
+    let (sender, mut expired) = tokio::sync::oneshot::channel::<()>();
+    std::thread::spawn(move || {
+        std::thread::sleep(limit);
+        let _ = sender.send(());
+    });
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(|context| {
+        if let std::task::Poll::Ready(output) = future.as_mut().poll(context) {
+            return std::task::Poll::Ready(Some(output));
+        }
+        match std::pin::Pin::new(&mut expired).poll(context) {
+            std::task::Poll::Ready(_) => std::task::Poll::Ready(None),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    })
+    .await
 }
 
 /// One item of the other Secret Service, as it reported it: on a locked
@@ -157,6 +192,7 @@ impl Legacy {
             connection,
             owner,
             session,
+            unlock_timeout: UNLOCK_TIMEOUT,
         })
     }
 
@@ -272,10 +308,18 @@ impl Legacy {
                     read.skipped_collections.push((name, "locked".to_owned()));
                     continue;
                 }
-                if !self.unlock(&path).await? {
-                    read.skipped_collections
-                        .push((name, "unlock dismissed".to_owned()));
-                    continue;
+                match self.unlock(&path).await? {
+                    Unlock::Unlocked => {}
+                    Unlock::Dismissed => {
+                        read.skipped_collections
+                            .push((name, "unlock dismissed".to_owned()));
+                        continue;
+                    }
+                    Unlock::TimedOut => {
+                        read.skipped_collections
+                            .push((name, "unlock timed out".to_owned()));
+                        continue;
+                    }
                 }
                 if self.collection_locked(&path).await? {
                     read.skipped_collections
@@ -324,8 +368,8 @@ impl Legacy {
     }
 
     /// Unlock one collection, through its prompt if the service asks for
-    /// one. Returns whether it was not dismissed.
-    async fn unlock(&self, path: &OwnedObjectPath) -> zbus::Result<bool> {
+    /// one. A prompt unanswered for [`Self::unlock_timeout`] is dismissed.
+    async fn unlock(&self, path: &OwnedObjectPath) -> zbus::Result<Unlock> {
         let service = proxy(
             &self.connection,
             &self.owner,
@@ -336,7 +380,7 @@ impl Legacy {
         let (_, prompt): (Vec<OwnedObjectPath>, OwnedObjectPath) =
             service.call("Unlock", &(vec![path],)).await?;
         if prompt.as_str() == "/" {
-            return Ok(true);
+            return Ok(Unlock::Unlocked);
         }
         let prompt = proxy(
             &self.connection,
@@ -348,12 +392,20 @@ impl Legacy {
         // Subscribe before prompting, or a quick Completed is lost.
         let mut completed = prompt.receive_signal("Completed").await?;
         prompt.call::<_, _, ()>("Prompt", &("",)).await?;
+        let next =
+            std::future::poll_fn(|context| std::pin::Pin::new(&mut completed).poll_next(context));
+        let Some(signal) = within(self.unlock_timeout, next).await else {
+            let _ = prompt.call::<_, _, ()>("Dismiss", &()).await;
+            return Ok(Unlock::TimedOut);
+        };
         let signal =
-            std::future::poll_fn(|context| std::pin::Pin::new(&mut completed).poll_next(context))
-                .await
-                .ok_or_else(|| zbus::Error::Failure("the unlock prompt vanished".to_owned()))?;
+            signal.ok_or_else(|| zbus::Error::Failure("the unlock prompt vanished".to_owned()))?;
         let (dismissed, _): (bool, OwnedVariant) = signal.body().deserialize()?;
-        Ok(!dismissed)
+        Ok(if dismissed {
+            Unlock::Dismissed
+        } else {
+            Unlock::Unlocked
+        })
     }
 }
 
