@@ -4,7 +4,7 @@ Status, 2026-11-15: steps 1–5 and 7 implemented (de2780e..3b49775), then
 the implementation review acted on (fc49f02..3555cbd), the review of
 those fixes (cbada0a..d03d54a), a third review (bf0e7e6..b927d1b) and a
 fourth (after b927d1b); step 6 implemented (b3429f9, 6539cb5) and its
-review acted on (4cfeaa0..e45811d, see "Step 6 review"); steps 8 and 9
+review acted on (4cfeaa0..84ef1d7, see "Step 6 review"); steps 8 and 9
 remain. All reviews
 are folded in (see "Review record" and "Implementation
 record" at the end). Branch: `feature/wsl2-keyring` (the WSL keyring this
@@ -709,7 +709,8 @@ mutation, and the gate:
 | 44f2080 | S6-4: the vault's fingerprint keeps `gkr:compat:*` names |
 | c36c048 | S6-5: the cursor follows the item-id rule |
 | e45811d | S6-8: stderr cap, drain past the caps |
-| (pending) | S6-6, S6-7: Desktop's error lines and failed Moves (uncommitted until the user's native look) |
+| 3750863 | S6-6: the CLI's own error line on the row |
+| 84ef1d7 | S6-7: a failed restore is reported and the vault read again |
 
 `fuzz/Cargo.lock` gained only the `md-5` entry; it already failed
 `cargo metadata --locked` at 4ed2d2d (missing `embed-resource`), which is
@@ -992,10 +993,10 @@ relay's 14.
   chain of step 1. The test pages over 9100 mixed-case ids and failed
   before at the reviewer's cursor.
 - **S6-6, low (read): the error shown was the first three stderr lines.**
-  Fixed (pending commit): the CLI's own lines, else the last three. Tests
+  Fixed in 3750863: the CLI's own lines, else the last three. Tests
   with three warnings before the error failed before.
 - **S6-7, low (read): a Move failing in the restore hid what it did.**
-  Fixed (pending commit): `move_items` reports whether the restore ran and
+  Fixed in 84ef1d7: `move_items` reports whether the restore ran and
   whether the failure is the cancellation itself; the vault is read again
   after any Move that reached the restore, and an error after a late
   Cancel is shown. Mutations of either flag fail the new tests.
