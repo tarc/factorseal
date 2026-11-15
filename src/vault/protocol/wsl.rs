@@ -110,16 +110,18 @@ pub fn relay_allows(action: &VaultAction, distro: &str) -> bool {
 /// and sent to `client` only if [`relay_allows`] its action; anything else
 /// is refused here with the request's own id. When the vault is sealed or
 /// unreachable, the client gets `Sealed`, and `on_sealed` (which brings
-/// Desktop forward) runs the first time only.
+/// Desktop forward) runs the first time only, unless `options` say
+/// `--no-desktop`.
 pub fn serve(
     client: &dyn VaultClient,
     distro: &str,
+    options: &RelayOptions,
     input: &mut impl Read,
     output: &mut impl Write,
     on_sealed: impl FnOnce(),
 ) -> VaultResult<()> {
     validate_distro(distro)?;
-    let mut on_sealed = Some(on_sealed);
+    let mut on_sealed = (!options.no_desktop).then_some(on_sealed);
     while let Some(frame) = read_frame(input)
         .map_err(|error| VaultError::Protocol(format!("reading a request: {error}")))?
     {
@@ -233,23 +235,36 @@ fn validate_windows_root(root: &str) -> VaultResult<()> {
     Ok(())
 }
 
-/// The options after `relay` on the broker's command line: nothing, or
-/// `--root <WINDOWS_ROOT>`, the root of the vault the broker serves, which
-/// it passes to Desktop when it brings it forward.
-pub fn parse_relay_options(
-    mut options: impl Iterator<Item = String>,
-) -> VaultResult<Option<String>> {
-    let invalid = || VaultError::Protocol("usage: relay [--root <WINDOWS_ROOT>]".to_owned());
-    let root = match options.next().as_deref() {
-        None => return Ok(None),
-        Some("--root") => options.next().ok_or_else(invalid)?,
-        Some(_) => return Err(invalid()),
-    };
-    if options.next().is_some() {
-        return Err(invalid());
+/// The options after `relay` on the broker's command line.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RelayOptions {
+    /// `--root <WINDOWS_ROOT>`: the root of the vault the broker serves,
+    /// which it passes to Desktop when it brings it forward.
+    pub root: Option<String>,
+    /// `--no-desktop`: never bring Desktop forward, for a client that checks
+    /// the vault by itself (the WSL keyring host's monitor) rather than for
+    /// a person waiting on an answer.
+    pub no_desktop: bool,
+}
+
+/// Parse the options after `relay`: `--root <WINDOWS_ROOT>` and
+/// `--no-desktop`, each at most once, in any order.
+pub fn parse_relay_options(mut options: impl Iterator<Item = String>) -> VaultResult<RelayOptions> {
+    let invalid =
+        || VaultError::Protocol("usage: relay [--root <WINDOWS_ROOT>] [--no-desktop]".to_owned());
+    let mut parsed = RelayOptions::default();
+    while let Some(option) = options.next() {
+        match option.as_str() {
+            "--root" if parsed.root.is_none() => {
+                let root = options.next().ok_or_else(invalid)?;
+                validate_windows_root(&root)?;
+                parsed.root = Some(root);
+            }
+            "--no-desktop" if !parsed.no_desktop => parsed.no_desktop = true,
+            _ => return Err(invalid()),
+        }
     }
-    validate_windows_root(&root)?;
-    Ok(Some(root))
+    Ok(parsed)
 }
 
 /// Prefix of the keyring namespaces of WSL distros; the distro name follows.
@@ -319,6 +334,8 @@ pub struct BrokerVaultClient {
     distro: String,
     /// The vault's root on Windows, when it is not the default vault.
     windows_root: Option<String>,
+    /// The broker never brings Desktop forward (`relay --no-desktop`).
+    no_desktop: bool,
     relay: std::sync::Mutex<Option<Relay>>,
 }
 
@@ -361,6 +378,7 @@ impl BrokerVaultClient {
             pipe,
             distro,
             windows_root: None,
+            no_desktop: false,
             relay: std::sync::Mutex::new(None),
         })
     }
@@ -376,6 +394,15 @@ impl BrokerVaultClient {
         Ok(self)
     }
 
+    /// Never bring Desktop forward when the vault is sealed or not running:
+    /// for a client that checks the vault by itself, not on someone's
+    /// behalf.
+    #[must_use]
+    pub fn without_desktop(mut self) -> Self {
+        self.no_desktop = true;
+        self
+    }
+
     fn start(&self) -> VaultResult<Relay> {
         use std::process::{Command, Stdio};
         let mut child = Command::new(&self.broker)
@@ -385,6 +412,7 @@ impl BrokerVaultClient {
                     .iter()
                     .flat_map(|root| ["--root", root.as_str()]),
             )
+            .args(self.no_desktop.then_some("--no-desktop"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -751,21 +779,67 @@ mod tests {
         assert!(matches!(response.result, Ok(VaultResponseBody::Stored)));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn the_relay_takes_only_a_vault_root() {
+    fn a_client_without_desktop_starts_its_broker_with_no_desktop() {
+        use super::super::wire::{
+            RequestId, VaultClient as _, VaultRequest, VaultResponse, VaultResponseBody,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let template =
+            VaultResponse::success(RequestId::from_bytes([0; 16]), VaultResponseBody::Stored)
+                .encode()
+                .unwrap();
+        let root = r"C:\vault";
+        let broker = fake_broker_expecting(
+            directory.path(),
+            template.as_ref(),
+            &["pipe", "NixOS", "relay", "--root", root, "--no-desktop"],
+        );
+        let client = BrokerVaultClient::new(broker, "pipe".to_owned(), "NixOS".to_owned())
+            .unwrap()
+            .with_windows_root(Some(root.to_owned()))
+            .unwrap()
+            .without_desktop();
+        let response = client
+            .request(&VaultRequest::new(VaultAction::Status).unwrap())
+            .unwrap();
+        assert!(matches!(response.result, Ok(VaultResponseBody::Stored)));
+    }
+
+    #[test]
+    fn the_relay_takes_a_vault_root_and_no_desktop() {
         let parse = |options: &[&str]| {
             parse_relay_options(options.iter().map(|option| (*option).to_owned()))
         };
-        assert_eq!(parse(&[]).unwrap(), None);
+        assert_eq!(parse(&[]).unwrap(), RelayOptions::default());
         assert_eq!(
-            parse(&["--root", r"C:\vault"]).unwrap().as_deref(),
-            Some(r"C:\vault")
+            parse(&["--root", r"C:\vault"]).unwrap(),
+            RelayOptions {
+                root: Some(r"C:\vault".to_owned()),
+                no_desktop: false,
+            }
         );
+        for options in [
+            &["--root", r"C:\vault", "--no-desktop"][..],
+            &["--no-desktop", "--root", r"C:\vault"],
+        ] {
+            assert_eq!(
+                parse(options).unwrap(),
+                RelayOptions {
+                    root: Some(r"C:\vault".to_owned()),
+                    no_desktop: true,
+                }
+            );
+        }
+        assert!(parse(&["--no-desktop"]).unwrap().no_desktop);
         for invalid in [
             &["--root"][..],
             &["--root", ""],
             &["--root", "a\0b"],
             &["--root", "a", "b"],
+            &["--root", "a", "--root", "b"],
+            &["--no-desktop", "--no-desktop"],
             &["--other", "a"],
         ] {
             assert!(parse(invalid).is_err(), "{invalid:?}");
@@ -800,15 +874,30 @@ mod tests {
     /// Relay `requests` through [`serve`], returning the responses and how
     /// often `on_sealed` ran.
     fn served(vault: &RecordingVault, requests: &[Vec<u8>]) -> (Vec<VaultResponse>, usize) {
+        served_with(vault, &RelayOptions::default(), requests)
+    }
+
+    fn served_with(
+        vault: &RecordingVault,
+        options: &RelayOptions,
+        requests: &[Vec<u8>],
+    ) -> (Vec<VaultResponse>, usize) {
         let mut input = Vec::new();
         for request in requests {
             write_frame(&mut input, request).unwrap();
         }
         let mut output = Vec::new();
         let mut opened = 0;
-        serve(vault, "NixOS", &mut input.as_slice(), &mut output, || {
-            opened += 1;
-        })
+        serve(
+            vault,
+            "NixOS",
+            options,
+            &mut input.as_slice(),
+            &mut output,
+            || {
+                opened += 1;
+            },
+        )
         .unwrap();
         let mut reader = output.as_slice();
         let mut responses = Vec::new();
@@ -909,11 +998,36 @@ mod tests {
             serve(
                 &vault,
                 "bad/name",
+                &RelayOptions::default(),
                 &mut [].as_slice(),
                 &mut Vec::new(),
                 || {}
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn a_relay_without_desktop_never_brings_it_forward() {
+        let vault = RecordingVault {
+            seen: std::sync::Mutex::new(Vec::new()),
+            answers: std::sync::Mutex::new(vec![
+                Ok(VaultResponseErrorCode::Sealed),
+                Err(VaultError::AgentUnreachable("pipe".to_owned())),
+                Ok(VaultResponseErrorCode::Sealed),
+            ]),
+        };
+        let frames: Vec<_> = (0..3).map(|_| encoded(VaultAction::Status).1).collect();
+        let options = RelayOptions {
+            root: None,
+            no_desktop: true,
+        };
+        let (responses, opened) = served_with(&vault, &options, &frames);
+        assert_eq!(opened, 0);
+        assert!(
+            responses
+                .iter()
+                .all(|response| code(response) == Some(VaultResponseErrorCode::Sealed))
         );
     }
 

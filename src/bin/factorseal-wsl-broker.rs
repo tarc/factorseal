@@ -12,7 +12,7 @@
 //! Usage:
 //!   factorseal-wsl-broker.exe <pipe-name> <distro> status
 //!   factorseal-wsl-broker.exe <pipe-name> <distro> get <project> <profile> <key>
-//!   factorseal-wsl-broker.exe <pipe-name> <distro> relay [--root <WINDOWS_ROOT>]
+//!   factorseal-wsl-broker.exe <pipe-name> <distro> relay [--root <WINDOWS_ROOT>] [--no-desktop]
 //!
 //! `relay` serves a Linux client (the SecretSpec provider or the keyring
 //! host `factorseal wsl-keyring` in WSL) over
@@ -20,6 +20,8 @@
 //! `factorseal::vault::wsl_relay` for the framing, the folder translation
 //! and the requests it forwards. `--root` names the vault's root when it is
 //! not the default vault: Desktop is then brought forward on that vault.
+//! `--no-desktop` never brings Desktop forward, for a client that checks the
+//! vault by itself (the keyring host's monitor).
 
 #[cfg(windows)]
 fn main() {
@@ -43,7 +45,7 @@ mod windows_impl {
         WindowsVaultClient, wsl_relay,
     };
 
-    const USAGE: &str = "usage: factorseal-wsl-broker <pipe-name> <distro> status | get <project> <profile> <key> | relay [--root <WINDOWS_ROOT>]";
+    const USAGE: &str = "usage: factorseal-wsl-broker <pipe-name> <distro> status | get <project> <profile> <key> | relay [--root <WINDOWS_ROOT>] [--no-desktop]";
 
     /// `VaultAction` deliberately doesn't derive `Clone` (some variants carry
     /// secret material), so the request this broker sends twice -- once
@@ -110,12 +112,8 @@ mod windows_impl {
         let distro = args.next().ok_or(USAGE)?;
         let action_name = args.next().ok_or(USAGE)?;
         if action_name == "relay" {
-            let root = wsl_relay::parse_relay_options(args).map_err(|_| USAGE.to_owned())?;
-            return relay(
-                &WindowsVaultClient::new(pipe_name),
-                &distro,
-                root.as_deref(),
-            );
+            let options = wsl_relay::parse_relay_options(args).map_err(|_| USAGE.to_owned())?;
+            return relay(&WindowsVaultClient::new(pipe_name), &distro, &options);
         }
         let requested = RequestedAction::parse(&action_name, &mut args)?;
 
@@ -181,14 +179,20 @@ mod windows_impl {
     /// Serve one Linux client: each frame on standard input is a request,
     /// answered by one frame on standard output, until the input ends.
     /// `wsl_relay::serve` enforces the allowlist; Desktop is brought forward
-    /// the first time the vault is sealed or unreachable.
-    fn relay(client: &WindowsVaultClient, distro: &str, root: Option<&str>) -> Result<(), String> {
+    /// the first time the vault is sealed or unreachable, unless
+    /// `--no-desktop`.
+    fn relay(
+        client: &WindowsVaultClient,
+        distro: &str,
+        options: &wsl_relay::RelayOptions,
+    ) -> Result<(), String> {
         wsl_relay::serve(
             client,
             distro,
+            options,
             &mut std::io::stdin().lock(),
             &mut std::io::stdout().lock(),
-            || open_desktop(root),
+            || open_desktop(options.root.as_deref()),
         )
         .map_err(|error| error.to_string())
     }

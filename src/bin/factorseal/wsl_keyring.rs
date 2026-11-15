@@ -12,7 +12,8 @@
 //! unlock brings Desktop forward and installs the collection once the vault
 //! is unsealed. While installed, the vault's state is checked by its idle
 //! deadline (a `Status` does not extend the lease) and whenever a request
-//! finds the vault sealed.
+//! finds the vault sealed. Those checks never bring Desktop forward
+//! (`relay --no-desktop`); only a client's request or unlock does.
 
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -183,7 +184,10 @@ pub(super) fn serve() -> Result<(), CliError> {
             network_manager: false,
         },
     )?;
-    let monitor = config.clone().client()?;
+    // The monitor checks the vault by itself: its broker never brings
+    // Desktop forward. A client's request (the store's broker) or unlock
+    // (`await_unseal`) does.
+    let monitor = config.clone().monitor_client()?;
     let mut reported = None;
     let mut installed = false;
     let mut observed = observe(&monitor, &mut reported);

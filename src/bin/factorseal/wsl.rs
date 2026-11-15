@@ -45,9 +45,18 @@ impl WslConfig {
         &self.distro
     }
 
+    /// A client whose broker brings Desktop forward when the vault is sealed
+    /// or not running: for requests made on someone's behalf.
     pub(super) fn client(self) -> Result<BrokerVaultClient, CliError> {
         Ok(BrokerVaultClient::new(self.broker, self.pipe, self.distro)?
             .with_windows_root(self.windows_root)?)
+    }
+
+    /// A client whose broker never brings Desktop forward: for the keyring
+    /// host's own checks of the vault, which nobody asked for.
+    #[cfg(feature = "vault")]
+    pub(super) fn monitor_client(self) -> Result<BrokerVaultClient, CliError> {
+        Ok(self.client()?.without_desktop())
     }
 }
 
@@ -307,6 +316,52 @@ mod tests {
 
     fn mode(path: &Path) -> u32 {
         fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// The arguments a client's broker is started with, recorded by a
+    /// stand-in broker that answers nothing.
+    #[cfg(feature = "vault")]
+    fn broker_arguments(client: impl FnOnce(WslConfig) -> BrokerVaultClient) -> Vec<String> {
+        use factorseal::{VaultAction, VaultClient as _, VaultRequest};
+        let directory = tempfile::tempdir().unwrap();
+        let recorded = directory.path().join("arguments");
+        let broker = directory.path().join("broker");
+        fs::write(
+            &broker,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+                recorded.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&broker, fs::Permissions::from_mode(0o700)).unwrap();
+        let config = WslConfig {
+            broker,
+            pipe: "pipe".to_owned(),
+            distro: "NixOS".to_owned(),
+            windows_root: None,
+        };
+        let _ = client(config).request(&VaultRequest::new(VaultAction::Status).unwrap());
+        fs::read_to_string(recorded)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Only the keyring host's monitor asks its broker not to bring Desktop
+    /// forward; a request made for a program or a person does.
+    #[cfg(feature = "vault")]
+    #[test]
+    fn only_the_monitor_client_leaves_desktop_alone() {
+        assert_eq!(
+            broker_arguments(|config| config.monitor_client().unwrap()),
+            ["pipe", "NixOS", "relay", "--no-desktop"]
+        );
+        assert_eq!(
+            broker_arguments(|config| config.client().unwrap()),
+            ["pipe", "NixOS", "relay"]
+        );
     }
 
     /// The configuration can live in a directory that isn't FactorSeal's

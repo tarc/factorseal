@@ -398,7 +398,10 @@ Values are stored by project and key, so a WSL program reads what Windows
 SecretSpec wrote, but under its own approvals: the caller is the broker.
 When `wsl.json` names a vault other than the default one
 (`wsl-setup --windows-root`), the broker is told its root
-(`relay --root <root>`) and starts Desktop on that vault.
+(`relay --root <root>`) and starts Desktop on that vault. A client that
+checks the vault by itself rather than for someone (the WSL keyring host's
+monitor) starts its broker with `relay --no-desktop`, which never brings
+Desktop forward.
 
 ### WSL keyring
 
@@ -438,9 +441,12 @@ check for a declared caller, for the item that check names.
 
 While the vault is sealed, the collection reports locked; a client's unlock
 asks through a new broker, which brings Desktop forward, and the collection
-is installed once the vault is unsealed. While installed, the host checks the
+is installed once the vault is unsealed. A client's request that finds the
+vault sealed brings Desktop forward too. While installed, the host checks the
 vault by its idle deadline (a status request does not extend the lease) and
-whenever a request finds it sealed. The host does not run the NetworkManager
+whenever a request finds it sealed; those checks, and the one at start-up,
+go through a broker started with `--no-desktop`, so the host never brings
+Desktop forward by itself, for instance when the vault idle-seals. The host does not run the NetworkManager
 agent. WSL keyring items appear in Desktop's inventory and backups under
 their distro's namespace.
 
