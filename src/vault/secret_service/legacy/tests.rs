@@ -594,3 +594,30 @@ async fn an_unlock_prompt_that_never_completes_times_out_and_is_dismissed() {
     assert_eq!(shared.lock().unwrap().calls.dismissed, ["other"]);
     legacy.close().await;
 }
+
+#[tokio::test]
+async fn secrets_are_read_in_batches_across_the_boundary() {
+    if !private_bus() {
+        return;
+    }
+    let mut many = fake(false);
+    many.collections[0].locked = false;
+    let item = || FakeItem {
+        label: "many",
+        attributes: &[("service", "many")],
+        hashed: &[],
+        modified: 1,
+        value: b"many value",
+    };
+    many.collections[0].items = (0..=SECRETS_BATCH).map(|_| item()).collect();
+    let (_server, legacy, shared) = serve(many).await;
+    let read = legacy.read_all(false).await.unwrap();
+    assert_eq!(read.items.len(), SECRETS_BATCH + 1);
+    assert!(read.items.iter().all(|item| {
+        item.secret
+            .as_ref()
+            .is_some_and(|(value, _)| &**value == b"many value")
+    }));
+    assert_eq!(shared.lock().unwrap().calls.get_secrets, 2);
+    legacy.close().await;
+}
