@@ -3,8 +3,8 @@
 Status, 2026-11-15: milestone 1 (SecretSpec in WSL) is done on
 `feature/wsl2-keyring` (backed up on the fork as `wip/wsl2-keyring` at
 3ecbb9a, no PR), and the fixes from its independent review are committed
-on top (see "Review fixes" below), except the Desktop popup fix (finding 1),
-which waits uncommitted for the user to see it in the native build.
+on top (see "Review fixes" below), the Desktop popup fix (finding 1)
+included once the user saw it in the native build.
 Milestone 2 (the WSL keyring) is planned below and not started. This branch
 sits on `stack/7-browser-windows`, the top of the WSL2 PR stack (#42 → #43 →
 #44 → #46 → #47, index #40); rebase it with `git rebase --onto` when the stack
@@ -119,7 +119,7 @@ Decisions the user took:
 
 | Commit | Finding | What, and how it was verified |
 |---|---|---|
-| *(uncommitted)* | 1, blocking | Desktop popup: `approval_lifetime(grants, choice)` refuses a carried-over choice that no longer fits ("Until the vault seals" for mixed or native requests, a native duration for all-WSL ones, "This write only" for non-writes) with "The requests changed. Choose how long to allow access."; `grant()` uses it. Assertions in `secretspec_requests_name_…`; Linux and Windows Desktop tests (184, 169); live on the test vault (scratch `mixed-popup.sh`): a WSL read waiting with "Until the vault seals" selected, then a native `provider-probe.ps1` read joins, Allow is refused and both stay pending, "1 hour" then grants the native read for an hour and the WSL read for min(1 h, unseal deadline). |
+| 42d8cbb | 1, blocking | Desktop popup: `approval_lifetime(grants, choice)` refuses a carried-over choice that no longer fits ("Until the vault seals" for mixed or native requests, a native duration for all-WSL ones, "This write only" for non-writes) with "The requests changed. Choose how long to allow access."; `grant()` uses it. Assertions in `secretspec_requests_name_…`; Linux and Windows Desktop tests (184, 169); live on the test vault (scratch `mixed-popup.sh`): a WSL read waiting with "Until the vault seals" selected, then a native `provider-probe.ps1` read joins, Allow is refused and both stay pending, "1 hour" then grants the native read for an hour and the WSL read for min(1 h, unseal deadline). The user watched the same run in the native build and approved it (2026-11-15). |
 | 5834211 | 2 + deviation 2 | The relayed provider no longer calls the Linux `UnlockForIpc`/`FinishIpcAccess`; it waits for the Windows unseal and retries once. Test under the private bus with a fake Linux host counting calls (was 4, now 0) and a vault sealed for two requests, then left sealed. Live: started while the test vault was sealed, `secretspec get` waited, the unlock came at 10 s, the retried request was approved and the same command finished at 15 s; left sealed, a check gives up at ~29 s with "interaction required". |
 | aa612c7 | 5 | `wsl_relay::serve` (the relay loop, with an `on_sealed` callback that runs once) replaces the broker's own loop; Linux tests with a recording client: other actions and bad frames never reach the vault and keep the frame's id, the distro tag, the error mapping, Desktop brought forward once. Mutations (allowlist skipped, callback never run) fail them. |
 | f06b741 | 4 | `check.sh secretspec-wsl` cleanup trap: kills each background run's process tree (`timeout` gives secretspec its own process group) and denies the run's pending requests; step 6 asserts the denied read fails. Live: SIGINT to the check's process group during step 1 (2 secretspec and a broker running): the check exited within a second, no process and no pending request left, no popup open. |
