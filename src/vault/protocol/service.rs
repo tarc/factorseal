@@ -1019,26 +1019,43 @@ fn secret_service_index(
     Index::decode(bytes.as_deref())
 }
 
-/// The existing item an incoming attribute-less item is, if any: the
-/// attribute-less item with its id; none when its id is free (it is added
-/// under that id); and only when an item with attributes took its id, the
-/// first attribute-less item with its label, content type and created time,
-/// which an earlier restore added under a fresh id. Without that last rule
-/// every restore of the same backup would add another copy.
-fn attribute_less_match(
+/// Where a restored keyring item goes when an item with other attributes
+/// holds its id: an id derived from it, so that every restore of the same
+/// backup moves it to the same place (and the next id in the chain if that
+/// one is taken too). Derived rather than recorded beside the item: the
+/// index refuses unknown fields, so a new field would make older builds
+/// reject the whole keyring.
+fn relocated_keyring_id(id: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"factorseal-keyring-relocated-v1\0");
+    hasher.update(id.as_bytes());
+    hex::encode(&hasher.finalize()[..16])
+}
+
+/// Longest chain of relocated ids followed before giving up; each link is
+/// a 128-bit hash, so a second link is already unlikely.
+const MAX_RELOCATIONS: usize = 64;
+
+/// Follow `id`'s relocation chain in `items`. Returns the first id on it
+/// that is free, or the position of the first item on it that `is_match`
+/// accepts; ids held by items it doesn't accept are passed over.
+fn relocation_chain(
     items: &[crate::vault::secret_service_data::IndexItem],
-    incoming: &crate::vault::secret_service_data::IndexItem,
-) -> Option<usize> {
-    match items.iter().position(|item| item.id == incoming.id) {
-        Some(position) if items[position].attributes.is_empty() => Some(position),
-        None => None,
-        Some(_) => items.iter().position(|item| {
-            item.attributes.is_empty()
-                && item.label == incoming.label
-                && item.content_type == incoming.content_type
-                && item.created == incoming.created
-        }),
+    id: &str,
+    is_match: impl Fn(&crate::vault::secret_service_data::IndexItem) -> bool,
+) -> VaultResult<Result<usize, String>> {
+    let mut id = id.to_owned();
+    for _ in 0..MAX_RELOCATIONS {
+        match items.iter().position(|item| item.id == id) {
+            None => return Ok(Err(id)),
+            Some(position) if is_match(&items[position]) => return Ok(Ok(position)),
+            Some(_) => id = relocated_keyring_id(&id),
+        }
     }
+    Err(VaultError::InvalidData(
+        "no free keyring item id for the restored item".to_owned(),
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1063,10 +1080,17 @@ fn import_secret_service_item(
     let mut index = secret_service_index(store, partition, now)?;
     // An item that answers the same lookup is the existing one, matched as
     // CreateItem with replace=true matches: the first in index order. An
-    // item without attributes answers no lookup, so it matches only by id;
-    // see attribute_less_match.
+    // item without attributes answers no lookup: it is the attribute-less
+    // item on its own id's relocation chain, if there is one. Otherwise the
+    // item goes to the first free id on that chain, so an item holding its
+    // id with other attributes (a program changed them after an earlier
+    // import) is never overwritten, and a restore of the same backup finds
+    // it there again.
+    let chain = relocation_chain(&index.items, &portable.item.id, |item| {
+        portable.item.attributes.is_empty() && item.attributes.is_empty()
+    })?;
     let existing = if portable.item.attributes.is_empty() {
-        attribute_less_match(&index.items, &portable.item)
+        chain.as_ref().ok().copied()
     } else {
         index
             .items
@@ -1082,14 +1106,14 @@ fn import_secret_service_item(
         portable.item.created = kept.created;
         index.items[position] = portable.item.clone();
     } else {
-        // An id taken by an item with other attributes (a program changed
-        // them after an earlier import) gets a fresh id, so the restore
-        // never overwrites an item that answers another lookup.
-        while index.items.iter().any(|item| item.id == portable.item.id) {
-            let mut bytes = [0_u8; 16];
-            getrandom::fill(&mut bytes)?;
-            portable.item.id = hex::encode(bytes);
-        }
+        // A match on the chain is only accepted for an attribute-less
+        // item, which took the branch above.
+        let Err(free) = chain else {
+            return Err(VaultError::InvalidData(
+                "keyring restore matched inconsistently".to_owned(),
+            ));
+        };
+        portable.item.id = free;
         index.items.push(portable.item.clone());
     }
     let address = portable.item.address()?;

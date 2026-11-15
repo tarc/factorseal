@@ -639,7 +639,7 @@ async fn a_wedged_dismiss_does_not_hold_up_the_read() {
     let mut hanging = fake(false);
     hanging.collections[2].hang = true;
     hanging.wedged_dismiss = true;
-    let (_server, mut legacy, _shared) = serve(hanging).await;
+    let (_server, mut legacy, shared) = serve(hanging).await;
     legacy.unlock_timeout = std::time::Duration::from_millis(300);
     legacy.dismiss_timeout = std::time::Duration::from_millis(300);
     let read = tokio::time::timeout(std::time::Duration::from_secs(20), legacy.read_all(true))
@@ -650,6 +650,9 @@ async fn a_wedged_dismiss_does_not_hold_up_the_read() {
         read.skipped_collections,
         [("other".to_owned(), "unlock timed out".to_owned())]
     );
+    // The Dismiss was sent, only its reply never came.
+    assert_eq!(shared.lock().unwrap().calls.dismissed, ["other"]);
+    legacy.close().await;
 }
 
 #[tokio::test]

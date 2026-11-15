@@ -5784,3 +5784,59 @@ fn an_attribute_less_item_matches_its_own_id_before_a_look_alike() {
         );
     }
 }
+
+#[test]
+fn a_look_alike_never_stands_in_for_an_item_whose_id_is_taken() {
+    for partition in keyring_partitions() {
+        for replace_existing in [false, true] {
+            let (_directory, service) = service(100, UnsealLeasePolicy::default());
+            let manager = caller();
+            service.authorize_permission_manager(&manager, 100).unwrap();
+            let taker = keyring_item("11111111111111111111111111111111", &[("k", "v")], "t", 1);
+            import_keyring_item(&service, &manager, &partition, &taker, b"t", false, 101);
+            // From one backup: b under its own id, a whose id the taker holds,
+            // both attribute-less with one label and creation time.
+            let b = keyring_item("22222222222222222222222222222222", &[], "Unnamed", 6);
+            let a = keyring_item("11111111111111111111111111111111", &[], "Unnamed", 6);
+            let restore = |now| {
+                [(&b, b"two"), (&a, b"one")]
+                    .into_iter()
+                    .map(|(item, value)| {
+                        import_keyring_item(
+                            &service,
+                            &manager,
+                            &partition,
+                            item,
+                            value,
+                            replace_existing,
+                            now,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                restore(102),
+                [VaultEntryImportStatus::Added, VaultEntryImportStatus::Added]
+            );
+            let values = || {
+                let mut values: Vec<_> = keyring_items(&service, &manager, &partition, 103)
+                    .into_iter()
+                    .map(|(_, value)| value)
+                    .collect();
+                values.sort();
+                values
+            };
+            let expected = vec![b"one".to_vec(), b"t".to_vec(), b"two".to_vec()];
+            assert_eq!(values(), expected);
+            // Restoring the same backup again finds each copy, a's under the
+            // id it moved to.
+            let again = if replace_existing {
+                VaultEntryImportStatus::Replaced
+            } else {
+                VaultEntryImportStatus::KeptExisting
+            };
+            assert_eq!(restore(104), [again, again]);
+            assert_eq!(values(), expected);
+        }
+    }
+}
