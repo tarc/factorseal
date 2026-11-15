@@ -278,6 +278,13 @@ fn failure(distro: &str, output: &RunOutput) -> String {
             "No Secret Service runs on {distro}'s session bus, and none can be started there, so there is no gnome-keyring to read."
         );
     }
+    // The export starts an activatable Secret Service first; in a distro
+    // switched to FactorSeal's keyring that is FactorSeal's own.
+    if stderr.contains("is FactorSeal itself") {
+        return format!(
+            "{distro} already uses FactorSeal's keyring, so there is no gnome-keyring to move from."
+        );
+    }
     if stderr.contains("unrecognized subcommand") {
         return format!(
             "The factorseal in {distro} is too old to export its keyring. Update it, then check again."
@@ -1100,6 +1107,29 @@ mod tests {
             .unwrap_err();
             assert!(error.contains(expected), "{error:?} lacks {expected:?}");
         }
+    }
+
+    /// The export starts an activatable Secret Service; in a distro
+    /// switched to the vault's keyring that is the vault's own, which the
+    /// export refuses to read.
+    #[test]
+    fn a_distro_on_factorseals_keyring_is_named_as_such() {
+        let wsl = FakeWsl::new(vec![output(
+            "",
+            "factorseal: the Secret Service on the session bus is FactorSeal itself, not gnome-keyring\n",
+            1,
+        )]);
+        let error = check(
+            &wsl,
+            "NixOS",
+            || panic!("no vault call"),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "NixOS already uses FactorSeal's keyring, so there is no gnome-keyring to move from."
+        );
     }
 
     #[test]
