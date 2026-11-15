@@ -3042,6 +3042,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "ashpd 0.14.0",
+ "base64 0.22.1",
  "clap",
  "detect-desktop-environment",
  "directories",

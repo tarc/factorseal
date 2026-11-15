@@ -567,6 +567,34 @@ impl DesktopRuntime {
         Ok((summary, contents))
     }
 
+    /// The fingerprints of the items in `distro`'s keyring, every page.
+    pub(crate) fn keyring_fingerprints(
+        &self,
+        metadata: &VaultMetadata,
+        distro: &str,
+    ) -> Result<std::collections::HashSet<String>, String> {
+        list_keyring_fingerprints(distro, |action| {
+            let request = VaultRequest::new(action).map_err(|error| error.to_string())?;
+            self.request_live(metadata, &request)
+        })
+    }
+
+    /// Restore a keyring archive without replacing anything: an item whose
+    /// attributes are already in the vault stays as it is. Returns how many
+    /// items were added and kept.
+    pub(crate) fn restore_keyring_archive(
+        &self,
+        metadata: &VaultMetadata,
+        archive: VaultArchive,
+    ) -> Result<(usize, usize), String> {
+        let prepared =
+            PreparedImport::archive(archive, unix_time()?).map_err(|error| error.to_string())?;
+        let summary = prepared
+            .commit(&native_client(&self.config, metadata), false)
+            .map_err(|error| error.to_string())?;
+        Ok((summary.added, summary.kept_existing + summary.replaced))
+    }
+
     fn read_personal_secrets(
         &self,
         metadata: &VaultMetadata,
@@ -1179,6 +1207,37 @@ fn load_vault_entries(
     })
 }
 
+/// Every page of `ListKeyringFingerprints` for `distro`'s keyring.
+fn list_keyring_fingerprints(
+    distro: &str,
+    mut request: impl FnMut(VaultAction) -> Result<VaultResponseBody, String>,
+) -> Result<std::collections::HashSet<String>, String> {
+    let mut fingerprints = std::collections::HashSet::new();
+    let mut cursor = None;
+    loop {
+        let VaultResponseBody::KeyringFingerprints {
+            fingerprints: page,
+            next_cursor,
+        } = request(VaultAction::ListKeyringFingerprints {
+            distro: Some(distro.to_owned()),
+            cursor: cursor.clone(),
+        })?
+        else {
+            return Err(
+                "the vault gave an unexpected answer to the keyring fingerprints".to_owned(),
+            );
+        };
+        fingerprints.extend(page.into_iter().map(|item| item.fingerprint));
+        if next_cursor.is_none() {
+            return Ok(fingerprints);
+        }
+        if next_cursor == cursor {
+            return Err("the vault repeated a keyring fingerprint cursor".to_owned());
+        }
+        cursor = next_cursor;
+    }
+}
+
 fn load_permissions(
     request: impl FnMut(VaultAction) -> Result<VaultResponseBody, String>,
 ) -> Result<Vec<factorseal::Permission>, String> {
@@ -1783,6 +1842,52 @@ mod tests {
                 .block_on(service.release_name("org.freedesktop.secrets"))
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn keyring_fingerprints_follow_every_page() {
+        let fingerprint = |id: &str| factorseal::KeyringFingerprint {
+            fingerprint: id.repeat(64),
+            id: id.repeat(32),
+            modified: 1,
+        };
+        let mut cursors = Vec::new();
+        let fingerprints = super::list_keyring_fingerprints("NixOS", |action| {
+            let factorseal::VaultAction::ListKeyringFingerprints { distro, cursor } = action else {
+                panic!("unexpected action {action:?}");
+            };
+            assert_eq!(distro.as_deref(), Some("NixOS"));
+            cursors.push(cursor.clone());
+            Ok(match cursor.as_deref() {
+                None => VaultResponseBody::KeyringFingerprints {
+                    fingerprints: vec![fingerprint("a"), fingerprint("b")],
+                    next_cursor: Some("b".repeat(32)),
+                },
+                Some(_) => VaultResponseBody::KeyringFingerprints {
+                    fingerprints: vec![fingerprint("c")],
+                    next_cursor: None,
+                },
+            })
+        })
+        .unwrap();
+        assert_eq!(cursors, [None, Some("b".repeat(32))]);
+        assert_eq!(
+            fingerprints,
+            ["a", "b", "c"]
+                .map(|id| id.repeat(64))
+                .into_iter()
+                .collect()
+        );
+        let repeated = super::list_keyring_fingerprints("NixOS", |_| {
+            Ok(VaultResponseBody::KeyringFingerprints {
+                fingerprints: Vec::new(),
+                next_cursor: Some("b".repeat(32)),
+            })
+        });
+        assert!(repeated.is_err_and(|error| error.contains("repeated")));
+        let unexpected =
+            super::list_keyring_fingerprints("NixOS", |_| Ok(VaultResponseBody::WslKeyringsSet));
+        assert!(unexpected.is_err());
     }
 
     #[test]

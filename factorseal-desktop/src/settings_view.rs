@@ -4,19 +4,140 @@ use gpui::{
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, IndexPath, StyledExt as _,
-    button::Button,
+    button::{Button, ButtonVariants as _},
     h_flex,
     select::{Select, SelectEvent, SelectItem, SelectState},
     switch::Switch,
     v_flex,
 };
 
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::{
     appearance::{self, Choice, TypeScale as _},
     branding::Glyph,
     controls::button,
     settings::DesktopSettings,
+    wsl_keyring_import::{self as keyring_import, Check, MoveReport},
 };
+
+/// Where a distro's gnome-keyring check or move stands. A run in progress
+/// holds the flag that cancels it.
+#[derive(Clone)]
+enum KeyringMove {
+    Checking(Arc<AtomicBool>),
+    Checked(Check),
+    Moving(Check, Arc<AtomicBool>),
+    Moved(MoveReport),
+    Failed(String),
+}
+
+impl KeyringMove {
+    fn cancel(&self) -> Option<&Arc<AtomicBool>> {
+        match self {
+            Self::Checking(cancel) | Self::Moving(_, cancel) => Some(cancel),
+            _ => None,
+        }
+    }
+}
+
+/// `count` and the noun, singular or plural.
+fn count(count: usize, singular: &str, plural: &str) -> String {
+    format!("{count} {}", if count == 1 { singular } else { plural })
+}
+
+/// What Check found, in a sentence or two.
+fn check_summary(distro: &str, check: &Check) -> Vec<String> {
+    let mut lines = vec![if check.items.is_empty() {
+        format!("gnome-keyring in {distro} has no items to move.")
+    } else if check.missing.is_empty() {
+        format!(
+            "{} in gnome-keyring, all already in FactorSeal.",
+            count(check.items.len(), "item", "items")
+        )
+    } else {
+        format!(
+            "{} in gnome-keyring, {} not in FactorSeal.",
+            count(check.items.len(), "item", "items"),
+            check.missing.len()
+        )
+    }];
+    let labels: Vec<&str> = check
+        .missing
+        .iter()
+        .filter_map(|item| item.label.as_deref())
+        .collect();
+    if !labels.is_empty() {
+        let unnamed = check.missing.len() - labels.len();
+        let mut named = labels.join(", ");
+        if unnamed > 0 {
+            use std::fmt::Write as _;
+            let _ = write!(
+                named,
+                ", and {} whose name gnome-keyring hides until it is unlocked",
+                count(unnamed, "item", "items")
+            );
+        }
+        lines.push(format!("Not in FactorSeal: {named}."));
+    }
+    if !check.skipped.is_empty() {
+        lines.push(format!(
+            "{} will not be moved:",
+            count(check.skipped.len(), "item", "items")
+        ));
+        lines.extend(check.skipped.iter().map(keyring_import::skipped_line));
+    }
+    if !check.missing.is_empty() && check.locked_collections > 0 {
+        lines.push(format!(
+            "gnome-keyring is locked, so moving asks for its password in a window from {distro}{}. Some items may turn out too large to move once their values are read.",
+            if check.locked_collections > 1 {
+                format!(", once for each of its {} locked collections", check.locked_collections)
+            } else {
+                String::new()
+            }
+        ));
+    }
+    lines
+}
+
+/// What a move did, in a sentence or two.
+fn move_summary(report: &MoveReport) -> Vec<String> {
+    let mut lines = vec![match (report.added, report.kept) {
+        (0, 0) => "Nothing was moved.".to_owned(),
+        (added, 0) => format!("Moved {} into FactorSeal.", count(added, "item", "items")),
+        (added, kept) => format!(
+            "Moved {} into FactorSeal; {} already there.",
+            count(added, "item", "items"),
+            if kept == 1 {
+                "1 was".to_owned()
+            } else {
+                format!("{kept} were")
+            }
+        ),
+    }];
+    if !report.skipped.is_empty() {
+        lines.push(format!(
+            "{} not moved:",
+            count(report.skipped.len(), "item", "items")
+        ));
+        lines.extend(report.skipped.iter().map(keyring_import::skipped_line));
+    }
+    lines.extend(
+        report
+            .skipped_collections
+            .iter()
+            .map(keyring_import::skipped_collection_line),
+    );
+    if report.added > 0 {
+        lines.push(
+            "The items stay in gnome-keyring too. Each program asks here the first time it reads one."
+                .to_owned(),
+        );
+    }
+    lines
+}
 
 #[derive(Clone, Debug, PartialEq)]
 enum Value {
@@ -158,6 +279,8 @@ pub(crate) struct SettingsView {
     export_complete: bool,
     /// Read when WSL keyrings is first opened.
     wsl_distros: Option<crate::wsl_distros::WslDistros>,
+    /// Each distro's gnome-keyring check or move.
+    keyring_moves: HashMap<String, KeyringMove>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -251,6 +374,7 @@ impl SettingsView {
             export_busy: false,
             export_complete: false,
             wsl_distros: None,
+            keyring_moves: HashMap::new(),
             _subscriptions: subscriptions,
         }
     }
@@ -577,6 +701,243 @@ impl SettingsView {
         )
     }
 
+    /// Whether `cancel` is still the flag of `distro`'s run, so a result
+    /// isn't applied after another run took its place.
+    fn keyring_run_current(&self, distro: &str, cancel: &Arc<AtomicBool>) -> bool {
+        self.keyring_moves
+            .get(distro)
+            .and_then(KeyringMove::cancel)
+            .is_some_and(|current| Arc::ptr_eq(current, cancel))
+    }
+
+    /// Check: list `distro`'s gnome-keyring (starting WSL) and compare it
+    /// with the vault.
+    fn check_keyring(&mut self, distro: String, cx: &mut Context<Self>) {
+        let (Some((runtime, metadata)), Some(wsl)) =
+            (crate::app::unsealed_vault(cx), keyring_import::system())
+        else {
+            return;
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.keyring_moves
+            .insert(distro.clone(), KeyringMove::Checking(Arc::clone(&cancel)));
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            let (run_distro, flag) = (distro.clone(), Arc::clone(&cancel));
+            let result = smol::unblock(move || {
+                keyring_import::check(
+                    wsl,
+                    &run_distro,
+                    || runtime.keyring_fingerprints(&metadata, &run_distro),
+                    &flag,
+                )
+            })
+            .await;
+            let _ = view.update(cx, |view, cx| {
+                if !view.keyring_run_current(&distro, &cancel) {
+                    return;
+                }
+                match result {
+                    Ok(check) => {
+                        view.keyring_moves
+                            .insert(distro, KeyringMove::Checked(check));
+                    }
+                    Err(_) if cancel.load(Ordering::SeqCst) => {
+                        view.keyring_moves.remove(&distro);
+                    }
+                    Err(error) => {
+                        view.keyring_moves
+                            .insert(distro, KeyringMove::Failed(error));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Move: export `distro`'s gnome-keyring (unlocking it) and restore all
+    /// of it; items already in the vault are kept as they are.
+    fn move_keyring(&mut self, distro: String, check: Check, cx: &mut Context<Self>) {
+        let (Some((runtime, metadata)), Some(wsl)) =
+            (crate::app::unsealed_vault(cx), keyring_import::system())
+        else {
+            return;
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let locked = check.locked_collections;
+        self.keyring_moves.insert(
+            distro.clone(),
+            KeyringMove::Moving(check.clone(), Arc::clone(&cancel)),
+        );
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            let (run_distro, flag) = (distro.clone(), Arc::clone(&cancel));
+            let result = smol::unblock(move || {
+                keyring_import::move_items(
+                    wsl,
+                    &run_distro,
+                    locked,
+                    |archive| runtime.restore_keyring_archive(&metadata, archive),
+                    &flag,
+                )
+            })
+            .await;
+            cx.update(|cx| {
+                if result.is_ok() {
+                    crate::app::refresh_vault(cx);
+                }
+            });
+            let _ = view.update(cx, |view, cx| {
+                if !view.keyring_run_current(&distro, &cancel) {
+                    return;
+                }
+                let state = match result {
+                    Ok(report) => KeyringMove::Moved(report),
+                    Err(_) if cancel.load(Ordering::SeqCst) => KeyringMove::Checked(check),
+                    Err(error) => KeyringMove::Failed(error),
+                };
+                view.keyring_moves.insert(distro, state);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The buttons beside a distro's switch: Check, Move, Cancel.
+    fn keyring_buttons(
+        &self,
+        distro: &str,
+        unsealed: bool,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let state = self.keyring_moves.get(distro);
+        let busy = state.and_then(KeyringMove::cancel);
+        let mut buttons = Vec::new();
+        if let Some(cancel) = busy {
+            let cancel = Arc::clone(cancel);
+            let cancelling = cancel.load(Ordering::SeqCst);
+            buttons.push(
+                button(SharedString::from(format!("keyring-cancel-{distro}")))
+                    .label(if cancelling {
+                        "Cancelling…"
+                    } else {
+                        "Cancel"
+                    })
+                    .disabled(cancelling)
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cancel.store(true, Ordering::SeqCst);
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+        }
+        if let Some(KeyringMove::Checked(check)) = state
+            && !check.missing.is_empty()
+        {
+            let (distro, check) = (distro.to_owned(), check.clone());
+            buttons.push(
+                button(SharedString::from(format!("keyring-move-{distro}")))
+                    .primary()
+                    .icon(Glyph::Transfer)
+                    .label(format!(
+                        "Move {}",
+                        count(check.missing.len(), "item", "items")
+                    ))
+                    .disabled(!unsealed)
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.move_keyring(distro.clone(), check.clone(), cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
+        let checking = matches!(state, Some(KeyringMove::Checking(_)));
+        let again = matches!(
+            state,
+            Some(KeyringMove::Checked(_) | KeyringMove::Moved(_) | KeyringMove::Failed(_))
+        );
+        let owned = distro.to_owned();
+        buttons.push(
+            button(SharedString::from(format!("keyring-check-{distro}")))
+                .loading(checking)
+                .label(if checking {
+                    "Checking…"
+                } else if again {
+                    "Check again"
+                } else {
+                    "Check gnome-keyring"
+                })
+                .accessibility_label(format!("Check gnome-keyring in {distro}"))
+                .disabled(!unsealed || busy.is_some())
+                .on_click(cx.listener(move |view, _, _, cx| {
+                    view.check_keyring(owned.clone(), cx);
+                }))
+                .into_any_element(),
+        );
+        buttons
+    }
+
+    /// What a distro's check or move says, under its row.
+    fn keyring_status(&self, distro: &str, cx: &App) -> Option<Div> {
+        let theme = cx.theme();
+        let (lines, color) = match self.keyring_moves.get(distro)? {
+            KeyringMove::Checking(_) => (
+                vec![format!(
+                    "Reading gnome-keyring in {distro}. WSL may have to start it first."
+                )],
+                theme.muted_foreground,
+            ),
+            KeyringMove::Checked(check) => (check_summary(distro, check), theme.foreground),
+            KeyringMove::Moving(check, _) => (
+                vec![if check.locked_collections > 0 {
+                    format!(
+                        "Moving… gnome-keyring may ask for its password in a window from {distro}."
+                    )
+                } else {
+                    "Moving…".to_owned()
+                }],
+                theme.muted_foreground,
+            ),
+            KeyringMove::Moved(report) => (move_summary(report), theme.foreground),
+            KeyringMove::Failed(error) => (vec![error.clone()], theme.danger),
+        };
+        Some(
+            v_flex()
+                .gap_1()
+                .pb_2()
+                .text_body()
+                .text_color(color)
+                .children(lines.into_iter().map(|line| div().child(line))),
+        )
+    }
+
+    fn wsl_row(
+        &self,
+        distro: String,
+        checked: bool,
+        broker_installed: bool,
+        unsealed: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let switch = Self::wsl_switch(distro.clone(), checked, broker_installed, cx);
+        let buttons = self.keyring_buttons(&distro, unsealed, cx);
+        let status = self.keyring_status(&distro, cx);
+        v_flex()
+            .w_full()
+            .child(Self::setting(
+                distro,
+                h_flex()
+                    .flex_wrap()
+                    .justify_end()
+                    .gap_2()
+                    .items_center()
+                    .children(buttons)
+                    .child(switch),
+                cx,
+            ))
+            .children(status)
+    }
+
     fn wsl_keyrings(&self, cx: &mut Context<Self>) -> Div {
         let panel = v_flex().gap_3();
         let Some(distros) = self.wsl_distros.clone() else {
@@ -584,15 +945,15 @@ impl SettingsView {
         };
         let saved = appearance::current(cx).wsl_keyrings.clone();
         let registered = distros.registered.as_deref().unwrap_or_default();
+        let unsealed = crate::app::unsealed_vault(cx).is_some();
         let rows: Vec<_> = Self::wsl_rows(registered, &saved)
             .into_iter()
             .map(|(distro, checked)| {
-                let switch =
-                    Self::wsl_switch(distro.clone(), checked, distros.broker_installed, cx);
-                Self::setting(distro, switch, cx)
+                self.wsl_row(distro, checked, distros.broker_installed, unsealed, cx)
             })
             .collect();
         let danger = cx.theme().danger;
+        let rows_empty = rows.is_empty();
         panel
             .when(rows.is_empty(), |panel| {
                 panel.child(Self::note(
@@ -609,6 +970,16 @@ impl SettingsView {
                 "FactorSeal cannot verify which program in WSL is asking: the name it shows comes from WSL, and any program there can act as another.",
                 cx,
             ))
+            .when(!rows_empty, |panel| {
+                panel.child(Self::note(
+                    if unsealed {
+                        "Check gnome-keyring starts the distro and counts the items its gnome-keyring has that FactorSeal lacks, without unlocking it. Moving copies them into this vault; gnome-keyring keeps its own."
+                    } else {
+                        "Unlock the vault to check a distro's gnome-keyring for items to move here."
+                    },
+                    cx,
+                ))
+            })
             .when_some(crate::app::wsl_keyrings_error(cx), |panel, error| {
                 panel.child(div().text_body().text_color(danger).child(format!(
                     "The vault did not take the last switch: {error}. The switches show what it still has."

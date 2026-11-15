@@ -19,6 +19,7 @@ mod theming;
 mod timing;
 mod unlock_animation;
 mod wsl_distros;
+mod wsl_keyring_import;
 
 use std::{borrow::Cow, path::PathBuf};
 

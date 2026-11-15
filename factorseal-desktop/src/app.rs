@@ -141,6 +141,22 @@ pub(crate) fn wsl_keyrings_error(cx: &App) -> Option<String> {
         .and_then(|status| status.0.clone())
 }
 
+/// The runtime and the vault's metadata, while it is unsealed.
+pub(crate) fn unsealed_vault(cx: &App) -> Option<(Arc<DesktopRuntime>, factorseal::VaultMetadata)> {
+    let runtime = Arc::clone(&cx.try_global::<RuntimeGlobal>()?.0);
+    match &cx.try_global::<DesktopWindow>()?.snapshot {
+        Snapshot::Unsealed { metadata, .. } => Some((runtime, metadata.clone())),
+        _ => None,
+    }
+}
+
+/// Read the vault's contents again, as after items were moved into it.
+pub(crate) fn refresh_vault(cx: &mut App) {
+    if let Some(runtime) = cx.try_global::<RuntimeGlobal>() {
+        refresh_desktop_snapshot(Arc::clone(&runtime.0), cx);
+    }
+}
+
 /// Switch the WSL keyrings: at the next unlock, and at once while unsealed.
 /// The switch is recorded here, on the UI thread, so switches keep the
 /// order the person made them in; the send runs in the background. When

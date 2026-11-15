@@ -46,14 +46,18 @@ pub(crate) fn parse_registered(output: &str) -> Vec<String> {
     distros
 }
 
-/// Windows' own `reg.exe`, by full path: a bare `reg.exe` is looked up in
-/// the application's folder first.
+/// A program of Windows' own (`reg.exe`, `wsl.exe`), by full path: a bare
+/// name is looked up in the application's folder first.
 #[cfg(any(windows, test))]
-fn system_reg_exe(system_root: Option<std::ffi::OsString>) -> std::ffi::OsString {
+pub(crate) fn system_exe(
+    system_root: Option<std::ffi::OsString>,
+    program: &str,
+) -> std::ffi::OsString {
     let mut path = system_root
         .filter(|root| !root.is_empty())
         .unwrap_or_else(|| r"C:\Windows".into());
-    path.push(r"\System32\reg.exe");
+    path.push(r"\System32\");
+    path.push(program);
     path
 }
 
@@ -61,7 +65,7 @@ fn system_reg_exe(system_root: Option<std::ffi::OsString>) -> std::ffi::OsString
 fn registered() -> Result<Vec<String>, String> {
     use std::os::windows::process::CommandExt as _;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let output = std::process::Command::new(system_reg_exe(std::env::var_os("SystemRoot")))
+    let output = std::process::Command::new(system_exe(std::env::var_os("SystemRoot"), "reg.exe"))
         .args([
             "query",
             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss",
@@ -89,15 +93,15 @@ mod tests {
     }
 
     #[test]
-    fn reg_exe_is_windows_own() {
+    fn system_programs_are_windows_own() {
         assert_eq!(
-            system_reg_exe(Some(r"D:\Win".into())),
+            system_exe(Some(r"D:\Win".into()), "reg.exe"),
             std::ffi::OsString::from(r"D:\Win\System32\reg.exe")
         );
         for missing in [None, Some(std::ffi::OsString::new())] {
             assert_eq!(
-                system_reg_exe(missing),
-                std::ffi::OsString::from(r"C:\Windows\System32\reg.exe")
+                system_exe(missing, "wsl.exe"),
+                std::ffi::OsString::from(r"C:\Windows\System32\wsl.exe")
             );
         }
     }
