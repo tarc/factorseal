@@ -1673,6 +1673,72 @@ mod tests {
         );
     }
 
+    /// The approved item stopped matching the attributes while the approval
+    /// waited (a manager restore can change them): writing it as a new item
+    /// would put its id in the index twice, and the index would no longer
+    /// load.
+    #[test]
+    fn a_planned_item_that_stopped_matching_is_not_written_twice() {
+        use crate::vault::{VaultAction, VaultRequest, WireSecret, WireSecretAddress};
+        let (_directory, agent) = agent();
+        let attributes = HashMap::from([("service".to_owned(), "example.test".to_owned())]);
+        let planned = agent.planned_item(&attributes, true).unwrap();
+        agent
+            .create_or_replace_planned(
+                "Example".to_owned(),
+                attributes.clone(),
+                b"first",
+                "text/plain".to_owned(),
+                true,
+                Some(&planned),
+            )
+            .unwrap();
+        let mut index = Index::decode(agent.store.get(INDEX_ITEM).unwrap().as_deref()).unwrap();
+        index.items[0]
+            .attributes
+            .insert("service".to_owned(), "restored.test".to_owned());
+        agent
+            .store
+            .backend_request(
+                VaultRequest::new(VaultAction::Put {
+                    namespace: NAMESPACE.to_vec(),
+                    address: WireSecretAddress::new(INDEX_ITEM, None),
+                    value: WireSecret::new(serde_json::to_vec(&index).unwrap()).unwrap(),
+                    evict_at: None,
+                })
+                .unwrap(),
+            )
+            .unwrap()
+            .result
+            .unwrap();
+
+        let written = agent.create_or_replace_planned(
+            "Example".to_owned(),
+            attributes,
+            b"second",
+            "text/plain".to_owned(),
+            true,
+            Some(&planned),
+        );
+        let items = agent.all_items();
+        assert!(
+            written.is_err(),
+            "wrote {written:?}; the index then: {:?}",
+            items.as_ref().map(Vec::len)
+        );
+        let items = items.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            agent
+                .store
+                .get(secret_item(&planned))
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            b"first"
+        );
+    }
+
     #[test]
     fn lock_seals_the_vault_through_the_adapter_grant() {
         let (_directory, service, caller) = test_service();

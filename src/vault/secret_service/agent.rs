@@ -348,6 +348,14 @@ impl Agent {
                     ));
                 }
                 (Some(position), _) => index.items[position].id.clone(),
+                // The approved item is still there but no longer matches
+                // (its attributes changed while the approval waited): a new
+                // item under its id would put that id in the index twice.
+                (None, Some(planned)) if index.items.iter().any(|item| item.id == planned) => {
+                    return Err(failed(
+                        "Secret Service index changed during approval; retry the operation",
+                    ));
+                }
                 (None, Some(planned)) => planned.to_owned(),
                 (None, None) => random_id().map_err(failed)?,
             };
