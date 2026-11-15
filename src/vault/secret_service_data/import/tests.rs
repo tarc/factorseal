@@ -151,8 +151,8 @@ fn duplicates_collapse_to_the_most_recently_modified() {
     assert_eq!(
         reasons(&import),
         [
-            ("older", KeyringSkipReason::Duplicate),
-            ("tie", KeyringSkipReason::Duplicate)
+            ("tie", KeyringSkipReason::Duplicate),
+            ("older", KeyringSkipReason::Duplicate)
         ]
     );
     assert_eq!(import.portable[0].1.as_slice(), b"two");
@@ -335,5 +335,44 @@ fn a_locked_generic_item_shows_its_schema_plainly() {
     assert_eq!(
         keyring_fingerprint(&locked),
         keyring_fingerprint(&attributes(plain))
+    );
+}
+
+#[test]
+fn an_export_falls_back_to_an_older_readable_duplicate() {
+    let gh = &[("service", "gh:github.com")];
+    let large = vec![b'x'; MAX_IMPORTED_VALUE_BYTES + 1];
+    let export = map_keyring_items(
+        vec![
+            item("login", "oldest", 3, attributes(gh), Some(b"old")),
+            item("login", "older", 5, attributes(gh), Some(&large)),
+            item("other", "newest", 9, attributes(gh), None),
+        ],
+        true,
+    );
+    assert_eq!(labels(&export), ["oldest"]);
+    assert_eq!(export.portable[0].1.as_slice(), b"old");
+    assert_eq!(
+        reasons(&export),
+        [
+            ("newest", KeyringSkipReason::Duplicate),
+            ("older", KeyringSkipReason::Duplicate)
+        ]
+    );
+    // Without a readable one, each says why.
+    let none = map_keyring_items(
+        vec![
+            item("login", "older", 5, attributes(gh), Some(&large)),
+            item("other", "newest", 9, attributes(gh), None),
+        ],
+        true,
+    );
+    assert_eq!(labels(&none), Vec::<&str>::new());
+    assert_eq!(
+        reasons(&none),
+        [
+            ("newest", KeyringSkipReason::Unreadable),
+            ("older", KeyringSkipReason::TooLarge)
+        ]
     );
 }

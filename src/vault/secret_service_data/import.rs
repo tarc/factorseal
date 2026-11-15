@@ -219,6 +219,24 @@ fn is_network_manager(pairs: &BTreeMap<&str, [u8; 16]>) -> bool {
     pairs.contains_key("connection-uuid") && pairs.contains_key("setting-name")
 }
 
+/// Why an item's value can't be imported, if it can't. A value beside
+/// hashed attributes would be stored under the placeholder ones, answering
+/// no program's lookup.
+fn value_rules(item: &KeyringSourceItem) -> Result<(), KeyringSkipReason> {
+    let hashed = item
+        .attributes
+        .keys()
+        .any(|name| name.starts_with(HASHED_PREFIX));
+    match &item.secret {
+        None => Err(KeyringSkipReason::Unreadable),
+        Some(_) if hashed => Err(KeyringSkipReason::Unreadable),
+        Some((value, _)) if value.len() > MAX_IMPORTED_VALUE_BYTES => {
+            Err(KeyringSkipReason::TooLarge)
+        }
+        Some(_) => Ok(()),
+    }
+}
+
 /// Map `items` to what an import brings and leaves out. With `with_values`
 /// (an export), items also need a readable value no larger than
 /// [`MAX_IMPORTED_VALUE_BYTES`]; without (an inventory), values are not
@@ -233,10 +251,12 @@ pub fn map_keyring_items(items: Vec<KeyringSourceItem>, with_values: bool) -> Ke
             reason,
         });
     };
-    // Attribute rules first; then, per fingerprint, the most recently
-    // modified item (the first seen on a tie); then the value rules, so the
-    // inventory and the export count the same items up to those.
-    let mut kept: Vec<([u8; 32], KeyringSourceItem)> = Vec::new();
+    // Attribute rules first; then one item per fingerprint: the most
+    // recently modified (the first seen on a tie), or in an export the most
+    // recent one that passes the value rules. The inventory and the export
+    // thus count the same items, up to fingerprints none of whose items
+    // has a usable value.
+    let mut groups: Vec<([u8; 32], Vec<KeyringSourceItem>)> = Vec::new();
     for item in items {
         let Some(pairs) = pairs(&item.attributes, true) else {
             skip(&mut import, &item, KeyringSkipReason::Unreadable);
@@ -252,33 +272,39 @@ pub fn map_keyring_items(items: Vec<KeyringSourceItem>, with_values: bool) -> Ke
         }
         let fingerprint = digest(&pairs);
         drop(pairs);
-        match kept.iter().position(|(other, _)| *other == fingerprint) {
-            Some(position)
-                if item.modified.unwrap_or(0) > kept[position].1.modified.unwrap_or(0) =>
-            {
-                let (_, older) = std::mem::replace(&mut kept[position], (fingerprint, item));
-                skip(&mut import, &older, KeyringSkipReason::Duplicate);
-            }
-            Some(_) => skip(&mut import, &item, KeyringSkipReason::Duplicate),
-            None => kept.push((fingerprint, item)),
+        match groups.iter_mut().find(|(other, _)| *other == fingerprint) {
+            Some((_, group)) => group.push(item),
+            None => groups.push((fingerprint, vec![item])),
         }
     }
-    for (fingerprint, mut item) in kept {
+    for (fingerprint, mut group) in groups {
+        // Stable: equal times keep their order.
+        group.sort_by_key(|item| std::cmp::Reverse(item.modified.unwrap_or(0)));
+        let chosen = if with_values {
+            let checked: Vec<_> = group.iter().map(value_rules).collect();
+            checked.iter().position(Result::is_ok)
+        } else {
+            Some(0)
+        };
+        let Some(chosen) = chosen else {
+            for item in group {
+                let reason = value_rules(&item)
+                    .err()
+                    .unwrap_or(KeyringSkipReason::Unreadable);
+                skip(&mut import, &item, reason);
+            }
+            continue;
+        };
+        let mut item = group.remove(chosen);
+        for other in &group {
+            skip(&mut import, other, KeyringSkipReason::Duplicate);
+        }
         if with_values {
-            // A value with hashed attributes would be stored under the
-            // placeholder ones, answering no program's lookup.
-            let hashed = item
-                .attributes
-                .keys()
-                .any(|name| name.starts_with(HASHED_PREFIX));
-            let Some((value, content_type)) = item.secret.take().filter(|_| !hashed) else {
+            // Checked by the value rules.
+            let Some((value, content_type)) = item.secret.take() else {
                 skip(&mut import, &item, KeyringSkipReason::Unreadable);
                 continue;
             };
-            if value.len() > MAX_IMPORTED_VALUE_BYTES {
-                skip(&mut import, &item, KeyringSkipReason::TooLarge);
-                continue;
-            }
             let modified = item.modified.unwrap_or(0);
             import.portable.push((
                 IndexItem {
