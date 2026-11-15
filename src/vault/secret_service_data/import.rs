@@ -33,6 +33,12 @@ const HASHED_SCHEMA: &str = "gkr:compat:hashed:xdg:schema";
 /// fit in one protocol message.
 pub const MAX_IMPORTED_VALUE_BYTES: usize = 256 * 1024;
 
+/// The largest frame body `export-secret-service --framed` writes, and so
+/// what Desktop reads of its output: an archive at its 256 MiB limit,
+/// base64 twice over (≈455 MiB), leaves room for some 350,000 listed
+/// items. The CLI refuses a larger export rather than have Desktop cut it.
+pub const MAX_KEYRING_FRAME_BYTES: usize = 512 * 1024 * 1024;
+
 /// The pairs a fingerprint covers, or `None` when a hashed value is not an
 /// MD5. A locked gnome-keyring item lists its attributes hashed under
 /// `gkr:compat:hashed:<name>`, beside a plain `xdg:schema`; then the hashed

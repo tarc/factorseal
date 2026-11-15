@@ -137,11 +137,36 @@ pub(super) fn write_frame(
     kind: &str,
     content: &[u8],
 ) -> std::io::Result<()> {
-    let encoded = STANDARD.encode(content);
+    write_frame_within(
+        stdout,
+        kind,
+        content,
+        factorseal::vault::MAX_KEYRING_FRAME_BYTES,
+    )
+}
+
+/// [`write_frame`], refusing a body longer than `limit`: Desktop reads no
+/// more, and would cut the frame after the password prompts.
+fn write_frame_within(
+    stdout: &mut dyn Write,
+    kind: &str,
+    content: &[u8],
+    limit: usize,
+) -> std::io::Result<()> {
+    let encoded = Zeroizing::new(STANDARD.encode(content));
+    if encoded.len() > limit {
+        return Err(std::io::Error::other(format!(
+            "the {kind} is {} MiB, more than FactorSeal Desktop reads ({} MiB); \
+             export to a file instead",
+            encoded.len().div_ceil(1024 * 1024),
+            limit / (1024 * 1024)
+        )));
+    }
     write!(
         stdout,
-        "{FRAME_START} {kind} {}\n{encoded}\n{FRAME_END}\n",
-        encoded.len()
+        "{FRAME_START} {kind} {}\n{}\n{FRAME_END}\n",
+        encoded.len(),
+        encoded.as_str()
     )?;
     stdout.flush()
 }
@@ -478,6 +503,24 @@ mod tests {
         .unwrap();
         let record: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
         assert_eq!(record["target"], "native");
+    }
+
+    #[test]
+    fn a_frame_larger_than_desktop_reads_is_refused() {
+        // 3 MiB and 3 bytes encode to just over 4 MiB.
+        let content = vec![7_u8; 3 * 1024 * 1024 + 3];
+        let mut stdout = Vec::new();
+        let error =
+            write_frame_within(&mut stdout, "export", &content, 4 * 1024 * 1024).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("more than FactorSeal Desktop reads (4 MiB)"),
+            "{error}"
+        );
+        assert!(stdout.is_empty(), "no partial frame");
+        write_frame_within(&mut stdout, "export", &content, 5 * 1024 * 1024).unwrap();
+        assert!(stdout.starts_with(FRAME_START.as_bytes()));
     }
 
     #[test]

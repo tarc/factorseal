@@ -24,11 +24,10 @@ use zeroize::Zeroizing;
 const FRAME_START: &[u8] = b"FACTORSEAL-FRAME v1 ";
 const FRAME_END: &[u8] = b"FACTORSEAL-FRAME end";
 
-/// The most standard output kept: the largest frame, an archive of at most
-/// 256 MiB base64 twice over (in the record, then the record in the frame,
-/// ≈455 MiB), with room for the record's lists.
+/// The most standard output kept: the largest frame body the CLI writes,
+/// with a MiB for its header and end lines and anything printed before it.
 #[cfg(windows)]
-const MAX_STDOUT_BYTES: u64 = 464 * 1024 * 1024;
+const MAX_STDOUT_BYTES: u64 = factorseal::vault::MAX_KEYRING_FRAME_BYTES as u64 + 1024 * 1024;
 
 /// The most standard error kept, from its end: only its lines for a
 /// message are used, and the CLI's error comes last.
