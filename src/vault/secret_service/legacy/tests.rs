@@ -535,3 +535,23 @@ async fn factorseal_is_recognized_by_its_executable_name() {
     );
     legacy.close().await;
 }
+
+#[test]
+fn wrapped_factorseal_executables_are_recognized() {
+    for name in [
+        "factorseal",
+        "factorseal-desktop",
+        ".factorseal-desktop-wrapped",
+        "..factorseal-desktop-wrapped-wrapped",
+        "factorseal-0a1b2c3d",
+    ] {
+        assert!(is_factorseal_executable(name.as_ref()), "{name}");
+    }
+    for name in [
+        "gnome-keyring-daemon",
+        ".gnome-keyring-daemon-wrapped",
+        "kwalletd6",
+    ] {
+        assert!(!is_factorseal_executable(name.as_ref()), "{name}");
+    }
+}

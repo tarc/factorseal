@@ -88,9 +88,19 @@ pub(crate) async fn is_factorseal(connection: &Connection, owner: &str) -> zbus:
         .await?;
     let executable = std::fs::read_link(format!("/proc/{pid}/exe"))
         .map_err(|error| zbus::Error::Failure(error.to_string()))?;
-    Ok(executable
-        .file_name()
-        .is_some_and(|name| name.to_string_lossy().starts_with("factorseal")))
+    Ok(executable.file_name().is_some_and(is_factorseal_executable))
+}
+
+/// Whether an executable file name is FactorSeal's. Nix wraps programs by
+/// moving each to `.<name>-wrapped` (once per wrapper hook), so a NixOS
+/// Desktop runs as `.factorseal-desktop-wrapped`; those are unwrapped first.
+pub(crate) fn is_factorseal_executable(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+    let mut name = name.trim_start_matches('.');
+    while let Some(inner) = name.strip_suffix("-wrapped") {
+        name = inner;
+    }
+    name.starts_with("factorseal")
 }
 
 impl Legacy {
