@@ -609,6 +609,11 @@ impl SettingsView {
                 "FactorSeal cannot verify which program in WSL is asking: the name it shows comes from WSL, and any program there can act as another.",
                 cx,
             ))
+            .when_some(crate::app::wsl_keyrings_error(cx), |panel, error| {
+                panel.child(div().text_body().text_color(danger).child(format!(
+                    "The vault did not take the last switch: {error}. The switches show what it still has."
+                )))
+            })
             .when(!distros.broker_installed, |panel| {
                 panel.child(div().text_body().text_color(danger).child(
                     "The WSL broker (factorseal-wsl-broker.exe) is not installed beside FactorSeal, so no distro can use this vault.",

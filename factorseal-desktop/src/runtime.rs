@@ -182,11 +182,48 @@ impl Snapshot {
     }
 }
 
+/// The WSL keyring switches. Each switch is a new generation of `wanted`;
+/// a send carries the latest list and records the generation it applied,
+/// so a list that lands late never undoes a later one.
+struct WslKeyrings {
+    /// What the switches show, and what the next unlock grants.
+    wanted: Vec<String>,
+    generation: u64,
+    /// The latest generation the vault has, and its list.
+    applied_generation: u64,
+    applied: Vec<String>,
+}
+
+impl WslKeyrings {
+    fn new(wanted: Vec<String>) -> Self {
+        Self {
+            applied: wanted.clone(),
+            wanted,
+            generation: 0,
+            applied_generation: 0,
+        }
+    }
+}
+
+/// A switch the vault refused while unsealed: the switches go back to what
+/// the vault has.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct WslKeyringsFailure {
+    pub(crate) error: String,
+    /// The list the vault still has.
+    pub(crate) kept: Vec<String>,
+    /// The switches' generation after going back to `kept`: still current
+    /// unless the person switched again since.
+    pub(crate) generation: u64,
+}
+
 pub(crate) struct DesktopRuntime {
     config: RuntimeConfig,
     next_lease: Mutex<LeasePolicy>,
-    /// WSL distros whose keyring the next worker grants the WSL broker.
-    wsl_keyrings: Mutex<Vec<String>>,
+    /// The WSL keyrings switched on, and what the vault has of them.
+    wsl_keyrings: Mutex<WslKeyrings>,
+    /// Held while a list is sent to the vault, so lists arrive in order.
+    wsl_keyrings_send: Mutex<()>,
     events: smol::channel::Sender<Snapshot>,
     lifeline: Mutex<Option<std::process::ChildStdin>>,
     unlock_in_progress: AtomicBool,
@@ -219,7 +256,8 @@ impl DesktopRuntime {
         (
             Arc::new(Self {
                 next_lease: Mutex::new(config.lease),
-                wsl_keyrings: Mutex::new(config.wsl_keyrings.clone()),
+                wsl_keyrings: Mutex::new(WslKeyrings::new(config.wsl_keyrings.clone())),
+                wsl_keyrings_send: Mutex::new(()),
                 config,
                 events,
                 lifeline: Mutex::new(None),
@@ -790,43 +828,99 @@ impl DesktopRuntime {
             wsl_keyrings: self
                 .wsl_keyrings
                 .lock()
-                .map(|distros| distros.clone())
+                .map(|mut guard| {
+                    let keyrings = &mut *guard;
+                    // The worker grants this list at the unlock.
+                    keyrings.applied.clone_from(&keyrings.wanted);
+                    keyrings.applied_generation = keyrings.generation;
+                    keyrings.wanted.clone()
+                })
                 .unwrap_or_default(),
         }
     }
 
-    /// Switch the WSL keyrings to `distros`: the next unlock grants them,
-    /// and an unsealed vault (`unsealed`) changes its grants at once.
-    pub(crate) fn set_wsl_keyrings(
-        &self,
-        unsealed: Option<&VaultMetadata>,
-        distros: Vec<String>,
-    ) -> Result<(), String> {
-        self.apply_wsl_keyrings(
-            distros,
-            unsealed.map(|metadata| {
-                move |action| {
-                    let request = VaultRequest::new(action).map_err(|error| error.to_string())?;
-                    self.request_live(metadata, &request)
-                }
-            }),
-        )
+    /// The generation of the WSL keyring switches; a failure's revert
+    /// applies only while it is still the current one.
+    pub(crate) fn wsl_keyrings_generation(&self) -> Option<u64> {
+        self.wsl_keyrings
+            .lock()
+            .ok()
+            .map(|keyrings| keyrings.generation)
     }
 
-    fn apply_wsl_keyrings(
-        &self,
-        distros: Vec<String>,
-        send: Option<impl FnOnce(VaultAction) -> Result<VaultResponseBody, String>>,
-    ) -> Result<(), String> {
-        if let Ok(mut next) = self.wsl_keyrings.lock() {
-            next.clone_from(&distros);
+    /// Record a switch of the WSL keyrings, in the order the person made
+    /// them (call it on the UI thread): the next unlock grants `distros`,
+    /// and the next [`Self::send_wsl_keyrings`] sends them.
+    pub(crate) fn switch_wsl_keyrings(&self, distros: Vec<String>) {
+        if let Ok(mut keyrings) = self.wsl_keyrings.lock() {
+            keyrings.wanted = distros;
+            keyrings.generation += 1;
         }
-        let Some(send) = send else {
-            return Ok(());
+    }
+
+    /// Send the latest switch to the unsealed vault (`unsealed`), which
+    /// changes its grants at once. Sends run one at a time and carry the
+    /// latest list, so a late one never undoes a later switch. When the
+    /// vault refuses it, the switches go back to what the vault has.
+    pub(crate) fn send_wsl_keyrings(
+        &self,
+        unsealed: &VaultMetadata,
+    ) -> Result<(), WslKeyringsFailure> {
+        self.send_wsl_keyrings_with(|action| {
+            let request = VaultRequest::new(action).map_err(|error| error.to_string())?;
+            self.request_live(unsealed, &request)
+        })
+    }
+
+    fn send_wsl_keyrings_with(
+        &self,
+        send: impl FnOnce(VaultAction) -> Result<VaultResponseBody, String>,
+    ) -> Result<(), WslKeyringsFailure> {
+        let unavailable = || WslKeyringsFailure {
+            error: "the WSL keyring switches are unavailable".to_owned(),
+            kept: Vec::new(),
+            generation: 0,
         };
-        match send(VaultAction::SetWslKeyrings { distros })? {
-            VaultResponseBody::WslKeyringsSet => Ok(()),
-            _ => Err("unexpected answer to the WSL keyrings".to_owned()),
+        let _sending = self.wsl_keyrings_send.lock().map_err(|_| unavailable())?;
+        let (latest, generation) = {
+            let keyrings = self.wsl_keyrings.lock().map_err(|_| unavailable())?;
+            if keyrings.applied_generation >= keyrings.generation {
+                // An earlier send already carried the latest switch.
+                return Ok(());
+            }
+            (keyrings.wanted.clone(), keyrings.generation)
+        };
+        let result = match send(VaultAction::SetWslKeyrings {
+            distros: latest.clone(),
+        }) {
+            Ok(VaultResponseBody::WslKeyringsSet) => Ok(()),
+            Ok(_) => Err("unexpected answer to the WSL keyrings".to_owned()),
+            Err(error) => Err(error),
+        };
+        let mut guard = self.wsl_keyrings.lock().map_err(|_| unavailable())?;
+        let keyrings = &mut *guard;
+        match result {
+            Ok(()) => {
+                keyrings.applied = latest;
+                keyrings.applied_generation = generation;
+                Ok(())
+            }
+            // Switched again meanwhile: that switch's own send carries the
+            // newer list and reports how it went.
+            Err(_) if keyrings.generation > generation => Ok(()),
+            Err(error) => {
+                // Back to what the vault has, as a generation of its own
+                // that is already applied, so no queued send repeats the
+                // refused list.
+                keyrings.wanted.clone_from(&keyrings.applied);
+                keyrings.generation += 1;
+                keyrings.applied_generation = keyrings.generation;
+                Err(WslKeyringsFailure {
+                    error,
+                    kept: keyrings.applied.clone(),
+                    generation: keyrings.generation,
+                })
+            }
         }
     }
 
@@ -1496,24 +1590,17 @@ mod tests {
         assert_eq!(bootstrap().wsl_keyrings, ["Debian"]);
 
         // Sealed: only the next unlock learns of it.
-        runtime
-            .apply_wsl_keyrings(
-                vec!["NixOS".to_owned()],
-                None::<fn(factorseal::VaultAction) -> Result<VaultResponseBody, String>>,
-            )
-            .unwrap();
+        runtime.switch_wsl_keyrings(vec!["NixOS".to_owned()]);
         assert_eq!(bootstrap().wsl_keyrings, ["NixOS"]);
 
         // Unsealed: the vault is told at once.
+        runtime.switch_wsl_keyrings(vec!["NixOS".to_owned(), "Ubuntu".to_owned()]);
         let mut sent = None;
         runtime
-            .apply_wsl_keyrings(
-                vec!["NixOS".to_owned(), "Ubuntu".to_owned()],
-                Some(|action| {
-                    sent = Some(action);
-                    Ok(VaultResponseBody::WslKeyringsSet)
-                }),
-            )
+            .send_wsl_keyrings_with(|action| {
+                sent = Some(action);
+                Ok(VaultResponseBody::WslKeyringsSet)
+            })
             .unwrap();
         assert!(matches!(
             sent,
@@ -1521,11 +1608,90 @@ mod tests {
                 if distros == &["NixOS", "Ubuntu"]
         ));
         assert_eq!(bootstrap().wsl_keyrings, ["NixOS", "Ubuntu"]);
-        assert!(
-            runtime
-                .apply_wsl_keyrings(Vec::new(), Some(|_| Err("sealed".to_owned())))
-                .is_err()
-        );
+    }
+
+    fn wsl_runtime(directory: &tempfile::TempDir) -> std::sync::Arc<super::DesktopRuntime> {
+        super::DesktopRuntime::new(super::RuntimeConfig {
+            root: directory.path().to_path_buf(),
+            socket: None,
+            lease: super::lease_policy(300, 28_800).unwrap(),
+            secret_service: false,
+            wsl_keyrings: Vec::new(),
+        })
+        .0
+    }
+
+    fn wanted(runtime: &super::DesktopRuntime) -> Vec<String> {
+        runtime.wsl_keyrings.lock().unwrap().wanted.clone()
+    }
+
+    /// Switched on by mistake and straight off: whichever background send
+    /// runs first carries the latest list, and the other sends nothing.
+    #[test]
+    fn wsl_keyring_switches_reach_the_vault_in_order_and_the_latest_wins() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = wsl_runtime(&directory);
+        let lists = std::cell::RefCell::new(Vec::new());
+        let vault = |action| {
+            if let factorseal::VaultAction::SetWslKeyrings { distros } = action {
+                lists.borrow_mut().push(distros);
+            }
+            Ok(VaultResponseBody::WslKeyringsSet)
+        };
+        runtime.switch_wsl_keyrings(vec!["Debian".to_owned()]);
+        runtime.switch_wsl_keyrings(Vec::new());
+        runtime.send_wsl_keyrings_with(vault).unwrap();
+        runtime.send_wsl_keyrings_with(vault).unwrap();
+        assert_eq!(lists.into_inner(), [Vec::<String>::new()]);
+        assert_eq!(wanted(&runtime), Vec::<String>::new());
+    }
+
+    /// A switch the vault refuses goes back to what the vault has, and no
+    /// queued send repeats it; a switch made meanwhile is never undone.
+    #[test]
+    fn a_refused_wsl_keyring_switch_goes_back_to_what_the_vault_has() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = wsl_runtime(&directory);
+        runtime.switch_wsl_keyrings(vec!["NixOS".to_owned()]);
+        runtime
+            .send_wsl_keyrings_with(|_| Ok(VaultResponseBody::WslKeyringsSet))
+            .unwrap();
+
+        runtime.switch_wsl_keyrings(vec!["NixOS".to_owned(), "Debian".to_owned()]);
+        runtime.switch_wsl_keyrings(Vec::new());
+        let failure = runtime
+            .send_wsl_keyrings_with(|_| Err("the pipe broke".to_owned()))
+            .unwrap_err();
+        assert_eq!(failure.error, "the pipe broke");
+        assert_eq!(failure.kept, ["NixOS"]);
+        assert_eq!(Some(failure.generation), runtime.wsl_keyrings_generation());
+        assert_eq!(wanted(&runtime), ["NixOS"]);
+        // The other switch's send finds nothing left to send.
+        runtime
+            .send_wsl_keyrings_with(|_| panic!("the refused list was sent again"))
+            .unwrap();
+
+        // Switched again while a refused send was in flight: that switch
+        // stands, and its own send carries it.
+        runtime.switch_wsl_keyrings(Vec::new());
+        runtime
+            .send_wsl_keyrings_with(|_| {
+                runtime.switch_wsl_keyrings(vec!["Ubuntu".to_owned()]);
+                Err("the pipe broke".to_owned())
+            })
+            .unwrap();
+        assert_eq!(wanted(&runtime), ["Ubuntu"]);
+        let mut sent = None;
+        runtime
+            .send_wsl_keyrings_with(|action| {
+                sent = Some(action);
+                Ok(VaultResponseBody::WslKeyringsSet)
+            })
+            .unwrap();
+        assert!(matches!(
+            sent,
+            Some(factorseal::VaultAction::SetWslKeyrings { ref distros }) if distros == &["Ubuntu"]
+        ));
     }
 
     #[test]

@@ -309,6 +309,21 @@ pub(crate) fn update(settings: crate::settings::DesktopSettings, cx: &mut App) -
     apply_selected(cx)
 }
 
+/// Save `kept` as the WSL keyrings switched on, without sending it: the
+/// vault refused a switch and still has `kept`.
+pub(crate) fn keep_wsl_keyrings(kept: Vec<String>, cx: &mut App) -> Result<()> {
+    let preferences = cx.global::<Preferences>();
+    let mut settings = preferences.settings.clone();
+    settings.wsl_keyrings = kept;
+    let path = preferences
+        .path
+        .as_deref()
+        .context("desktop configuration directory is unavailable")?;
+    crate::settings::save(path, &settings)?;
+    cx.global_mut::<Preferences>().settings = settings;
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn system_changed(cx: &mut App) {
     let theme = Theme::global(cx).clone();

@@ -129,27 +129,60 @@ pub(crate) fn set_next_lease(lease: crate::runtime::LeasePolicy, cx: &App) {
     }
 }
 
+/// The last WSL keyring switch the vault refused, shown in Settings until
+/// the next switch.
+struct WslKeyringsStatus(Option<String>);
+
+impl Global for WslKeyringsStatus {}
+
+/// Why the last WSL keyring switch did not take effect, if it did not.
+pub(crate) fn wsl_keyrings_error(cx: &App) -> Option<String> {
+    cx.try_global::<WslKeyringsStatus>()
+        .and_then(|status| status.0.clone())
+}
+
 /// Switch the WSL keyrings: at the next unlock, and at once while unsealed.
-pub(crate) fn set_wsl_keyrings(distros: Vec<String>, cx: &App) {
+/// The switch is recorded here, on the UI thread, so switches keep the
+/// order the person made them in; the send runs in the background. When
+/// the vault refuses it, Settings says so and its switches go back to what
+/// the vault has.
+pub(crate) fn set_wsl_keyrings(distros: Vec<String>, cx: &mut App) {
     let Some(runtime) = cx
         .try_global::<RuntimeGlobal>()
         .map(|runtime| Arc::clone(&runtime.0))
     else {
         return;
     };
-    let unsealed = cx
-        .try_global::<DesktopWindow>()
-        .and_then(|window| match &window.snapshot {
-            Snapshot::Unsealed { metadata, .. } => Some(metadata.clone()),
-            _ => None,
-        });
-    cx.background_executor()
-        .spawn(async move {
-            if let Err(error) = runtime.set_wsl_keyrings(unsealed.as_ref(), distros) {
-                eprintln!("could not switch the WSL keyrings: {error}");
+    runtime.switch_wsl_keyrings(distros);
+    cx.set_global(WslKeyringsStatus(None));
+    let Some(unsealed) =
+        cx.try_global::<DesktopWindow>()
+            .and_then(|window| match &window.snapshot {
+                Snapshot::Unsealed { metadata, .. } => Some(metadata.clone()),
+                _ => None,
+            })
+    else {
+        return;
+    };
+    cx.spawn(async move |cx| {
+        let sending = Arc::clone(&runtime);
+        let result = smol::unblock(move || sending.send_wsl_keyrings(&unsealed)).await;
+        let Err(failure) = result else {
+            return;
+        };
+        cx.update(|cx| {
+            // Switched again since: that switch reports for itself.
+            if runtime.wsl_keyrings_generation() != Some(failure.generation) {
+                return;
             }
-        })
-        .detach();
+            if let Err(error) = crate::appearance::keep_wsl_keyrings(failure.kept, cx) {
+                eprintln!("could not restore the WSL keyring switches: {error:#}");
+            }
+            cx.set_global(WslKeyringsStatus(Some(failure.error)));
+            cx.refresh_windows();
+        });
+    })
+    .detach();
 }
 
 struct DesktopStatus {
