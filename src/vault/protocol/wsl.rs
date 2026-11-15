@@ -595,6 +595,7 @@ mod tests {
         fake_broker_expecting(directory, template, &["pipe", "NixOS", "relay"])
     }
 
+    #[cfg(target_os = "linux")]
     fn fake_broker_expecting(
         directory: &std::path::Path,
         template: &[u8],
@@ -723,6 +724,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_broker_is_told_which_vault_root_it_serves() {
         use super::super::wire::{
