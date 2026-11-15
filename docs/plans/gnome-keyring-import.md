@@ -3,8 +3,9 @@
 Status, 2026-11-15: steps 1–5 and 7 implemented (de2780e..3b49775), then
 the implementation review acted on (fc49f02..3555cbd), the review of
 those fixes (cbada0a..d03d54a), a third review (bf0e7e6..b927d1b) and a
-fourth (after b927d1b); step 6 implemented (b3429f9, 6539cb5), not yet
-reviewed; steps 8 and 9 remain. All reviews
+fourth (after b927d1b); step 6 implemented (b3429f9, 6539cb5) and its
+review acted on (4cfeaa0..e45811d, see "Step 6 review"); steps 8 and 9
+remain. All reviews
 are folded in (see "Review record" and "Implementation
 record" at the end). Branch: `feature/wsl2-keyring` (the WSL keyring this
 targets lives there). The Windows installer that hands off to it is planned
@@ -148,12 +149,15 @@ of pairs (name, MD5 of the value):
   placeholder and is ignored. Every other attribute is ignored. A locked
   item is recognized by its hashed names, not by `Locked`: a collection
   locked again after an unlock shows plain attributes.
-- **gnome-keyring, unlocked, and the vault:** each attribute gives
-  `(name, md5(value))`. Names starting with `gkr:compat:` are left out
-  (gnome-keyring reserves them; this is defensive). The vault side always
-  takes this plain rule (`vault_keyring_fingerprint`), never the locked
-  one: FactorSeal's Secret Service doesn't reserve `gkr:compat:`, so a
-  vault item may carry such a name.
+- **gnome-keyring, unlocked:** each attribute gives `(name,
+  md5(value))`. Names starting with `gkr:compat:` are left out
+  (gnome-keyring reserves them; this is defensive).
+- **The vault:** the same plain rule (`vault_keyring_fingerprint`), never
+  the locked one, over **every** attribute, `gkr:compat:*` included:
+  FactorSeal's Secret Service doesn't reserve the prefix, so a vault item
+  may carry such a name, and a restore compares the whole attributes
+  (step 1). Leaving the names out made Check count an item as present
+  that Move then added (step 6 review S6-4).
 
 The fingerprint is SHA-256 over this byte string:
 
@@ -311,6 +315,14 @@ until the user has seen it in the native build.
    (`harden_key_owner`). Then `/proc/<pid>/comm` and the program in
    `/proc/<pid>/cmdline` decide, FactorSeal if either looks like it.
 
+   Before looking up the owner, the export calls `StartServiceByName`
+   (step 6 review S6-1): `GetNameOwner` never activates, and gnome-keyring
+   is often only D-Bus-activatable (poita, right after WSL starts the
+   distro). It starts locked, so nothing is asked. dbus-daemon answers
+   `ServiceUnknown` without a service file even while the name has an
+   owner (seen on the test bus), so that answer leaves the owner lookup to
+   decide.
+
    An unlock prompt unanswered for five minutes is dismissed
    (`Prompt.Dismiss`) and its collection reported as "unlock timed out": a
    gcr prompt with no display never appears, and the wait would never end.
@@ -386,7 +398,10 @@ until the user has seen it in the native build.
    fingerprint, id and modified time for that distro's keyring (or the
    native one), sorted by id, as many as fit one response, with
    `next_cursor` (the last id) when more remain. The cursor must be a
-   lowercase 32-hex id, since pages are cut by string comparison. It
+   32-hex id in either case, as item ids are (`IndexItem::validate`);
+   pages are cut and sorted by plain byte order, and the cursor is an id
+   the vault returned, so it resumes exactly (step 6 review S6-5, which
+   took back the lowercase-only rule of D2). It
    returns no values and no attributes, and is not in the broker's
    allowlist. Tests: manager only,
    WSL and native partitions, values never in the response, the pinned
@@ -416,8 +431,8 @@ until the user has seen it in the native build.
        package"; enabling the module comes only after the move (see
        "Rollout on poita");
      - no Secret Service on the session bus (no session bus in a `wsl.exe`
-       shell). With D-Bus activation the call starts gnome-keyring locked,
-       so "not running" rarely happens;
+       shell). With D-Bus activation the call starts gnome-keyring locked
+       (since S6-1's fix), so "not running" rarely happens;
      - prompt dismissed;
      - no frame in the output: shows the first lines of stderr.
 
@@ -454,12 +469,14 @@ until the user has seen it in the native build.
      distro is never pasted into the script, and no quote reaches
      `wsl.exe`'s command-line parsing; distro names (letters, digits,
      `.`, `-`, `_`) stay one word unquoted.
-   - The backstop's collection count comes from a new inventory field,
-     `locked_collections` (b3429f9): `read_all` prompts for every locked
-     collection, empty ones too, which the items alone don't show. A
-     record from an older CLI falls back to counting every collection
-     with an item. The limit is three minutes (also the inventory's)
-     plus five minutes five seconds per locked collection.
+   - The backstop counts every collection the inventory visited (field
+     `collections`, e851d9f), with the locked ones (`locked_collections`,
+     b3429f9: empty ones prompt too) and the items' collections, at least
+     one: any collection may be locked by the time of the Move (S6-3). A
+     record from an older CLI gives the items' collections. The limit is
+     three minutes (also the inventory's) plus five minutes five seconds
+     per collection. `locked_collections` alone decides whether the row
+     says that moving asks for gnome-keyring's password.
    - Desktop refuses a record whose `target` isn't `wsl:<distro>`, and an
      archive holding any entry outside that distro's keyring (another
      partition or document kind): otherwise a process in the distro could
@@ -467,11 +484,21 @@ until the user has seen it in the native build.
    - The one-time passphrase is the personal generator's random style,
      32 letters and digits.
    - Errors: exit 127 (no `factorseal`), "no Secret Service" or "no
-     session bus", "unrecognized subcommand" (a CLI too old), else the
-     first three lines of stderr, or of stdout when stderr is empty
-     (where `wsl.exe` writes its UTF-16 messages).
+     session bus" ("none can be started there"), "unrecognized
+     subcommand" (a CLI too old), else the CLI's own lines (`factorseal:`
+     or `error:`), or the last three lines, of stderr, or of stdout when
+     stderr is empty (where `wsl.exe` writes its UTF-16 messages). A login
+     shell's output comes first and the CLI's error last (S6-6).
    - Cancel kills `wsl.exe`; a cancel that arrives after the archive was
-     decrypted no longer stops the restore, whose result is shown.
+     decrypted no longer stops the restore. A restore that fails, after
+     a late cancel too, shows its error, and the vault is read again
+     after any Move that reached the restore, since a failed one may have
+     added items (S6-7).
+   - The frame parser looks for a header's newline only within 64 bytes,
+     so its scan is linear (S6-2). `wsl.exe`'s stderr is kept up to 64
+     KiB, its stdout up to 464 MiB (the largest valid frame); output past
+     a cap is read to the end and dropped, so the child isn't blocked on
+     a full pipe (S6-8).
    - Sealed: the buttons are disabled and a note asks for the unlock;
      the page doesn't start one itself.
    - After a move Desktop reads the vault again, so the moved items show
@@ -513,7 +540,13 @@ until the user has seen it in the native build.
    release build (installer plan, step 8) checks that its Desktop was built
    without it. A release Desktop thus has no way to run another command in
    WSL and restore its output. Then `check.sh keyring`'s host finds an
-   imported item after the popup approval.
+   imported item after the popup approval. If the hook relies on D-Bus
+   activation inside `dbus-run-session`, the activated daemon gets the
+   bus daemon's environment, not the script's: set `HOME`,
+   `XDG_DATA_HOME` and a short `XDG_RUNTIME_DIR` before
+   `dbus-run-session`, or in the service file's `Exec` as
+   `scripts/test-keyring-import.sh` does, or it opens the real
+   `~/.local/share/keyrings` (step 6 review S6-1).
 9. **Docs**:
    - `usage.md`: WSL keyring section and native Linux (check, move, the
      private-bus recipe with its short runtime dir, delete a hand-made
@@ -670,6 +703,13 @@ mutation, and the gate:
 | 3b49775 | 7: `scripts/test-keyring-import.sh` |
 | b3429f9 | 6: the inventory names its locked collections; import types deserialize |
 | 6539cb5 | 6: Desktop's Check and Move |
+| 4cfeaa0 | step 6 review S6-1: start an activatable Secret Service |
+| 0c3c6a2 | S6-2: linear frame scan |
+| e851d9f | S6-3: Move's limit counts every collection |
+| 44f2080 | S6-4: the vault's fingerprint keeps `gkr:compat:*` names |
+| c36c048 | S6-5: the cursor follows the item-id rule |
+| e45811d | S6-8: stderr cap, drain past the caps |
+| (pending) | S6-6, S6-7: Desktop's error lines and failed Moves (uncommitted until the user's native look) |
 
 `fuzz/Cargo.lock` gained only the `md-5` entry; it already failed
 `cargo metadata --locked` at 4ed2d2d (missing `embed-resource`), which is
@@ -907,6 +947,70 @@ on main), CLI 93 passed; `scripts/test-keyring-import.sh` passes.
   is unchanged; gnome-keyring imports (always with attributes, ids under
   another tag) can't collide with relocated ids; 9a98b33 and b927d1b
   change no behaviour.
+
+### Step 6 review
+
+An independent review of 07b7fee..6539cb5 (2026-11-15, at e7c3020),
+asked to report observed behaviour only, found eight points. Every point
+and what became of it, so the review file was removed. Gate after the
+fixes: fmt, workspace clippy, lib 557 passed, 1 failed, 6 ignored
+(`libsecret_store_seal_lookup` times out, as on main), CLI 93 passed,
+Desktop 209 passed, 1 ignored; `scripts/test-keyring-import.sh` passes;
+natively on Windows, clippy, Desktop 194 passed, 1 ignored, and the WSL
+relay's 14.
+
+- **S6-1, high (ran): Check said there was no gnome-keyring when it was
+  only D-Bus-activatable.** Fixed in 4cfeaa0 (step 2). The script's new
+  phase, gnome-keyring only activatable through a service file, failed
+  before with "no Secret Service on the session bus". The first fix took
+  the reviewer's `ServiceUnknown` → "no Secret Service" and broke the
+  plain locked phase: run on the test bus, dbus-daemon answers
+  `ServiceUnknown` without a service file even while gnome-keyring owns
+  the name, so that answer now falls through to the owner lookup.
+  Desktop's message says none can be started (with S6-6). The reviewer
+  reproduced it with an activated daemon that took the bus daemon's
+  environment and listed the user's real keyring, locked (no unlock, no
+  secrets, nothing written; mtimes checked unchanged afterwards): the
+  script's service file sets the throwaway directories in its `Exec`,
+  and step 8 carries the caution.
+- **S6-2, medium (ran): quadratic frame parser.** Fixed in 0c3c6a2 (step
+  6). The test (1.3 MB of markers; 16384 candidates whose lengths all end
+  at one end line) took 64 s before. A base64 check before decoding,
+  for the overlapping candidates, was tried and dropped: its mutation
+  survived, the decoder already failing fast on such bodies.
+- **S6-3, medium (read): Move's limit fell to 3 minutes when a
+  collection locked after Check.** Fixed in e851d9f (step 6, the inventory
+  lists every collection).
+- **S6-4, low (ran): Check and Move disagreed on a vault item with a
+  `gkr:compat:*` name.** Fixed in 44f2080 with the reviewer's second
+  option, which keeps step 1's matching ("The fingerprint"). The D5 test,
+  which pinned the old rule, became the new one and failed before.
+- **S6-5, low (ran): an uppercase id at a page end broke every later
+  Check.** Fixed in c36c048 (step 5) by accepting either case in the
+  cursor, rather than refusing or lowering such ids on import: they are
+  valid ids today, and lowering one would move it under the matching
+  chain of step 1. The test pages over 9100 mixed-case ids and failed
+  before at the reviewer's cursor.
+- **S6-6, low (read): the error shown was the first three stderr lines.**
+  Fixed (pending commit): the CLI's own lines, else the last three. Tests
+  with three warnings before the error failed before.
+- **S6-7, low (read): a Move failing in the restore hid what it did.**
+  Fixed (pending commit): `move_items` reports whether the restore ran and
+  whether the failure is the cancellation itself; the vault is read again
+  after any Move that reached the restore, and an error after a late
+  Cancel is shown. Mutations of either flag fail the new tests.
+- **S6-8, low (read): output caps allowed ~2 GiB.** Fixed in e45811d.
+  Reading the runner for it showed it stopped reading at the cap, leaving
+  a child blocked on a full pipe until the time limit; output past a cap
+  is now drained, with a test that fails without it.
+
+**Checked and fine** (the reviewer's list, not repeated here in full): the
+gate at e7c3020; the parser's functional rules; the record and archive
+checks before restore; `replace_existing = false`; `wsl.exe` killing,
+pipes, stdin EOF, argument passing, exit 127 and its UTF-16 messages
+(run from PowerShell with the same Win32 calls); 20,000 passphrases;
+`locked_collections`; the backstop arithmetic; paging; the UI's stale-run
+guard.
 
 ### Live check on poita
 
