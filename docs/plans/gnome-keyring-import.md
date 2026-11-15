@@ -1,8 +1,9 @@
 # Plan: move gnome-keyring items into FactorSeal
 
 Status, 2026-11-15: steps 1–5 and 7 implemented (de2780e..3b49775), then
-the implementation review acted on (fc49f02..3555cbd) and the review of
-those fixes acted on (after 7914db9); steps 6, 8 and 9 remain. All reviews
+the implementation review acted on (fc49f02..3555cbd), the review of
+those fixes (cbada0a..d03d54a) and a third review (after d03d54a); steps
+6, 8 and 9 remain. All reviews
 are folded in (see "Review record" and "Implementation
 record" at the end). Branch: `feature/wsl2-keyring` (the WSL keyring this
 targets lives there). The Windows installer that hands off to it is planned
@@ -231,20 +232,24 @@ until the user has seen it in the native build.
         its id.
    2. **By id only** (the id is taken by an item with other attributes, e.g.
       one a program changed through `SetAttributes` after an earlier
-      import): the incoming item is added under a fresh random id and
-      reported as added. Keeping or overwriting by id would make Move
+      import): the incoming item is added under an id derived from its own
+      (`relocated_keyring_id`: SHA-256 under a tag, the next link in the
+      chain while that is taken too) and reported as added. Derived, not
+      random, so a restore of the same backup finds it there again; and
+      not recorded in a new index field, since `Index` and `IndexItem`
+      refuse unknown fields and older builds would reject the keyring. Keeping or overwriting by id would make Move
       disagree with Check, which compares attributes.
    3. **No match:** added under its own id, as today.
 
    An incoming item **without attributes** answers no lookup, so rule 1
-   doesn't apply to it (`attribute_less_match`):
-   - an attribute-less item with its id is the match;
-   - when its id is free, there is none: it is added under that id;
-   - only when an item **with** attributes took its id (rule 2), the first
-     attribute-less item with its label, content type and created time is
-     the match, so a backup restored again keeps the copy an earlier
-     restore added under a fresh id instead of adding another. Applying
-     this match when the id is free lost data (fixes review, N1).
+   doesn't apply to it. It follows its id's relocation chain
+   (`relocation_chain`): the first attribute-less item on it is the match;
+   ids held by items with attributes are passed over; the first free id
+   is where it is added. So its own copy is found on every restore,
+   moved or not, and no other item can stand in for it. (Matching by
+   label, content type and creation time, tried in 94a0252 and cbada0a,
+   let an unrelated look-alike from the same backup match: fixes review
+   N1, third review R1.)
 
    Other attribute-identical duplicates already in the vault are left
    alone. Tests in `service/tests.rs`, native and WSL partition:
@@ -256,8 +261,10 @@ until the user has seen it in the native build.
    - two existing duplicates (the first in index order is the match);
    - attribute-less items: matched by id only, a re-restore whose id is
      taken adds one copy, two different items with one label and time are
-     both added (with and without `replace_existing`), and the exact id
-     wins over a look-alike earlier in the index.
+     both added (with and without `replace_existing`), the exact id wins
+     over a look-alike earlier in the index, and an item whose id is taken
+     is added beside a look-alike from the same backup and found again on
+     a second restore.
 
    Mutation: match by id only.
 2. **Shared Secret Service reader.** Move the session-bus reader out of the
@@ -288,7 +295,7 @@ until the user has seen it in the native build.
    gcr prompt with no display never appears, and the wait would never end.
    The Dismiss itself is best effort and bounded to five seconds. Prompts
    run one collection after another, so the whole read can take five
-   minutes per locked collection.
+   minutes and five seconds per locked collection.
 
    Tests use a fake Secret Service on a private bus (zbus
    server in the test) that returns hashed attributes and the placeholder
@@ -395,7 +402,8 @@ until the user has seen it in the native build.
    - the CLI dismisses a prompt after five minutes (step 2), so Desktop
      only needs a backstop on the `wsl.exe` child, killed on cancel too.
      It must exceed five minutes times the number of locked collections
-     (prompts run one after another), plus Dismiss's five seconds each;
+     (prompts run one after another), plus Dismiss's five seconds each,
+     with the count taken from the Check's inventory, not a constant;
    - a collection skipped as "unlock timed out" is shown apart from one
      whose prompt was dismissed;
    - the result shows a newer item skipped as "unreadable" or "too large"
@@ -448,8 +456,8 @@ until the user has seen it in the native build.
      archive);
    - the restore rule from step 1 in the backup docs and in `CHANGELOG.md`,
      since it changes backup restores for everyone (no release from this
-     branch before that); the rule as it stands after the fixes review's
-     N1, not 94a0252's;
+     branch before that); the attribute-less rule as it stands after the
+     third review's R1 (relocation chain), not 94a0252's or cbada0a's;
    - the native recipe only now that a Nix-wrapped Desktop is recognized as
      FactorSeal (implementation review D1);
    - `wsl2-keyring-design.md` decision 3 pointing here.
@@ -594,7 +602,7 @@ left for a separate fix.
 
 An independent review of de2780e..3b49775 (2026-11-15) was acted on
 point by point; this records every point, so the review file was
-removed. Gate after the fixes: fmt, clippy, lib 546 passed
+removed. Gate after the fixes: fmt, clippy, lib 546 passed, 1 failed
 (`libsecret_store_seal_lookup` times out, as on main), CLI 93 passed;
 `scripts/test-keyring-import.sh` passes.
 
@@ -610,7 +618,9 @@ removed. Gate after the fixes: fmt, clippy, lib 546 passed
   copied again.** Fixed in 94a0252 with the review's first option (match by label,
   content type and created time); the second (always keep) was rejected,
   since it drops the backup's item and clients can still enumerate a
-  collection's items. Test fails before the fix.
+  collection's items. Test fails before the fix. The label match itself
+  lost data and was replaced by the relocation chain (fixes review N1,
+  third review R1).
 - **D4, low: a readable older duplicate was lost to an unusable newest
   one.** Fixed in 711c208, in the export; the inventory still keeps the newest. Test
   fails before the fix.
@@ -671,16 +681,17 @@ removed. Gate after the fixes: fmt, clippy, lib 546 passed
 An independent review of fc49f02..7914db9 (2026-11-15) found that each
 fix resolved its finding, and that D3's fix caused a new defect. Every
 point and what became of it, so the review file was removed. Gate after
-the fixes: fmt, clippy, lib 550 passed (`libsecret_store_seal_lookup` times
-out, as on main), CLI 93 passed; `scripts/test-keyring-import.sh` passes.
+the fixes: fmt, clippy, lib 550 passed, 1 failed, 6 ignored
+(`libsecret_store_seal_lookup` times out, as on main), CLI 93 passed; `scripts/test-keyring-import.sh` passes.
 
 **New defects**
 - **N1, medium: D3's label match dropped or overwrote a different
   attribute-less item** when its own id was free, and a look-alike earlier
   in the index beat the exact id. The reviewer showed it with a temporary
   test (`Added KeptExisting items=1`; with replace, the first item's value
-  overwritten). Fixed in cbada0a (`attribute_less_match`, step 1), with
-  the two tests of Q1; both failed before.
+  overwritten). Partly fixed in cbada0a (`attribute_less_match`, step 1),
+  with the two tests of Q1, which failed before: the free-id case was
+  fixed, the taken-id case was not (third review R1, fixed in bf0e7e6).
 - **N2, low: newer duplicates passed over for the value rules were
   reported as "duplicate".** Fixed in 90e37b7: they report their own
   reason (step 3). The extended test failed before.
@@ -718,3 +729,58 @@ not opened, since filing on GitHub is the user's call.
 
 **Risks:** step 6 gets P2 and N2's result note; step 8 nothing new; step 9
 documents step 1's rule as fixed by N1 (in step 9).
+
+### Third review
+
+An independent review of cbada0a..d03d54a (2026-11-15) found that N2 and
+N3 resolved their findings and N1 didn't fully. Every point and what
+became of it, so the review file was removed. Gate after the fixes: fmt,
+clippy, lib 551 passed, 1 failed, 6 ignored (`libsecret_store_seal_lookup`
+times out, as on main), CLI 93 passed; `scripts/test-keyring-import.sh`
+passes.
+
+**Fix that didn't resolve its finding**
+- **R1, medium: N1's look-alike rule still lost data when the incoming id
+  was taken.** With an item with attributes at `11…1`, a backup's `b`
+  (`22…2`) and `a` (`11…1`), both attribute-less, "Unnamed", one creation
+  time, restored as `Added KeptExisting` (`a` lost), or with replace as
+  `Added Replaced` (`b` overwritten); the reviewer ran it on both
+  partitions. Fixed in bf0e7e6 with the relocation chain (step 1). The
+  reviewer's suggested `restored_from` field was not taken: `Index` and
+  `IndexItem` are `#[serde(deny_unknown_fields)]`
+  (`secret_service_data.rs`), so an index written with it would make
+  older builds reject the whole keyring; a derived id is as exact and
+  changes no format. Its regression test (TQ2) failed before; relocating
+  at random again fails it and the re-restore test.
+
+**New defects:** none besides R1 (cbada0a, 90e37b7 and b154670 change only
+what they say).
+
+**Left alone: a FactorSeal started through `ld-linux` isn't recognized.**
+Judged justified (the unwrapping can't let a non-FactorSeal name through;
+no packaging launches it that way). The suggested note next to the
+unwrapping is in 9a98b33.
+
+**Checked and fine:** N2's choice of reasons (the `Duplicate` fallback is
+unreachable for newer items; counts unchanged), N3 (bounded Dismiss,
+separate from the unlock limit, 5 min + 5 s per locked collection), Q2,
+the record's hashes and its completeness.
+
+**Plan accuracy**
+- **PA1:** step 1 and step 9 now describe the relocation chain, and the
+  N1 and D3 entries say the label match was replaced.
+- **PA2:** step 2 says five minutes and five seconds per locked
+  collection.
+- **PA3:** the reviewer counted 557 lib tests at d03d54a against the
+  record's "550 passed, 1 failed": the record left out the 6 ignored
+  (550 + 1 + 6 = 557). Gate lines now give all three counts.
+- N1's entry now says partly fixed.
+
+**Test quality**
+- **TQ1:** the wedged-Dismiss test checks that the Dismiss was sent
+  (dropping it fails the test) and closes the session: bf0e7e6.
+- **TQ2:** R1's regression test: bf0e7e6.
+
+**Risks:** step 6 takes the backstop's collection count from the
+inventory (in step 6); step 8 nothing new; step 9 documents the rule after
+R1 (in step 9).
