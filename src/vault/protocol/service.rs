@@ -970,7 +970,7 @@ fn keyring_fingerprint_page(
         .into_iter()
         .filter(|item| cursor.is_none_or(|cursor| item.id.as_str() > cursor))
         .filter_map(|item| {
-            crate::vault::keyring_fingerprint(&item.attributes).map(|fingerprint| {
+            crate::vault::vault_keyring_fingerprint(&item.attributes).map(|fingerprint| {
                 super::KeyringFingerprint {
                     fingerprint: hex::encode(fingerprint),
                     id: item.id,

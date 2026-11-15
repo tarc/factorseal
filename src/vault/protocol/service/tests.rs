@@ -5667,3 +5667,33 @@ fn a_keyring_fingerprint_cursor_must_be_a_lowercase_item_id() {
         );
     }
 }
+
+#[test]
+fn vault_keyring_fingerprints_never_read_attributes_as_gnome_keyring_hashes() {
+    // FactorSeal's own Secret Service does not reserve gkr:compat:, so a
+    // program can store such a name; the vault fingerprints it plainly.
+    let (_directory, service) = service(100, UnsealLeasePolicy::default());
+    let manager = caller();
+    service.authorize_permission_manager(&manager, 100).unwrap();
+    let partition = keyring_partitions()[0].clone();
+    let item = keyring_item(
+        "22222222222222222222222222222222",
+        &[("gkr:compat:hashed:x", "zz"), ("service", "gh")],
+        "odd",
+        9,
+    );
+    import_keyring_item(&service, &manager, &partition, &item, b"x", false, 101);
+    let (fingerprints, _, _) = keyring_fingerprints(&service, &manager, None, None, 102).unwrap();
+    let plain = crate::vault::keyring_fingerprint(&std::collections::HashMap::from([(
+        "service".to_owned(),
+        "gh".to_owned(),
+    )]))
+    .unwrap();
+    assert_eq!(
+        fingerprints
+            .iter()
+            .map(|f| f.fingerprint.clone())
+            .collect::<Vec<_>>(),
+        [hex::encode(plain)]
+    );
+}

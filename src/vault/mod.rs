@@ -52,7 +52,7 @@ pub use secret_service::{
 #[cfg(any(feature = "vault-store", feature = "secret-service-host"))]
 pub use secret_service_data::import::{
     KeyringImport, KeyringImportItem, KeyringSkipReason, KeyringSkippedItem, KeyringSourceItem,
-    MAX_IMPORTED_VALUE_BYTES, keyring_fingerprint, map_keyring_items,
+    MAX_IMPORTED_VALUE_BYTES, keyring_fingerprint, map_keyring_items, vault_keyring_fingerprint,
 };
 #[cfg(feature = "secret-service-host")]
 mod secret_service_prompt;

@@ -40,12 +40,18 @@ pub const MAX_IMPORTED_VALUE_BYTES: usize = 256 * 1024;
 /// (gnome-keyring leaves the generic schema unhashed, and shows the generic
 /// schema as a placeholder for every other). Otherwise every attribute
 /// counts except the names gnome-keyring reserves (`gkr:compat:*`).
+///
+/// `source` says the attributes come from another Secret Service; the
+/// vault's own items always take the plain rule, since FactorSeal does not
+/// reserve `gkr:compat:` and a program may store such a name.
 fn pairs<S: BuildHasher>(
     attributes: &HashMap<String, String, S>,
+    source: bool,
 ) -> Option<BTreeMap<&str, [u8; 16]>> {
-    let hashed = attributes
-        .keys()
-        .any(|name| name.starts_with(HASHED_PREFIX));
+    let hashed = source
+        && attributes
+            .keys()
+            .any(|name| name.starts_with(HASHED_PREFIX));
     // A locked item's plain xdg:schema is its real schema only when
     // gnome-keyring did not hash it (the generic schema); otherwise it is
     // a placeholder.
@@ -86,7 +92,18 @@ fn digest(pairs: &BTreeMap<&str, [u8; 16]>) -> [u8; 32] {
 pub fn keyring_fingerprint<S: BuildHasher>(
     attributes: &HashMap<String, String, S>,
 ) -> Option<[u8; 32]> {
-    pairs(attributes)
+    pairs(attributes, true)
+        .filter(|pairs| !pairs.is_empty())
+        .map(|pairs| digest(&pairs))
+}
+
+/// The fingerprint of a FactorSeal keyring item: always the plain rule
+/// (every attribute but `gkr:compat:*`). `None` without attributes.
+#[must_use]
+pub fn vault_keyring_fingerprint<S: BuildHasher>(
+    attributes: &HashMap<String, String, S>,
+) -> Option<[u8; 32]> {
+    pairs(attributes, false)
         .filter(|pairs| !pairs.is_empty())
         .map(|pairs| digest(&pairs))
 }
@@ -221,7 +238,7 @@ pub fn map_keyring_items(items: Vec<KeyringSourceItem>, with_values: bool) -> Ke
     // inventory and the export count the same items up to those.
     let mut kept: Vec<([u8; 32], KeyringSourceItem)> = Vec::new();
     for item in items {
-        let Some(pairs) = pairs(&item.attributes) else {
+        let Some(pairs) = pairs(&item.attributes, true) else {
             skip(&mut import, &item, KeyringSkipReason::Unreadable);
             continue;
         };
