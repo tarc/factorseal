@@ -27,6 +27,8 @@ pub(crate) struct Legacy {
     /// How long an unlock prompt may stay unanswered. A gcr prompt with no
     /// display never appears, and nothing else would end the wait.
     pub(in crate::vault::secret_service) unlock_timeout: Duration,
+    /// How long the best-effort Dismiss of a timed-out prompt may take.
+    pub(in crate::vault::secret_service) dismiss_timeout: Duration,
 }
 
 /// What became of one collection's unlock.
@@ -37,6 +39,7 @@ enum Unlock {
 }
 
 const UNLOCK_TIMEOUT: Duration = Duration::from_secs(300);
+const DISMISS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `future`'s output, or `None` once `limit` passes. The timer is a thread,
 /// not a Tokio timer: callers may run on zbus's own executor.
@@ -193,6 +196,7 @@ impl Legacy {
             owner,
             session,
             unlock_timeout: UNLOCK_TIMEOUT,
+            dismiss_timeout: DISMISS_TIMEOUT,
         })
     }
 
@@ -395,7 +399,13 @@ impl Legacy {
         let next =
             std::future::poll_fn(|context| std::pin::Pin::new(&mut completed).poll_next(context));
         let Some(signal) = within(self.unlock_timeout, next).await else {
-            let _ = prompt.call::<_, _, ()>("Dismiss", &()).await;
+            // Best effort, and bounded: the service that left the prompt
+            // unanswered may not answer this either.
+            let _ = within(
+                self.dismiss_timeout,
+                prompt.call::<_, _, ()>("Dismiss", &()),
+            )
+            .await;
             return Ok(Unlock::TimedOut);
         };
         let signal =

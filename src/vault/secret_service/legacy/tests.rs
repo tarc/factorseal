@@ -38,6 +38,8 @@ struct Calls {
 struct Fake {
     collections: Vec<FakeCollection>,
     calls: Calls,
+    /// Dismiss never replies, as from a wedged service.
+    wedged_dismiss: bool,
 }
 
 type Shared = Arc<Mutex<Fake>>;
@@ -229,10 +231,16 @@ impl Prompt {
         .unwrap();
         Ok(())
     }
-    fn dismiss(&self) {
-        let mut fake = self.0.lock().unwrap();
-        let name = fake.collections[self.1].name;
-        fake.calls.dismissed.push(name);
+    async fn dismiss(&self) {
+        let wedged = {
+            let mut fake = self.0.lock().unwrap();
+            let name = fake.collections[self.1].name;
+            fake.calls.dismissed.push(name);
+            fake.wedged_dismiss
+        };
+        if wedged {
+            std::future::pending::<()>().await;
+        }
     }
     #[zbus(signal)]
     async fn completed(
@@ -307,6 +315,7 @@ fn fake(dismiss_other: bool) -> Fake {
             },
         ],
         calls: Calls::default(),
+        wedged_dismiss: false,
     }
 }
 
@@ -619,5 +628,40 @@ async fn secrets_are_read_in_batches_across_the_boundary() {
             .is_some_and(|(value, _)| &**value == b"many value")
     }));
     assert_eq!(shared.lock().unwrap().calls.get_secrets, 2);
+    legacy.close().await;
+}
+
+#[tokio::test]
+async fn a_wedged_dismiss_does_not_hold_up_the_read() {
+    if !private_bus() {
+        return;
+    }
+    let mut hanging = fake(false);
+    hanging.collections[2].hang = true;
+    hanging.wedged_dismiss = true;
+    let (_server, mut legacy, _shared) = serve(hanging).await;
+    legacy.unlock_timeout = std::time::Duration::from_millis(300);
+    legacy.dismiss_timeout = std::time::Duration::from_millis(300);
+    let read = tokio::time::timeout(std::time::Duration::from_secs(20), legacy.read_all(true))
+        .await
+        .expect("the read finishes")
+        .unwrap();
+    assert_eq!(
+        read.skipped_collections,
+        [("other".to_owned(), "unlock timed out".to_owned())]
+    );
+}
+
+#[tokio::test]
+async fn a_prompt_answered_within_the_limit_unlocks() {
+    if !private_bus() {
+        return;
+    }
+    let (_server, mut legacy, shared) = serve(fake(false)).await;
+    legacy.unlock_timeout = std::time::Duration::from_secs(5);
+    let read = legacy.read_all(true).await.unwrap();
+    assert_eq!(read.skipped_collections, []);
+    assert_eq!(read.items.len(), 3);
+    assert_eq!(shared.lock().unwrap().calls.dismissed, Vec::<&str>::new());
     legacy.close().await;
 }
