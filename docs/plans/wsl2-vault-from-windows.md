@@ -159,6 +159,11 @@ asserts the same exact approval time that made 3c7c41a flaky.
 
 ## Milestone 2: the WSL keyring (planned)
 
+The design, its re-checked facts and the user's decisions of 2026-11-15
+(switch at once, `Lock` from WSL refused, no gnome-keyring import) are in
+[wsl2-keyring-design.md](wsl2-keyring-design.md); where it corrects the facts
+and steps below, it wins.
+
 ### Facts this rests on (checked 2026-11-14 on `stack/7-browser-windows`)
 
 - Since 395b3c6 every Secret Service search/get/set/delete goes through
