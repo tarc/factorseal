@@ -196,6 +196,7 @@ impl Legacy {
         let connection = Connection::session()
             .await
             .map_err(|error| format!("no session bus: {error}"))?;
+        Self::start(&connection).await?;
         let owner = Self::owner(&connection)
             .await
             .map_err(|_| "no Secret Service on the session bus".to_owned())?;
@@ -211,6 +212,25 @@ impl Legacy {
         Self::connect_on(connection, owner)
             .await
             .map_err(|error| format!("cannot open a Secret Service session: {error}"))
+    }
+
+    /// Start the Secret Service if D-Bus can activate it and it isn't
+    /// running yet, as gnome-keyring after WSL starts a distro. It starts
+    /// locked, so this asks nothing. `GetNameOwner` alone never activates.
+    /// Without a service file dbus-daemon answers `ServiceUnknown` even
+    /// while the name has an owner, so that leaves the owner lookup to
+    /// decide.
+    async fn start(connection: &Connection) -> Result<(), String> {
+        let bus = fdo::DBusProxy::new(connection)
+            .await
+            .map_err(|error| format!("no session bus: {error}"))?;
+        let name = "org.freedesktop.secrets"
+            .try_into()
+            .map_err(|error: zbus::Error| error.to_string())?;
+        match bus.start_service_by_name(name, 0).await {
+            Ok(_) | Err(fdo::Error::ServiceUnknown(_)) => Ok(()),
+            Err(error) => Err(format!("the Secret Service could not be started: {error}")),
+        }
     }
 
     async fn owner(connection: &Connection) -> zbus::Result<String> {

@@ -8,8 +8,9 @@
 #    limit) is seeded with secret-tool and with a libsecret schema that has
 #    an INTEGER attribute.
 # 2. `factorseal export-secret-service --inventory` runs with the daemon
-#    restarted locked, then the framed export runs unlocked; both must
-#    give the same fingerprints.
+#    restarted locked, again with gnome-keyring only D-Bus-activatable (not
+#    running, as after WSL starts the distro), then the framed export runs
+#    unlocked; all must give the same fingerprints.
 # 3. The archive is restored into a test vault.
 # 4. That vault serves the Secret Service on a private bus, and secret-tool
 #    lookup must return each value; a second restore keeps every item.
@@ -106,6 +107,22 @@ phase '
 start_keyring
 "$CLI" export-secret-service --inventory --native >"$BASE/inventory.json" 2>"$BASE/inventory.err"
 '
+# Not running, only activatable. An activated service gets the bus daemon's
+# environment, not this script's, so its Exec sets the throwaway dirs:
+# without them it would open the real ~/.local/share/keyrings.
+mkdir "$base/services"
+cat >"$base/services/org.freedesktop.secrets.service" <<SERVICE
+[D-BUS Service]
+Name=org.freedesktop.secrets
+Exec=$(command -v env) HOME=$base XDG_DATA_HOME=$base/data XDG_RUNTIME_DIR=$base/run $gnome_keyring --start --foreground --components=secrets
+SERVICE
+sed "s|</busconfig>|  <servicedir>$base/services</servicedir>\n</busconfig>|" "$dbus_config" >"$base/activation.conf"
+dbus-run-session --config-file "$base/activation.conf" -- bash -c '
+set -euo pipefail
+dbus-send --session --print-reply --dest=org.freedesktop.DBus / \
+    org.freedesktop.DBus.NameHasOwner string:org.freedesktop.secrets | grep -q "boolean false"
+"$CLI" export-secret-service --inventory --native >"$BASE/activated.json" 2>"$BASE/activated.err"
+' || die "inventory with gnome-keyring only activatable: $(cat "$base/activated.err")"
 # Locked again after an unlock in the same daemon: attributes stay plain.
 phase '
 start_keyring unlocked
@@ -123,6 +140,7 @@ import base64, json, sys
 base = sys.argv[1]
 inventory = json.load(open(f"{base}/inventory.json"))
 relocked = json.load(open(f"{base}/relocked.json"))
+activated = json.load(open(f"{base}/activated.json"))
 text = open(f"{base}/export.out").read().splitlines()
 start = next(i for i, line in enumerate(text) if line.startswith("FACTORSEAL-FRAME v1 export "))
 assert text[start + 2] == "FACTORSEAL-FRAME end", "no frame end"
@@ -132,13 +150,14 @@ locked = sorted(item["fingerprint"] for item in inventory["items"])
 unlocked = sorted(item["fingerprint"] for item in record["items"])
 assert all(item["locked"] and "label" not in item for item in inventory["items"]), inventory
 again = sorted(item["fingerprint"] for item in relocked["items"])
-assert len(locked) == 3 and locked == unlocked == again, (locked, unlocked, again)
+started = sorted(item["fingerprint"] for item in activated["items"])
+assert len(locked) == 3 and locked == unlocked == again == started, (locked, unlocked, again, started)
 assert all(item["locked"] and "label" in item for item in relocked["items"]), relocked
 # The INTEGER item's fingerprint pinned in the unit tests (host, port, xdg:schema).
 assert "786097a0da05fd756c858c9f65ec38f3fd9485f684d626d40504649cbdf8cbc7" in locked, locked
 assert record["skipped"] == [] and inventory["skipped"] == [], (record, inventory)
 PY
-echo "fingerprints: locked, locked-again and unlocked agree (3 items)"
+echo "fingerprints: locked, activated, locked-again and unlocked agree (3 items)"
 
 # 3 and 4. Restore into a test vault (the library's, with a mock key
 # protector: a Linux CLI vault needs a TPM), serve it, look the values up.
