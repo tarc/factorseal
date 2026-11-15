@@ -44,8 +44,8 @@ mod linux;
 mod secret_service;
 #[cfg(all(feature = "secret-service-host", target_os = "linux"))]
 pub use secret_service::{
-    NAMESPACE as SECRET_SERVICE_NAMESPACE, SecretServiceHost, SecretServicePrompter,
-    WifiMigrationEntry, WifiMigrationReport,
+    NAMESPACE as SECRET_SERVICE_NAMESPACE, SecretServiceHost, SecretServiceHostOptions,
+    SecretServicePrompter, WifiMigrationEntry, WifiMigrationReport,
 };
 #[cfg(feature = "secret-service-host")]
 mod secret_service_prompt;

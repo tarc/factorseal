@@ -8,8 +8,9 @@ use zbus::fdo;
 
 use super::{failed, no_item, random_id, secret_item, unix_time};
 use crate::vault::{
-    VaultAction, VaultClient, VaultError, VaultMutation, VaultRequest, VaultResponse,
-    VaultResponseBody, VaultResult, WireSecret, WireSecretAddress,
+    DeclaredKeyringCaller, VaultAction, VaultApplicationContext, VaultClient, VaultError,
+    VaultMutation, VaultRequest, VaultResponse, VaultResponseBody, VaultResult, WireSecret,
+    WireSecretAddress,
 };
 
 pub(super) use crate::vault::secret_service_data::{INDEX_ITEM, Index, IndexItem};
@@ -45,9 +46,20 @@ impl Backend for Remote {
     }
 }
 
+/// Resolves a D-Bus sender in WSL to the program behind it and that
+/// program's folder, for a vault that cannot see the sender itself.
+pub(super) type CallerDeclarer =
+    dyn Fn(&str) -> VaultResult<(DeclaredKeyringCaller, String)> + Send + Sync;
+
 #[derive(Clone)]
 pub(super) struct Store {
     backend: Arc<dyn Backend>,
+    /// The vault namespace holding this collection's items and index.
+    namespace: Arc<[u8]>,
+    /// Set for a WSL distro's keyring: callers are declared by this host
+    /// (`WslKeyringAccess`) instead of resolved by the vault, and the
+    /// vault is never sealed from here.
+    declarer: Option<Arc<CallerDeclarer>>,
     delegation: Option<(
         String,
         String,
@@ -57,6 +69,11 @@ pub(super) struct Store {
 }
 
 impl Store {
+    /// Whether callers are declared by this host (a WSL distro's keyring).
+    pub(super) fn declares_callers(&self) -> bool {
+        self.declarer.is_some()
+    }
+
     pub(super) fn backend_request(&self, request: VaultRequest) -> VaultResult<VaultResponse> {
         self.backend.request(request)
     }
@@ -73,6 +90,8 @@ impl Store {
     ) -> Self {
         Self {
             backend: Arc::new(InProcess { service, caller }),
+            namespace: NAMESPACE.into(),
+            declarer: None,
             delegation: None,
         }
     }
@@ -80,8 +99,25 @@ impl Store {
     pub(super) fn remote(client: Box<dyn VaultClient>) -> Self {
         Self {
             backend: Arc::new(Remote { client }),
+            namespace: NAMESPACE.into(),
+            declarer: None,
             delegation: None,
         }
+    }
+
+    /// The keyring of WSL distro `distro`, reached through the WSL broker
+    /// (`client`), with each caller resolved in WSL by `declarer`.
+    pub(super) fn wsl(
+        client: Box<dyn VaultClient>,
+        distro: &str,
+        declarer: Arc<CallerDeclarer>,
+    ) -> VaultResult<Self> {
+        Ok(Self {
+            backend: Arc::new(Remote { client }),
+            namespace: crate::vault::wsl_relay::wsl_keyring_namespace(distro)?.into(),
+            declarer: Some(declarer),
+            delegation: None,
+        })
     }
 
     pub(super) fn delegated(
@@ -93,8 +129,46 @@ impl Store {
     ) -> Self {
         Self {
             backend: Arc::clone(&self.backend),
+            namespace: Arc::clone(&self.namespace),
+            declarer: self.declarer.clone(),
             delegation: Some((sender, service, entry, operation)),
         }
+    }
+
+    /// An access check for `sender` on this collection, with `action` to run
+    /// once it is granted: `KeyringAccess`, where the vault resolves the
+    /// sender, or `WslKeyringAccess` with the caller this host resolved.
+    fn keyring_access(
+        &self,
+        sender: String,
+        service: String,
+        entry: Option<crate::SecretAddress>,
+        operation: crate::vault::PermissionOperation,
+        pending: Option<String>,
+        action: Option<Box<VaultAction>>,
+    ) -> VaultResult<VaultRequest> {
+        let Some(declarer) = &self.declarer else {
+            return VaultRequest::new(VaultAction::KeyringAccess {
+                entry,
+                sender,
+                service,
+                operation,
+                action,
+                pending,
+            });
+        };
+        let (caller, folder) = declarer(&sender)?;
+        VaultRequest::new_with_application(
+            VaultAction::WslKeyringAccess {
+                caller,
+                entry,
+                service,
+                operation,
+                action,
+                pending,
+            },
+            VaultApplicationContext::new(None, None, Some(folder), None)?,
+        )
     }
 
     pub(super) fn check_access(
@@ -106,30 +180,22 @@ impl Store {
         pending: Option<String>,
     ) -> VaultResult<VaultResponse> {
         self.backend
-            .request(VaultRequest::new(VaultAction::KeyringAccess {
-                entry,
-                sender,
-                service,
-                operation,
-                pending,
-                action: None,
-            })?)
+            .request(self.keyring_access(sender, service, entry, operation, pending, None)?)
     }
 
     fn call(&self, action: VaultAction) -> VaultResult<VaultResponseBody> {
-        let action = if let Some((sender, service, entry, operation)) = &self.delegation {
-            VaultAction::KeyringAccess {
-                entry: entry.clone(),
-                sender: sender.clone(),
-                service: service.clone(),
-                operation: *operation,
-                pending: None,
-                action: Some(Box::new(action)),
-            }
+        let request = if let Some((sender, service, entry, operation)) = &self.delegation {
+            self.keyring_access(
+                sender.clone(),
+                service.clone(),
+                entry.clone(),
+                *operation,
+                None,
+                Some(Box::new(action)),
+            )?
         } else {
-            action
+            VaultRequest::new(action)?
         };
-        let request = VaultRequest::new(action)?;
         let response = self.backend.request(request)?;
         response.check_delivery()?;
         response.result.map_err(|error| {
@@ -146,7 +212,7 @@ impl Store {
         item: impl Into<String>,
     ) -> VaultResult<Option<crate::security::LockedBytes>> {
         let response = self.call(VaultAction::Get {
-            namespace: NAMESPACE.to_vec(),
+            namespace: self.namespace.to_vec(),
             address: WireSecretAddress::new(item, None),
         })?;
         match response {
@@ -159,7 +225,7 @@ impl Store {
 
     fn mutate(&self, mutations: Vec<VaultMutation>) -> VaultResult<()> {
         match self.call(VaultAction::Mutate {
-            namespace: NAMESPACE.to_vec(),
+            namespace: self.namespace.to_vec(),
             mutations,
         })? {
             VaultResponseBody::Mutated => Ok(()),
@@ -169,12 +235,17 @@ impl Store {
         }
     }
 
-    /// `Lock` seals the whole vault through the adapter's own grant.
-    pub(super) fn seal(&self) -> VaultResult<()> {
+    /// `Lock` seals the whole vault through the adapter's own grant, and
+    /// answers whether it did: a WSL distro's keyring never seals the
+    /// Windows vault, so `Lock` from WSL locks nothing.
+    pub(super) fn seal(&self) -> VaultResult<bool> {
+        if self.declarer.is_some() {
+            return Ok(false);
+        }
         match self.call(VaultAction::Seal {
-            namespace: NAMESPACE.to_vec(),
+            namespace: self.namespace.to_vec(),
         })? {
-            VaultResponseBody::Sealed => Ok(()),
+            VaultResponseBody::Sealed => Ok(true),
             _ => Err(VaultError::Protocol(
                 "unexpected Secret Service vault response".to_owned(),
             )),
@@ -209,8 +280,32 @@ impl Agent {
         Ok(self.store.index().map_err(failed)?.items)
     }
 
-    // Keep the owned D-Bus inputs available when a concurrent writer requires a retry.
-    #[allow(clippy::needless_pass_by_value)]
+    /// The item a `CreateItem` will write: the one with these attributes
+    /// when replacing, or a new one. Named before the write so that an
+    /// approval can be asked for that item.
+    pub(super) fn planned_item(
+        &self,
+        attributes: &HashMap<String, String>,
+        replace: bool,
+    ) -> fdo::Result<String> {
+        let existing = replace
+            .then(|| {
+                self.all_items().map(|items| {
+                    items
+                        .into_iter()
+                        .find(|item| item.attributes == *attributes)
+                        .map(|item| item.id)
+                })
+            })
+            .transpose()?
+            .flatten();
+        match existing {
+            Some(id) => Ok(id),
+            None => random_id().map_err(failed),
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn create_or_replace(
         &self,
         label: String,
@@ -218,6 +313,22 @@ impl Agent {
         value: &[u8],
         content_type: String,
         replace: bool,
+    ) -> fdo::Result<(IndexItem, bool)> {
+        self.create_or_replace_planned(label, attributes, value, content_type, replace, None)
+    }
+
+    /// [`Self::create_or_replace`] writing exactly the `planned` item, the
+    /// one an approval was given for; fails if the index changed so that
+    /// the write would land on another item.
+    #[allow(clippy::needless_pass_by_value)]
+    pub(super) fn create_or_replace_planned(
+        &self,
+        label: String,
+        attributes: HashMap<String, String>,
+        value: &[u8],
+        content_type: String,
+        replace: bool,
+        planned: Option<&str>,
     ) -> fdo::Result<(IndexItem, bool)> {
         for _ in 0..16 {
             let expected = self.store.get(INDEX_ITEM).map_err(failed)?;
@@ -230,9 +341,15 @@ impl Agent {
                         .position(|item| item.attributes == attributes)
                 })
                 .flatten();
-            let id = match existing {
-                Some(position) => index.items[position].id.clone(),
-                None => random_id().map_err(failed)?,
+            let id = match (existing, planned) {
+                (Some(position), Some(planned)) if index.items[position].id != planned => {
+                    return Err(failed(
+                        "Secret Service index changed during approval; retry the operation",
+                    ));
+                }
+                (Some(position), _) => index.items[position].id.clone(),
+                (None, Some(planned)) => planned.to_owned(),
+                (None, None) => random_id().map_err(failed)?,
             };
             let now = unix_time();
             let item = IndexItem {

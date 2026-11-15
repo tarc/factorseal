@@ -108,8 +108,8 @@ pub use vault::{
 };
 #[cfg(all(feature = "secret-service-host", target_os = "linux"))]
 pub use vault::{
-    SECRET_SERVICE_NAMESPACE, SecretServiceHost, SecretServicePrompter, WifiMigrationEntry,
-    WifiMigrationReport,
+    SECRET_SERVICE_NAMESPACE, SecretServiceHost, SecretServiceHostOptions, SecretServicePrompter,
+    WifiMigrationEntry, WifiMigrationReport,
 };
 #[cfg(feature = "secret-service-host")]
 pub use vault::{

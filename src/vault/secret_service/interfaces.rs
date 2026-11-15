@@ -348,8 +348,10 @@ impl Service {
         &self,
         objects: Vec<OwnedObjectPath>,
     ) -> fdo::Result<(Vec<OwnedObjectPath>, OwnedObjectPath)> {
-        if let Ok(agent) = self.shared.agent() {
-            agent.store.seal().map_err(failed)?;
+        if let Ok(agent) = self.shared.agent()
+            && !agent.store.seal().map_err(failed)?
+        {
+            return Ok((Vec::new(), root_path()?));
         }
         Ok((objects, root_path()?))
     }
@@ -445,6 +447,7 @@ impl Collection {
         let attributes = property_map(&properties, "org.freedesktop.Secret.Item.Attributes")?;
         let (value, content_type) = self.shared.decrypt_secret(secret, &sender(&header)?)?;
         let context = access_context(&attributes, &header, connection).await;
+        let mut planned = None;
         let (agent, value) = if self.shared.prompter.supports_input() {
             let value = self
                 .shared
@@ -455,12 +458,23 @@ impl Collection {
                 .await?;
             (self.shared.agent()?, value)
         } else {
+            // The vault approves writes to a named item only. A host that
+            // declares its callers (WSL) names the item before asking.
+            let current = self.shared.agent()?;
+            if current.store.declares_callers() {
+                planned = Some(current.planned_item(&attributes, replace)?);
+            }
+            let entry = planned
+                .as_deref()
+                .map(|id| crate::SecretAddress::new(secret_item(id), None))
+                .transpose()
+                .map_err(failed)?;
             let agent = self
                 .shared
                 .authorized_agent(
                     &sender(&header)?,
                     &service_target(&attributes),
-                    None,
+                    entry,
                     super::super::PermissionOperation::Put,
                 )
                 .await?;
@@ -469,8 +483,14 @@ impl Collection {
                 super::super::WireSecret::new(value.to_vec()).map_err(failed)?,
             )
         };
-        let (item, created) =
-            agent.create_or_replace(label, attributes, value.expose(), content_type, replace)?;
+        let (item, created) = agent.create_or_replace_planned(
+            label,
+            attributes,
+            value.expose(),
+            content_type,
+            replace,
+            planned.as_deref(),
+        )?;
         let path = item_path(&item.id)?;
         if created {
             server

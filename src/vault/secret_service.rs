@@ -123,17 +123,34 @@ impl SecretServiceHost {
 
     /// Start serving on the session bus from a dedicated thread.
     pub fn start(prompter: Arc<dyn SecretServicePrompter>) -> VaultResult<Self> {
-        Self::start_with(prompter, TAKEOVER_POLL)
+        Self::start_with_options(prompter, SecretServiceHostOptions::default())
     }
 
+    /// [`Self::start`] with `options`.
+    pub fn start_with_options(
+        prompter: Arc<dyn SecretServicePrompter>,
+        options: SecretServiceHostOptions,
+    ) -> VaultResult<Self> {
+        Self::start_inner(prompter, TAKEOVER_POLL, options)
+    }
+
+    #[cfg(test)]
     fn start_with(prompter: Arc<dyn SecretServicePrompter>, poll: Duration) -> VaultResult<Self> {
+        Self::start_inner(prompter, poll, SecretServiceHostOptions::default())
+    }
+
+    fn start_inner(
+        prompter: Arc<dyn SecretServicePrompter>,
+        poll: Duration,
+        options: SecretServiceHostOptions,
+    ) -> VaultResult<Self> {
         let (commands, receiver) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared::new(prompter));
         let frontend = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
             .name("factorseal-secret-service".to_owned())
             .spawn(move || {
-                if let Err(error) = run_frontend(&frontend, receiver, poll) {
+                if let Err(error) = run_frontend(&frontend, receiver, poll, options) {
                     eprintln!("FactorSeal: Secret Service stopped: {error}");
                 }
             })
@@ -147,6 +164,18 @@ impl SecretServiceHost {
         })
     }
 
+    /// Back the collection with the keyring of WSL distro `distro`, reached
+    /// through the WSL broker (`client`). Each caller is resolved here, in
+    /// WSL, from its D-Bus connection and declared to the vault, which cannot
+    /// see it; the broker must hold that distro's keyring grant.
+    #[cfg(feature = "vault")]
+    pub fn install_wsl(&self, client: Box<dyn VaultClient>, distro: &str) -> VaultResult<()> {
+        self.send(Command::Install {
+            store: Box::new(Store::wsl(client, distro, Arc::new(declare_dbus_caller))?),
+            reply: None,
+        })
+    }
+
     /// Back the collection with an unsealed vault reached through `client`.
     ///
     /// The host's executable must hold the adapter's namespace grant. Item
@@ -154,7 +183,7 @@ impl SecretServiceHost {
     /// Loading happens on the adapter thread; failures are reported there.
     pub fn install(&self, client: Box<dyn VaultClient>) -> VaultResult<()> {
         self.send(Command::Install {
-            store: Store::remote(client),
+            store: Box::new(Store::remote(client)),
             reply: None,
         })
     }
@@ -163,7 +192,7 @@ impl SecretServiceHost {
     fn install_store(&self, store: Store) -> VaultResult<oneshot::Receiver<VaultResult<()>>> {
         let (reply, done) = oneshot::channel();
         self.send(Command::Install {
-            store,
+            store: Box::new(store),
             reply: Some(reply),
         })?;
         Ok(done)
@@ -237,6 +266,43 @@ pub(crate) fn serve_secret_service(
     Ok(())
 }
 
+/// How a [`SecretServiceHost`] serves.
+#[derive(Clone, Copy, Debug)]
+pub struct SecretServiceHostOptions {
+    /// Also act as NetworkManager's secret agent on the system bus. Off for
+    /// a WSL keyring, which has no Wi-Fi to serve and whose system bus
+    /// (NixOS-WSL runs systemd) the agent would otherwise retry forever.
+    pub network_manager: bool,
+}
+
+impl Default for SecretServiceHostOptions {
+    fn default() -> Self {
+        Self {
+            network_manager: true,
+        }
+    }
+}
+
+/// The program behind D-Bus `sender` and its folder, resolved as the vault
+/// resolves a native caller, for the vault of a WSL keyring to approve.
+#[cfg(feature = "vault")]
+fn declare_dbus_caller(sender: &str) -> VaultResult<(super::DeclaredKeyringCaller, String)> {
+    let (identity, folder) = super::linux::dbus_caller_identity(sender)?;
+    let uid = identity
+        .user_id()
+        .strip_prefix("uid:")
+        .and_then(|uid| uid.parse().ok())
+        .ok_or_else(|| VaultError::Protocol("unexpected Linux caller user ID".to_owned()))?;
+    Ok((
+        super::DeclaredKeyringCaller {
+            uid,
+            executable: identity.application_id().to_owned(),
+            executable_digest: *identity.executable_digest(),
+        },
+        folder,
+    ))
+}
+
 /// The headless agent has no unlock interface: it only serves while unsealed.
 #[cfg(feature = "vault")]
 struct NoPrompter;
@@ -251,7 +317,7 @@ enum Command {
         reply: oneshot::Sender<VaultResult<WifiMigrationReport>>,
     },
     Install {
-        store: Store,
+        store: Box<Store>,
         reply: Option<oneshot::Sender<VaultResult<()>>>,
     },
     Uninstall,
@@ -649,6 +715,7 @@ fn run_frontend(
     shared: &Arc<Shared>,
     mut commands: mpsc::UnboundedReceiver<Command>,
     poll: Duration,
+    options: SecretServiceHostOptions,
 ) -> VaultResult<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -660,7 +727,11 @@ fn run_frontend(
         // This task also runs while another process owns the session keyring.
         // Dropping the runtime stops it and disconnects the registered agent.
         #[cfg(not(test))]
-        tokio::spawn(network_manager::run(Arc::clone(shared)));
+        if options.network_manager {
+            tokio::spawn(network_manager::run(Arc::clone(shared)));
+        }
+        #[cfg(test)]
+        let _ = options;
         let connection = Connection::session().await.map_err(dbus_error)?;
         let bus = fdo::DBusProxy::new(&connection).await.map_err(dbus_error)?;
         // Subscribe before publishing the service, including clients which
@@ -791,7 +862,7 @@ async fn apply(shared: &Arc<Shared>, server: &ObjectServer, command: Command) {
             });
         }
         Command::Install { store, reply } => {
-            let result = install(shared, server, store).await;
+            let result = install(shared, server, *store).await;
             match reply {
                 Some(reply) => {
                     let _ = reply.send(result);
@@ -1557,6 +1628,50 @@ mod tests {
     }
 
     #[test]
+    fn a_planned_write_lands_on_the_approved_item_or_not_at_all() {
+        let (_directory, agent) = agent();
+        let attributes = HashMap::from([("service".to_owned(), "example.test".to_owned())]);
+        // A new item takes the id it was approved under.
+        let planned = agent.planned_item(&attributes, true).unwrap();
+        let (item, created) = agent
+            .create_or_replace_planned(
+                "Example".to_owned(),
+                attributes.clone(),
+                b"first",
+                "text/plain".to_owned(),
+                true,
+                Some(&planned),
+            )
+            .unwrap();
+        assert!(created);
+        assert_eq!(item.id, planned);
+        // Replacing names the item that matches.
+        assert_eq!(agent.planned_item(&attributes, true).unwrap(), planned);
+        // An approval for another item never writes this one.
+        assert!(
+            agent
+                .create_or_replace_planned(
+                    "Example".to_owned(),
+                    attributes,
+                    b"second",
+                    "text/plain".to_owned(),
+                    true,
+                    Some("ffffffffffffffffffffffffffffffff"),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            agent
+                .store
+                .get(secret_item(&planned))
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            b"first"
+        );
+    }
+
+    #[test]
     fn lock_seals_the_vault_through_the_adapter_grant() {
         let (_directory, service, caller) = test_service();
         let store = Store::in_process(Arc::clone(&service), caller);
@@ -1713,6 +1828,297 @@ mod tests {
             session_proxy.call::<_, _, ()>("Close", &()).await.unwrap();
             assert!(session_proxy.call::<_, _, ()>("Close", &()).await.is_err());
             assert!(server_connection.release_name(BUS_NAME).await.unwrap());
+        });
+    }
+
+    /// The WSL broker as the vault sees it: its own identity, and each
+    /// request tagged with its distro. (The folder is left in its Linux
+    /// form, which a Windows path would not validate on Linux.)
+    struct SimulatedBroker {
+        service: Arc<VaultService>,
+        broker: CallerIdentity,
+    }
+
+    impl VaultClient for SimulatedBroker {
+        fn request(
+            &self,
+            request: &super::super::VaultRequest,
+        ) -> VaultResult<super::super::VaultResponse> {
+            let mut value: serde_json::Value =
+                serde_json::from_slice(request.encode()?.as_ref()).unwrap();
+            if value["application"].is_object() {
+                value["application"]["declared_wsl_origin"] = "NixOS".into();
+            }
+            let relayed = super::super::VaultRequest::decode(&serde_json::to_vec(&value).unwrap())?;
+            Ok(self.service.handle(&self.broker, relayed, 101))
+        }
+    }
+
+    fn wsl_broker() -> CallerIdentity {
+        CallerIdentity::new(
+            CallerPlatform::Windows,
+            "S-1-5-21-1000",
+            r"C:\FactorSeal\factorseal-wsl-broker.exe",
+            [4; 32],
+            None,
+        )
+        .unwrap()
+    }
+
+    /// Approve the next pending request as Desktop would, once it appears,
+    /// and return it.
+    fn approve_next(
+        service: &VaultService,
+        manager: &CallerIdentity,
+        root: &std::path::Path,
+    ) -> super::super::Permission {
+        use crate::vault::{PermissionState, VaultAction, VaultRequest, VaultResponseBody};
+        let started = std::time::Instant::now();
+        loop {
+            let VaultResponseBody::Permissions { permissions, .. } = service
+                .handle(
+                    manager,
+                    VaultRequest::new(VaultAction::ListPermissions).unwrap(),
+                    101,
+                )
+                .result
+                .unwrap()
+            else {
+                panic!("permissions")
+            };
+            if let Some(permission) = permissions
+                .into_iter()
+                .find(|permission| matches!(permission.state, PermissionState::Pending { .. }))
+            {
+                let PermissionState::Pending { challenge, .. } = &permission.state else {
+                    unreachable!()
+                };
+                let signature = Vault::unseal_for_test(root)
+                    .unwrap()
+                    .sign_permission_challenge(&permission.id, challenge, Some(3600))
+                    .unwrap();
+                service
+                    .handle(
+                        manager,
+                        VaultRequest::new(VaultAction::ApprovePermission {
+                            id: permission.id.clone(),
+                            signature,
+                            duration_seconds: Some(3600),
+                            single_use: false,
+                        })
+                        .unwrap(),
+                        101,
+                    )
+                    .result
+                    .unwrap();
+                return permission;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "no request came"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_wsl_keyring_asks_for_the_declared_program_per_item_and_never_seals() {
+        use crate::vault::SecretAddress;
+        runtime().block_on(async {
+            let Some((probe, _bus_guard)) = free_session_bus().await else {
+                return;
+            };
+            assert!(probe.release_name(BUS_NAME).await.unwrap());
+            let (directory, service, manager) = test_service_unprivileged();
+            let root = directory.path().join("factorseal");
+            service.authorize_permission_manager(&manager, 100).unwrap();
+            service
+                .set_wsl_keyring_hosts(Some(wsl_broker()), &["NixOS".to_owned()], 100)
+                .unwrap();
+            let (prompted, _) = mpsc::unbounded_channel();
+            let host = SecretServiceHost::start_with(
+                Arc::new(ChannelPrompter(prompted)),
+                Duration::from_millis(1),
+            )
+            .unwrap();
+            let declared: Arc<agent::CallerDeclarer> = Arc::new(|_sender: &str| {
+                Ok((
+                    super::super::DeclaredKeyringCaller {
+                        uid: 1000,
+                        executable: "/usr/bin/secret-tool".to_owned(),
+                        executable_digest: [3; 32],
+                    },
+                    "/home/me/project".to_owned(),
+                ))
+            });
+            let store = Store::wsl(
+                Box::new(SimulatedBroker {
+                    service: Arc::clone(&service),
+                    broker: wsl_broker(),
+                }),
+                "NixOS",
+                declared,
+            )
+            .unwrap();
+            host.install_store(store).unwrap().await.unwrap().unwrap();
+
+            let client = Connection::session().await.unwrap();
+            let secrets = Proxy::new(
+                &client,
+                BUS_NAME,
+                SERVICE_PATH,
+                "org.freedesktop.Secret.Service",
+            )
+            .await
+            .unwrap();
+            let input = OwnedVariant::try_from(zbus::Variant::from(String::new())).unwrap();
+            let (_output, session): (OwnedVariant, OwnedObjectPath) = secrets
+                .call("OpenSession", &("plain".to_owned(), input))
+                .await
+                .unwrap();
+            let collection = Proxy::new(
+                &client,
+                BUS_NAME,
+                COLLECTION_PATH,
+                "org.freedesktop.Secret.Collection",
+            )
+            .await
+            .unwrap();
+            let properties = HashMap::from([
+                (
+                    "org.freedesktop.Secret.Item.Label".to_owned(),
+                    OwnedVariant::try_from(zbus::Variant::from("gh token")).unwrap(),
+                ),
+                (
+                    "org.freedesktop.Secret.Item.Attributes".to_owned(),
+                    OwnedVariant::try_from(zbus::Variant::from(HashMap::from([(
+                        "service".to_owned(),
+                        "gh:github.com".to_owned(),
+                    )])))
+                    .unwrap(),
+                ),
+            ]);
+
+            // Creating asks for the declared program and the item it names.
+            let approver = std::thread::spawn({
+                let service = Arc::clone(&service);
+                let manager = manager.clone();
+                let root = root.clone();
+                move || approve_next(&service, &manager, &root)
+            });
+            let (item, _prompt): (OwnedObjectPath, OwnedObjectPath) = collection
+                .call(
+                    "CreateItem",
+                    &(
+                        properties,
+                        (
+                            session.clone(),
+                            Vec::<u8>::new(),
+                            b"gho_x".to_vec(),
+                            "text/plain".to_owned(),
+                        ),
+                        true,
+                    ),
+                )
+                .await
+                .unwrap();
+            let asked = approver.join().unwrap();
+            assert_eq!(asked.principal.user_id, "wsl:NixOS:uid:1000");
+            assert_eq!(asked.principal.application_id, "/usr/bin/secret-tool");
+            assert_eq!(
+                asked.application.declared_wsl_origin.as_deref(),
+                Some("NixOS")
+            );
+            assert_eq!(asked.operation, super::super::PermissionOperation::Put);
+            let id = item_id(item.as_str()).unwrap().to_owned();
+            let Some(super::super::PermissionTarget::ProjectEntry {
+                address, base_dir, ..
+            }) = asked.target.as_deref()
+            else {
+                panic!("expected a grant for one item, got {:?}", asked.target);
+            };
+            assert_eq!(address.as_local(), Some((secret_item(&id).as_str(), None)));
+            assert_eq!(base_dir.as_deref(), Some("/home/me/project"));
+
+            // The item is in the distro's keyring, not the native one.
+            let namespace = crate::vault::wsl_relay::wsl_keyring_namespace("NixOS").unwrap();
+            let value_at = |namespace: &[u8]| {
+                let address = SecretAddress::new(secret_item(&id), None).unwrap();
+                service
+                    .handle(
+                        &wsl_broker(),
+                        super::super::VaultRequest::new(super::super::VaultAction::Get {
+                            namespace: namespace.to_vec(),
+                            address: super::super::WireSecretAddress::new(
+                                address.as_local().unwrap().0,
+                                None,
+                            ),
+                        })
+                        .unwrap(),
+                        101,
+                    )
+                    .result
+            };
+            assert!(matches!(
+                value_at(&namespace),
+                Ok(super::super::VaultResponseBody::Secret { value: Some(_) })
+            ));
+            assert!(value_at(NAMESPACE).is_err());
+
+            // Reading it is a separate approval, then the value comes back.
+            let item_proxy = Proxy::new(&client, BUS_NAME, item, "org.freedesktop.Secret.Item")
+                .await
+                .unwrap();
+            let approver = std::thread::spawn({
+                let service = Arc::clone(&service);
+                let manager = manager.clone();
+                move || approve_next(&service, &manager, &root)
+            });
+            let secret: Secret = item_proxy
+                .call("GetSecret", &(session.clone(),))
+                .await
+                .unwrap();
+            assert_eq!(
+                approver.join().unwrap().operation,
+                super::super::PermissionOperation::Get
+            );
+            assert_eq!(secret.2, b"gho_x");
+
+            // Lock from WSL locks nothing and leaves the vault open.
+            let (locked, _): (Vec<OwnedObjectPath>, OwnedObjectPath) = secrets
+                .call("Lock", &(vec![object_path(COLLECTION_PATH).unwrap()],))
+                .await
+                .unwrap();
+            assert_eq!(locked, Vec::<OwnedObjectPath>::new());
+            assert!(!service.expire_if_needed(101).unwrap());
+            assert!(host.is_installed());
+            drop(host);
+        });
+    }
+
+    #[test]
+    fn a_wsl_caller_is_declared_as_the_vault_would_resolve_it() {
+        runtime().block_on(async {
+            let Some((connection, _bus_guard)) = free_session_bus().await else {
+                return;
+            };
+            let sender = connection.unique_name().unwrap().to_string();
+            let (caller, folder) =
+                tokio::task::spawn_blocking(move || declare_dbus_caller(&sender))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let native = crate::vault::linux::linux_caller_identity_for_executable(
+                std::env::current_exe().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(caller.uid, nix::unistd::getuid().as_raw());
+            assert_eq!(caller.executable, native.application_id());
+            assert_eq!(caller.executable_digest, *native.executable_digest());
+            assert!(folder.starts_with('/'), "{folder}");
+            assert!(connection.release_name(BUS_NAME).await.unwrap());
         });
     }
 
