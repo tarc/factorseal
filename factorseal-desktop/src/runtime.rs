@@ -183,6 +183,8 @@ impl Snapshot {
 pub(crate) struct DesktopRuntime {
     config: RuntimeConfig,
     next_lease: Mutex<LeasePolicy>,
+    /// WSL distros whose keyring the next worker grants the WSL broker.
+    wsl_keyrings: Mutex<Vec<String>>,
     events: smol::channel::Sender<Snapshot>,
     lifeline: Mutex<Option<std::process::ChildStdin>>,
     unlock_in_progress: AtomicBool,
@@ -215,6 +217,7 @@ impl DesktopRuntime {
         (
             Arc::new(Self {
                 next_lease: Mutex::new(config.lease),
+                wsl_keyrings: Mutex::new(Vec::new()),
                 config,
                 events,
                 lifeline: Mutex::new(None),
@@ -762,6 +765,11 @@ impl DesktopRuntime {
             password: WireSecret::from_locked(password),
             hosts_secret_service: self.config.secret_service,
             sync_control: true,
+            wsl_keyrings: self
+                .wsl_keyrings
+                .lock()
+                .map(|distros| distros.clone())
+                .unwrap_or_default(),
         };
         let sent = factorseal::desktop_worker::send(
             worker

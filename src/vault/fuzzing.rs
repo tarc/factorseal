@@ -144,6 +144,7 @@ pub fn seeds() -> Vec<(&'static str, Vec<u8>)> {
         password: WireSecret::new(b"synthetic".to_vec()).unwrap(),
         hosts_secret_service: false,
         sync_control: true,
+        wsl_keyrings: Vec::new(),
     };
     let mut frame = Vec::new();
     crate::desktop_worker::send(&mut frame, &bootstrap).unwrap();

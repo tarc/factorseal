@@ -89,8 +89,8 @@ pub use vault::{
 
 #[cfg(feature = "vault-store")]
 pub use vault::{
-    CallerIdentity, CallerPlatform, GrantAuthorization, GrantAuthorizationTarget, GrantPermission,
-    UnsealLeasePolicy, VaultService,
+    CallerIdentity, CallerPlatform, DeclaredKeyringCaller, GrantAuthorization,
+    GrantAuthorizationTarget, GrantPermission, UnsealLeasePolicy, VaultService,
 };
 
 #[cfg(feature = "key-protection")]

@@ -40,6 +40,7 @@ fn run_inner(root: &Path, socket: Option<&Path>, reported: &mut bool) -> Result<
         password,
         hosts_secret_service,
         sync_control,
+        wsl_keyrings,
     } = timing::result("desktop_worker", "receive_bootstrap", || {
         receive(&mut std::io::stdin())
     })
@@ -150,6 +151,7 @@ fn run_inner(root: &Path, socket: Option<&Path>, reported: &mut bool) -> Result<
             .map_err(|_| CliError::DesktopLaunch("owner lock unavailable".to_owned()))? =
             Arc::downgrade(&service);
         authorize_hosts(&service, &hosts, now, hosts_secret_service)?;
+        authorize_wsl_keyrings(&service, &hosts, &wsl_keyrings, now);
         if initializing {
             service.seal()?;
             Vault::complete_initialization(root)?;
@@ -184,7 +186,12 @@ fn run_inner(root: &Path, socket: Option<&Path>, reported: &mut bool) -> Result<
 struct HostIdentities {
     cli: CallerIdentity,
     desktop: CallerIdentity,
+    /// The WSL broker installed beside the CLI (Windows only).
+    wsl_broker: Option<CallerIdentity>,
 }
+
+/// File name of the WSL broker, installed beside `factorseal.exe`.
+const WSL_BROKER_EXECUTABLE: &str = "factorseal-wsl-broker.exe";
 
 // Keep native unsealing on the calling thread; the helper sees executable
 // paths only, never the password or unsealed keys. Scoped joining also reaps
@@ -213,7 +220,56 @@ fn identify_hosts(executable: &Path) -> Result<HostIdentities, CliError> {
     let desktop = timing::result("desktop_worker", "identify_desktop_executable", || {
         super::platform::caller_identity_for_executable(executable)
     })?;
-    Ok(HostIdentities { cli, desktop })
+    #[cfg(windows)]
+    let wsl_broker = std::env::current_exe()
+        .ok()
+        .and_then(|cli| wsl_broker_beside(&cli, super::platform::caller_identity_for_executable));
+    #[cfg(not(windows))]
+    let wsl_broker = None;
+    Ok(HostIdentities {
+        cli,
+        desktop,
+        wsl_broker,
+    })
+}
+
+/// The identity of the WSL broker installed beside `cli`, if there is one.
+/// A broker that cannot be identified is reported and left out, so it
+/// costs the WSL keyrings, never the unlock.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn wsl_broker_beside(
+    cli: &Path,
+    identify: impl FnOnce(&Path) -> Result<CallerIdentity, CliError>,
+) -> Option<CallerIdentity> {
+    let broker = cli.parent()?.join(WSL_BROKER_EXECUTABLE);
+    if !broker.is_file() {
+        return None;
+    }
+    identify(&broker)
+        .inspect_err(|error| {
+            eprintln!(
+                "FactorSeal: could not identify {}: {error}",
+                broker.display()
+            );
+        })
+        .ok()
+}
+
+/// Make the WSL broker the keyring host of the distros switched on in
+/// Desktop, and remove what earlier sessions granted beyond that. A failure
+/// costs the WSL keyrings, never the unlock.
+fn authorize_wsl_keyrings(
+    service: &VaultService,
+    hosts: &HostIdentities,
+    distros: &[String],
+    now: u64,
+) {
+    let result = timing::result("desktop_worker", "authorize_wsl_keyrings", || {
+        service.set_wsl_keyring_hosts(hosts.wsl_broker.clone(), distros, now)
+    });
+    if let Err(error) = result {
+        eprintln!("FactorSeal: the WSL keyrings were not granted: {error}");
+    }
 }
 
 fn authorize_hosts(
@@ -356,7 +412,106 @@ mod tests {
         HostIdentities {
             cli: caller.clone(),
             desktop: caller,
+            wsl_broker: None,
         }
+    }
+
+    fn wsl_broker() -> CallerIdentity {
+        CallerIdentity::new(
+            factorseal::CallerPlatform::Windows,
+            "S-1-5-21-1000",
+            r"C:\FactorSeal\factorseal-wsl-broker.exe",
+            [4; 32],
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_wsl_broker_is_the_one_beside_the_cli() {
+        let directory = tempfile::tempdir().unwrap();
+        let cli = directory.path().join("factorseal.exe");
+        let broker = directory.path().join(WSL_BROKER_EXECUTABLE);
+        let never = |_: &Path| -> Result<CallerIdentity, CliError> {
+            panic!("there is no broker to identify")
+        };
+        assert!(wsl_broker_beside(&cli, never).is_none());
+
+        std::fs::write(&broker, b"broker").unwrap();
+        let identified = wsl_broker_beside(&cli, |path| {
+            assert_eq!(path, broker);
+            Ok(wsl_broker())
+        });
+        assert_eq!(identified, Some(wsl_broker()));
+        // One that cannot be identified is left out; the unlock goes on.
+        assert!(
+            wsl_broker_beside(&cli, |_| Err(CliError::DesktopLaunch(
+                "unreadable".to_owned()
+            )))
+            .is_none()
+        );
+    }
+
+    /// Whether `broker` gets as far as an approval for a keyring access in
+    /// `distro`, which only that distro's keyring host does.
+    fn reaches_wsl_keyring(service: &VaultService, broker: &CallerIdentity, distro: &str) -> bool {
+        let application = factorseal::VaultApplicationContext::new(
+            None,
+            None,
+            Some(if cfg!(windows) { r"C:\demo" } else { "/demo" }.to_owned()),
+            None,
+        )
+        .unwrap()
+        .with_declared_wsl_origin(Some(distro.to_owned()))
+        .unwrap();
+        let request = factorseal::VaultRequest::new_with_application(
+            factorseal::VaultAction::WslKeyringAccess {
+                caller: factorseal::DeclaredKeyringCaller {
+                    uid: 1000,
+                    executable: "/usr/bin/secret-tool".to_owned(),
+                    executable_digest: [3; 32],
+                },
+                entry: Some(
+                    factorseal::SecretAddress::new("item/0123456789abcdef0123456789abcdef", None)
+                        .unwrap(),
+                ),
+                service: "demo".to_owned(),
+                operation: factorseal::PermissionOperation::Get,
+                action: None,
+                pending: None,
+            },
+            application,
+        )
+        .unwrap();
+        let now = super::super::commands::unix_time().unwrap();
+        service
+            .handle(broker, request, now)
+            .result
+            .unwrap_err()
+            .interaction
+            .is_some()
+    }
+
+    #[test]
+    fn each_unlock_grants_the_wsl_broker_exactly_the_distros_switched_on() {
+        let directory = tempfile::tempdir().unwrap();
+        let now = super::super::commands::unix_time().unwrap();
+        let (_, service) = crate::test_vault::open_service(&directory.path().join("vault"), now);
+        let mut hosts = test_hosts();
+        hosts.wsl_broker = Some(wsl_broker());
+
+        authorize_wsl_keyrings(&service, &hosts, &["NixOS".to_owned()], now);
+        assert!(reaches_wsl_keyring(&service, &wsl_broker(), "NixOS"));
+        assert!(!reaches_wsl_keyring(&service, &wsl_broker(), "Debian"));
+
+        authorize_wsl_keyrings(&service, &hosts, &[], now);
+        assert!(!reaches_wsl_keyring(&service, &wsl_broker(), "NixOS"));
+
+        // No broker installed: what an earlier session granted goes too.
+        authorize_wsl_keyrings(&service, &hosts, &["NixOS".to_owned()], now);
+        hosts.wsl_broker = None;
+        authorize_wsl_keyrings(&service, &hosts, &["NixOS".to_owned()], now);
+        assert!(!reaches_wsl_keyring(&service, &wsl_broker(), "NixOS"));
     }
 
     #[test]

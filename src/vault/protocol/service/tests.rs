@@ -4853,3 +4853,14 @@ fn wsl_keyring_items_are_listed_backed_up_and_restored() {
     assert_eq!(portable.item, item);
     assert_eq!(portable.value.expose(), b"gho_x");
 }
+
+#[test]
+fn an_unlock_without_wsl_keyrings_writes_nothing() {
+    let (directory, service) = service(100, UnsealLeasePolicy::default());
+    let before = authorization_generation(&directory);
+    service.set_wsl_keyring_hosts(None, &[], 100).unwrap();
+    service
+        .set_wsl_keyring_hosts(Some(wsl_broker(1)), &[], 100)
+        .unwrap();
+    assert_eq!(authorization_generation(&directory), before);
+}

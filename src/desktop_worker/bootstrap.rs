@@ -20,6 +20,10 @@ pub struct Bootstrap {
     pub hosts_secret_service: bool,
     #[serde(default)]
     pub sync_control: bool,
+    /// WSL distros switched on in Desktop's settings: the worker makes the
+    /// WSL broker beside the CLI their keyring host until the vault seals.
+    #[serde(default)]
+    pub wsl_keyrings: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]

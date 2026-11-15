@@ -1,9 +1,9 @@
 use super::*;
+use crate::test_vault::IntegrationProtectorFactory;
 use factorseal::{
-    CallerIdentity, CallerPlatform, HardwareBackend, KeyProtector, KeyProtectorFactory,
-    PermissionChange, PermissionState, SecretSpecAddress, UnlockCredentials, UnlockFactorKind,
-    UnlockGroup, UnlockPolicy, UnsealLeasePolicy, Vault, VaultInteractionReference, VaultPlatform,
-    VaultResponse, VaultResponseError, VaultService,
+    CallerIdentity, CallerPlatform, PermissionChange, PermissionState, SecretSpecAddress,
+    UnlockCredentials, UnlockGroup, Vault, VaultInteractionReference, VaultResponse,
+    VaultResponseError, VaultService,
 };
 use secretspec_ipc::client::Client;
 use secretspec_ipc::protocol::provider::{
@@ -15,10 +15,9 @@ use secretspec_ipc::protocol::{
     InitializeParams, Limits, PROTOCOL_VERSION, PROVIDER_PROTOCOL, Product,
 };
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use zeroize::Zeroizing;
 
 type CacheKey = (String, SecretSpecAddress);
 
@@ -669,53 +668,6 @@ fn provider_maps_an_unavailable_agent_to_required_interaction() {
     }
 }
 
-struct IntegrationProtector {
-    key: u8,
-}
-
-impl KeyProtector for IntegrationProtector {
-    fn backend(&self) -> HardwareBackend {
-        HardwareBackend::AndroidTrustedEnvironment
-    }
-
-    fn wrap(&self, plaintext: &[u8]) -> factorseal::VaultResult<Vec<u8>> {
-        Ok(plaintext.iter().map(|byte| byte ^ self.key).collect())
-    }
-
-    fn unwrap(&self, ciphertext: &[u8]) -> factorseal::VaultResult<Zeroizing<Vec<u8>>> {
-        Ok(Zeroizing::new(
-            ciphertext.iter().map(|byte| byte ^ self.key).collect(),
-        ))
-    }
-
-    fn delete(&self) -> factorseal::VaultResult<()> {
-        Ok(())
-    }
-}
-
-struct IntegrationProtectorFactory;
-
-impl KeyProtectorFactory for IntegrationProtectorFactory {
-    fn create(
-        &self,
-        root: &Path,
-        label: &str,
-        biometric: bool,
-    ) -> factorseal::VaultResult<Box<dyn KeyProtector>> {
-        self.open(root, label, biometric)
-    }
-
-    fn open(
-        &self,
-        _root: &Path,
-        label: &str,
-        _biometric: bool,
-    ) -> factorseal::VaultResult<Box<dyn KeyProtector>> {
-        let key = if label.contains("-wrap-") { 0x35 } else { 0x97 };
-        Ok(Box::new(IntegrationProtector { key }))
-    }
-}
-
 struct ServiceVaultClient {
     service: Arc<VaultService>,
     caller: CallerIdentity,
@@ -748,20 +700,8 @@ impl ApprovalIntegrationFixture {
     fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("factorseal");
-        let unlock_group = UnlockGroup::new([UnlockFactorKind::Biometric]).unwrap();
-        let policy = UnlockPolicy::new([unlock_group.clone()]).unwrap();
-        let unsealed = Vault::create_with_key_protector_policy(
-            &root,
-            VaultPlatform::Android,
-            &policy,
-            UnlockCredentials::none(),
-            &IntegrationProtectorFactory,
-        )
-        .unwrap();
         let now = unix_time_ms().unwrap() / 1_000;
-        let service = Arc::new(
-            VaultService::open(&root, unsealed, now, UnsealLeasePolicy::default()).unwrap(),
-        );
+        let (unlock_group, service) = crate::test_vault::open_service(&root, now);
         let manager = CallerIdentity::new(
             CallerPlatform::Linux,
             "uid:1000",

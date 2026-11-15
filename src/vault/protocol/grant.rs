@@ -467,6 +467,10 @@ pub(super) fn store_wsl_keyring_hosts(
         .and_then(|bytes| serde_json::from_slice::<WslKeyringHosts>(&bytes).ok())
         .filter(|record| record.version == WSL_KEYRING_HOSTS_VERSION)
         .unwrap_or_default();
+    // Every unlock calls this; one that has no WSL keyring writes nothing.
+    if previous.hosts.is_empty() && wanted.is_empty() {
+        return Ok(());
+    }
     let mut operations = Vec::new();
     for host in previous.hosts.iter().filter(|host| !wanted.contains(host)) {
         let namespace = super::wsl::wsl_keyring_namespace(&host.distro)?;

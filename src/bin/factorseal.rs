@@ -22,6 +22,9 @@ mod provider;
 #[cfg(feature = "secretspec-provider")]
 #[path = "factorseal/secretspec_discovery.rs"]
 mod secretspec_discovery;
+#[cfg(test)]
+#[path = "factorseal/test_vault.rs"]
+mod test_vault;
 #[path = "../timing.rs"]
 mod timing;
 #[cfg(all(target_os = "linux", feature = "secretspec-provider"))]
