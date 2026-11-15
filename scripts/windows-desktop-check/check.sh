@@ -33,8 +33,9 @@
 #       On the test vault, run the Linux `secretspec` in WSL against the
 #       Windows vault through the Linux provider and the broker's relay mode,
 #       configured by `factorseal wsl-setup --windows-root` in a scratch
-#       directory (the broker is copied beside the native CLI, since
-#       wsl-setup takes one install folder): set a key and read it back
+#       directory (the broker and the native CLI are copied to
+#       target\wsl-check, which has no Desktop for the broker to start):
+#       set a key and read it back
 #       (granted "Until the vault seals" in the popup), read it again without
 #       a popup, ask again from another folder, read the same value from the
 #       native provider in the translated folder, and ask again after the
@@ -52,7 +53,7 @@ set -euo pipefail
 
 case ${1:-} in
     popup | grant | test-desktop | write-once | secretspec-wsl) ;;
-    *) sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+    *) sed -n '2,51p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
 
 repo=$(cd "$(dirname "$0")/../.." && pwd)
@@ -502,9 +503,16 @@ secretspec-wsl)
     done
     # Configure the provider as a person would, with `factorseal wsl-setup`,
     # pointed at the test vault and at this scratch directory. It takes one
-    # Windows install folder, so put the broker beside the native CLI.
-    install_dir=$(dirname "$cli")
-    cmp -s "$broker" "$install_dir/factorseal-wsl-broker.exe" || cp "$broker" "$install_dir/factorseal-wsl-broker.exe"
+    # Windows install folder holding the broker and the CLI. Use a folder of
+    # their own: beside factorseal-desktop.exe, the broker would start that
+    # Desktop without --root, on the person's own vault, whenever the test
+    # vault is sealed.
+    install_dir="$windows_tree/target/wsl-check"
+    mkdir -p "$install_dir"
+    for binary in "$broker" "$cli"; do
+        cmp -s "$binary" "$install_dir/$(basename "$binary")" || cp "$binary" "$install_dir/"
+    done
+    [ ! -e "$install_dir/factorseal-desktop.exe" ] || die "$install_dir must not hold factorseal-desktop.exe"
     setup=$(XDG_CONFIG_HOME="$base/xdg" FACTORSEAL_WSL_CONFIG="$base/wsl.json" \
         "$linux_cli" wsl-setup --windows-install "$install_dir" --windows-root "$test_root" 2>&1) ||
         die "factorseal wsl-setup failed: $setup"
