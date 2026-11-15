@@ -5652,9 +5652,55 @@ fn keyring_fingerprints_page_by_item_id() {
     assert_eq!(next, None);
 }
 
+/// Item ids may be any hex case (`IndexItem::validate`), and a page can end
+/// on an uppercase one: its cursor must come back and page on, in the byte
+/// order pages are cut by, over every item once.
 #[test]
-fn a_keyring_fingerprint_cursor_must_be_a_lowercase_item_id() {
-    for cursor in ["A".repeat(32), "a".repeat(31), "g".repeat(32)] {
+fn keyring_fingerprints_page_on_past_an_uppercase_item_id() {
+    let mut index = crate::vault::secret_service_data::Index::default();
+    // Uppercase ids sort first in byte order, so the first page ends on one.
+    index.items = (0..9_100_u32)
+        .map(|n| {
+            let id = if n < 9_000 {
+                format!("A{n:031X}")
+            } else {
+                format!("a{n:031x}")
+            };
+            keyring_item(&id, &[("n", &n.to_string())], "item", 1)
+        })
+        .collect();
+    let mut expected: Vec<_> = index.items.iter().map(|item| item.id.clone()).collect();
+    expected.sort();
+    let mut seen = Vec::new();
+    let mut cursor = None;
+    let mut uppercase_cursor = false;
+    loop {
+        let VaultResponseBody::KeyringFingerprints {
+            fingerprints,
+            next_cursor,
+        } = super::keyring_fingerprint_page(index.clone(), cursor.as_deref()).unwrap()
+        else {
+            panic!("not a fingerprint page");
+        };
+        seen.extend(fingerprints.into_iter().map(|item| item.id));
+        let Some(next) = next_cursor else { break };
+        uppercase_cursor |= next.bytes().any(|byte| byte.is_ascii_uppercase());
+        VaultRequest::new(VaultAction::ListKeyringFingerprints {
+            distro: None,
+            cursor: Some(next.clone()),
+        })
+        .unwrap()
+        .validate_fields()
+        .unwrap_or_else(|error| panic!("cursor {next}: {error}"));
+        cursor = Some(next);
+    }
+    assert!(uppercase_cursor, "a page must end on an uppercase id");
+    assert_eq!(seen, expected);
+}
+
+#[test]
+fn a_keyring_fingerprint_cursor_must_be_an_item_id() {
+    for cursor in ["a".repeat(31), "g".repeat(32), "A".repeat(33)] {
         assert!(
             VaultRequest::new(VaultAction::ListKeyringFingerprints {
                 distro: None,

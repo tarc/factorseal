@@ -1008,11 +1008,10 @@ impl VaultAction {
                 if let Some(distro) = distro {
                     super::wsl::validate_distro(distro)?;
                 }
+                // An item id, as the vault returns it: ids may be any hex
+                // case, and pages are cut by plain byte order.
                 if cursor.as_ref().is_some_and(|cursor| {
-                    cursor.len() != 32
-                        || !cursor
-                            .bytes()
-                            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+                    cursor.len() != 32 || !cursor.bytes().all(|byte| byte.is_ascii_hexdigit())
                 }) {
                     return Err(VaultError::Protocol(
                         "invalid keyring fingerprint cursor".to_owned(),
