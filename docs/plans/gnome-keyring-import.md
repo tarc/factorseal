@@ -1,8 +1,9 @@
 # Plan: move gnome-keyring items into FactorSeal
 
 Status, 2026-11-15: steps 1–5 and 7 implemented (de2780e..3b49775), then
-the implementation review acted on (fc49f02..3555cbd); steps 6, 8 and 9
-remain. Both reviews are folded in (see "Review record" and "Implementation
+the implementation review acted on (fc49f02..3555cbd) and the review of
+those fixes acted on (after 7914db9); steps 6, 8 and 9 remain. All reviews
+are folded in (see "Review record" and "Implementation
 record" at the end). Branch: `feature/wsl2-keyring` (the WSL keyring this
 targets lives there). The Windows installer that hands off to it is planned
 in [windows-installer.md](windows-installer.md).
@@ -236,10 +237,14 @@ until the user has seen it in the native build.
    3. **No match:** added under its own id, as today.
 
    An incoming item **without attributes** answers no lookup, so rule 1
-   doesn't apply to it. It matches an existing attribute-less item with
-   the same id, or with the same label, content type and created time (so
-   that after rule 2 gave it a fresh id, restoring the same backup again
-   keeps it instead of adding a copy).
+   doesn't apply to it (`attribute_less_match`):
+   - an attribute-less item with its id is the match;
+   - when its id is free, there is none: it is added under that id;
+   - only when an item **with** attributes took its id (rule 2), the first
+     attribute-less item with its label, content type and created time is
+     the match, so a backup restored again keeps the copy an earlier
+     restore added under a fresh id instead of adding another. Applying
+     this match when the id is free lost data (fixes review, N1).
 
    Other attribute-identical duplicates already in the vault are left
    alone. Tests in `service/tests.rs`, native and WSL partition:
@@ -248,7 +253,11 @@ until the user has seen it in the native build.
      import status), and `created` unchanged;
    - two incoming duplicates in one archive (second kept);
    - id collision with different attributes (new id, old item untouched);
-   - two existing duplicates (the first in index order is the match).
+   - two existing duplicates (the first in index order is the match);
+   - attribute-less items: matched by id only, a re-restore whose id is
+     taken adds one copy, two different items with one label and time are
+     both added (with and without `replace_existing`), and the exact id
+     wins over a look-alike earlier in the index.
 
    Mutation: match by id only.
 2. **Shared Secret Service reader.** Move the session-bus reader out of the
@@ -276,7 +285,12 @@ until the user has seen it in the native build.
 
    An unlock prompt unanswered for five minutes is dismissed
    (`Prompt.Dismiss`) and its collection reported as "unlock timed out": a
-   gcr prompt with no display never appears, and the wait would never end. Tests use a fake Secret Service on a private bus (zbus
+   gcr prompt with no display never appears, and the wait would never end.
+   The Dismiss itself is best effort and bounded to five seconds. Prompts
+   run one collection after another, so the whole read can take five
+   minutes per locked collection.
+
+   Tests use a fake Secret Service on a private bus (zbus
    server in the test) that returns hashed attributes and the placeholder
    `xdg:schema` for a locked collection, has a second locked collection, and
    exposes the default alias. The Wi-Fi migration tests must stay green.
@@ -289,8 +303,10 @@ until the user has seen it in the native build.
      the others are reported ("duplicate"). The inventory keeps the most
      recently modified (the first seen on a tie). The export keeps the most
      recent one that passes the value rules, so an unreadable or too large
-     newest item doesn't lose an older readable one; when none passes, each
-     reports its own reason.
+     newest item doesn't lose an older readable one. Newer items passed
+     over that way report their own reason ("unreadable", "too large"), so
+     the report shows that an older value moved; older ones report
+     "duplicate". When none passes, each reports its own reason.
    - Items with no attributes are skipped ("no attributes").
    - The content type defaults to `text/plain`.
    - NetworkManager items (`connection-uuid` + `setting-name`) are skipped,
@@ -377,8 +393,13 @@ until the user has seen it in the native build.
 
    From the implementation review:
    - the CLI dismisses a prompt after five minutes (step 2), so Desktop
-     only needs a backstop: a longer limit on the `wsl.exe` child, killed
-     on cancel too;
+     only needs a backstop on the `wsl.exe` child, killed on cancel too.
+     It must exceed five minutes times the number of locked collections
+     (prompts run one after another), plus Dismiss's five seconds each;
+   - a collection skipped as "unlock timed out" is shown apart from one
+     whose prompt was dismissed;
+   - the result shows a newer item skipped as "unreadable" or "too large"
+     beside an older duplicate that moved (step 3), not as a duplicate;
    - the frame parser accepts `\r\n` and garbage before
      `FACTORSEAL-FRAME` on the same line, and checks `<length>` exactly;
    - read `ListKeyringFingerprints` page by page until `next_cursor` is
@@ -395,9 +416,12 @@ until the user has seen it in the native build.
    1. A throwaway `gnome-keyring-daemon --components=secrets --unlock` (nix
       `gnome-keyring`, temporary `XDG_DATA_HOME`, short `XDG_RUNTIME_DIR`)
       runs under `dbus-run-session`. It is seeded with `secret-tool store`
-      and a libsecret schema with an integer attribute.
-   2. `--inventory` runs with the daemon restarted locked, then the export
-      runs unlocked. The fingerprints of both runs must match.
+      and a libsecret schema with an integer attribute, and an item created
+      through libsecret with no schema (which gnome-keyring then reports
+      with the generic one).
+   2. `--inventory` runs with the daemon restarted locked, again on a
+      collection locked again after an unlock, then the export runs
+      unlocked. The fingerprints of all three runs must match.
    3. The archive is restored into a test vault.
    4. FactorSeal's host is served on that private bus, and `secret-tool
       lookup` must return each value.
@@ -424,7 +448,8 @@ until the user has seen it in the native build.
      archive);
    - the restore rule from step 1 in the backup docs and in `CHANGELOG.md`,
      since it changes backup restores for everyone (no release from this
-     branch before that);
+     branch before that); the rule as it stands after the fixes review's
+     N1, not 94a0252's;
    - the native recipe only now that a Nix-wrapped Desktop is recognized as
      FactorSeal (implementation review D1);
    - `wsl2-keyring-design.md` decision 3 pointing here.
@@ -576,7 +601,7 @@ removed. Gate after the fixes: fmt, clippy, lib 546 passed
 **Defects**
 - **D1, medium: a Nix-wrapped Desktop wasn't recognized as FactorSeal.**
   Fixed in fc49f02. Confirmed in nixpkgs'
-  make-binary-wrapper-hook (`hidden=".$(basename "$prog")"-wrapped`). The
+  make-binary-wrapper-hook (`hidden="$(dirname "$prog")/.$(basename "$prog")"-wrapped`). The
   name is unwrapped before the prefix test; unit test of the names (the
   review's T3), and the old check fails it.
 - **D2, low: an uppercase cursor paged wrongly.** Fixed in 1eae96c: lowercase only;
@@ -611,8 +636,9 @@ removed. Gate after the fixes: fmt, clippy, lib 546 passed
 3. Hashed mode chosen by hashed names: kept for gnome-keyring, removed on
    the vault side (D5): "The fingerprint".
 4. A locked item's plain `xdg:schema` counts without a hashed one: kept;
-   the review's run also showed schema-less items get the generic schema
-   (in "Facts", and seeded in step 7).
+   the review's run also showed that an item a client stores with no
+   schema is reported by gnome-keyring with the generic one (in "Facts",
+   and seeded in step 7, which stores it with none).
 5. 256 KiB "too large": step 3.
 6. Injected CLI reader: step 4 (C2).
 7. Step 7 restores into the library's test vault: step 7.
@@ -639,3 +665,56 @@ removed. Gate after the fixes: fmt, clippy, lib 546 passed
   6.
 - **R5 (step 9):** the native recipe needed D1, now fixed: in step 9.
 - **R6 (step 8):** nothing blocks `wsl-test-hooks`. No change.
+
+### Fixes review
+
+An independent review of fc49f02..7914db9 (2026-11-15) found that each
+fix resolved its finding, and that D3's fix caused a new defect. Every
+point and what became of it, so the review file was removed. Gate after
+the fixes: fmt, clippy, lib 550 passed (`libsecret_store_seal_lookup` times
+out, as on main), CLI 93 passed; `scripts/test-keyring-import.sh` passes.
+
+**New defects**
+- **N1, medium: D3's label match dropped or overwrote a different
+  attribute-less item** when its own id was free, and a look-alike earlier
+  in the index beat the exact id. The reviewer showed it with a temporary
+  test (`Added KeptExisting items=1`; with replace, the first item's value
+  overwritten). Fixed in cbada0a (`attribute_less_match`, step 1), with
+  the two tests of Q1; both failed before.
+- **N2, low: newer duplicates passed over for the value rules were
+  reported as "duplicate".** Fixed in 90e37b7: they report their own
+  reason (step 3). The extended test failed before.
+- **N3, low: the Dismiss after a timeout waited without a limit.** Fixed in
+  b154670: five seconds. A fake whose Dismiss never replies held the read
+  until the test's guard before the fix.
+
+**Checked and fine:** D1 (unwrapping can't let a non-FactorSeal name
+through; a process started through `ld-linux` is still missed, outside the
+finding and unlikely for Desktop, so nothing changed), D2, D5, D4's order
+on ties, C1's timer, T2, T4 (the script passes, run by the reviewer).
+
+**Declined or answered points of the first review:** all judged justified
+(D3's second option, C2, C3, T1, T3, T5, T6, R1–R6, deviation 8). For
+deviation 8 the reviewer suggests a tracking issue for `fuzz/Cargo.lock`;
+not opened, since filing on GitHub is the user's call.
+
+**Plan accuracy**
+- **P1:** step 1 described the flawed rule and missed the re-restore
+  test. Rewritten with N1's rule and its tests.
+- **P2:** step 6 now sizes the backstop (five minutes per locked collection
+  plus Dismiss), shows "unlock timed out" apart from "dismissed", and shows
+  N2's reasons in the result.
+- **P3:** deviation 4 now says the client stores no schema and
+  gnome-keyring reports the generic one; step 7's list names the
+  schema-less seed and the relocked inventory.
+- **P4:** the nixpkgs line in D1's record is now verbatim.
+- The record lists every finding of the first review (checked by the
+  reviewer).
+
+**Test quality**
+- **Q1:** exact id over a look-alike: added with N1.
+- **Q2:** a prompt answered within the limit still unlocks: added in
+  b154670.
+
+**Risks:** step 6 gets P2 and N2's result note; step 8 nothing new; step 9
+documents step 1's rule as fixed by N1 (in step 9).
