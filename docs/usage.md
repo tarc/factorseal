@@ -173,6 +173,41 @@ to a Linux vault.
 See [WSL2 broker](architecture.md#wsl2-broker) for what the vault can and cannot
 verify about such requests.
 
+### The WSL2 keyring from the vault on Windows (experimental)
+
+Programs in a WSL2 distro that use the system keyring
+(`org.freedesktop.secrets`, through libsecret or a Secret Service library)
+can keep their secrets in the Windows vault instead of gnome-keyring:
+
+1. In FactorSeal Desktop on Windows, open Settings, WSL keyrings, and switch
+   the distro on. Desktop lists the distros registered for your Windows user;
+   the WSL broker must be installed beside `factorseal.exe`.
+2. In the distro, run `factorseal wsl-setup` once (see above), stop
+   gnome-keyring or any other keyring service, and run
+   `factorseal wsl-keyring`. On NixOS, the module does it for you:
+
+   ```nix
+   services.factorseal = {
+     enable = true;
+     mode = "wsl";
+   };
+   services.gnome.gnome-keyring.enable = false;
+   ```
+
+   It starts `factorseal wsl-keyring` as a D-Bus-activated user service and
+   needs no TPM in the distro.
+
+Each program asks in Desktop's popup the first time it reads or writes an
+item, named as WSL declares it ("from WSL, unverified"), and its access lasts
+until the vault seals. A program's `Lock` call does not seal the Windows
+vault. While the vault is sealed the keyring reports locked; unlocking brings
+Desktop forward. Items already in the distro's gnome-keyring are not moved:
+they stay in its files, and programs ask you to sign in again. To go back,
+switch the distro off, stop `factorseal wsl-keyring` (or set the NixOS mode
+back) and start gnome-keyring again. See
+[WSL keyring](architecture.md#wsl-keyring) for what the vault can and cannot
+verify.
+
 ### Import and export
 
 Create or restore a portable, versioned FactorSeal archive while the vault is

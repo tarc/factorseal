@@ -352,6 +352,9 @@ Do not run another provider that owns that bus name, such as GNOME Keyring or
 oo7, at the same time. macOS Keychain and Windows Credential Manager remain
 separate platform interfaces.
 
+A WSL2 distro can be served the same way from the vault on Windows; see
+[WSL keyring](#wsl-keyring).
+
 ### WSL2 broker
 
 Linux processes inside WSL2 cannot open the vault's Windows named pipe. The
@@ -393,6 +396,48 @@ request carries are declared by the WSL side. When the vault is sealed or not ru
 FactorSeal Desktop, which shows the running instance so the person can unlock.
 Values are stored by project and key, so a WSL program reads what Windows
 SecretSpec wrote, but under its own approvals: the caller is the broker.
+When `wsl.json` names a vault other than the default one
+(`wsl-setup --windows-root`), the broker is told its root
+(`relay --root <root>`) and starts Desktop on that vault.
+
+### WSL keyring
+
+`factorseal wsl-keyring` serves `org.freedesktop.secrets` inside a WSL2 distro
+from that distro's keyring in the Windows vault, through the broker. Each
+distro has its own namespace, `factorseal/wsl-secret-service/v1/<distro>`.
+Since distro names are declared by the WSL side, namespaces keep distros'
+items apart; they do not isolate one distro from another.
+
+The worker grants the broker installed beside the CLI (the only one it
+trusts for this) `Get`, `Put` and `Delete` on the namespace of each distro
+switched on in Desktop's Settings, at every unlock, until the unseal lease's
+absolute deadline; a switch moved while unsealed takes effect at once
+(`SetWslKeyrings`, permission managers only). A record of these host grants
+lets an unlock remove what an earlier session granted beyond the current
+list. The broker gets no `Seal`, so `Lock` from WSL locks nothing.
+
+The vault cannot see the D-Bus caller in WSL, so the host resolves it there,
+as the vault resolves a native caller (uid, executable path, SHA-256 of the
+executable, folder), and declares it in `WslKeyringAccess`. The vault accepts
+that only from the holder of the distro's host grant, and only for actions in
+that distro's namespace. The approval's principal is the declared program
+under a `wsl:<distro>:uid:<n>` user ID, so it never matches a
+transport-authenticated principal, and it carries the distro, so the grant
+lasts until the vault seals like other WSL grants. The popup names the
+program "from WSL, unverified". Without secure input in WSL, a new item is
+named before the write, so the approval is for that item. In relay mode the
+broker forwards, besides the SecretSpec provider's actions, only
+`WslKeyringAccess` for its distro's namespace and a read of that keyring's
+index (labels and attributes); item values travel only inside an access
+check for a declared caller.
+
+While the vault is sealed, the collection reports locked; a client's unlock
+asks through a new broker, which brings Desktop forward, and the collection
+is installed once the vault is unsealed. While installed, the host checks the
+vault by its idle deadline (a status request does not extend the lease) and
+whenever a request finds it sealed. The host does not run the NetworkManager
+agent. WSL keyring items appear in Desktop's inventory and backups under
+their distro's namespace.
 
 ## Vault lifecycle
 

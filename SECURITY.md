@@ -170,11 +170,22 @@ export/import operations. Granting that capability therefore grants broad access
 to durable entries; it is not a metadata-only role. First-party CLI/Desktop
 executables receive this authority when initialized or reauthorized.
 
-The Linux Secret Service collection is shared with applications on the user's
-session bus. It does not provide separate per-application vault grants for each
-keyring item. Its standard `plain` and legacy DH session algorithms are
-compatibility transports, not FIPS or post-quantum protocol claims. Only use this
-adapter where that session-wide trust is appropriate.
+The Linux Secret Service collection asks per application and item: each
+search, read, write or delete needs a grant for the program behind the D-Bus
+call, which the vault resolves from the bus (executable path and digest) and
+binds to the item, operation and folder. Item labels and lookup attributes
+stay readable to the adapter that serves the collection. Its standard `plain`
+and legacy DH session algorithms are compatibility transports, not FIPS or
+post-quantum protocol claims.
+
+A WSL2 distro's keyring, served from the vault on Windows by
+`factorseal wsl-keyring`, asks the same way, but for a program the WSL side
+declares: the vault sees only the WSL broker. Such approvals are advisory.
+They catch surprising access by honest programs and leave an audit trail,
+but any process in WSL can run the broker and declare any program, so the
+trust boundary for WSL is the whole of WSL (every distro, every Linux user,
+root included, since interop runs as the Windows user). A distro's keyring
+must be switched on in Desktop, and its approvals end when the vault seals.
 
 ## Dependency maintenance
 
