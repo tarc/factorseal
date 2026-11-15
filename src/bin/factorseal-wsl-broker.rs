@@ -12,13 +12,14 @@
 //! Usage:
 //!   factorseal-wsl-broker.exe <pipe-name> <distro> status
 //!   factorseal-wsl-broker.exe <pipe-name> <distro> get <project> <profile> <key>
-//!   factorseal-wsl-broker.exe <pipe-name> <distro> relay
+//!   factorseal-wsl-broker.exe <pipe-name> <distro> relay [--root <WINDOWS_ROOT>]
 //!
 //! `relay` serves a Linux client (the SecretSpec provider or the keyring
 //! host `factorseal wsl-keyring` in WSL) over
 //! standard input and output until the input ends; see
 //! `factorseal::vault::wsl_relay` for the framing, the folder translation
-//! and the requests it forwards.
+//! and the requests it forwards. `--root` names the vault's root when it is
+//! not the default vault: Desktop is then brought forward on that vault.
 
 #[cfg(windows)]
 fn main() {
@@ -42,7 +43,7 @@ mod windows_impl {
         WindowsVaultClient, wsl_relay,
     };
 
-    const USAGE: &str = "usage: factorseal-wsl-broker <pipe-name> <distro> status | get <project> <profile> <key> | relay";
+    const USAGE: &str = "usage: factorseal-wsl-broker <pipe-name> <distro> status | get <project> <profile> <key> | relay [--root <WINDOWS_ROOT>]";
 
     /// `VaultAction` deliberately doesn't derive `Clone` (some variants carry
     /// secret material), so the request this broker sends twice -- once
@@ -109,10 +110,12 @@ mod windows_impl {
         let distro = args.next().ok_or(USAGE)?;
         let action_name = args.next().ok_or(USAGE)?;
         if action_name == "relay" {
-            if args.next().is_some() {
-                return Err(USAGE.to_owned());
-            }
-            return relay(&WindowsVaultClient::new(pipe_name), &distro);
+            let root = wsl_relay::parse_relay_options(args).map_err(|_| USAGE.to_owned())?;
+            return relay(
+                &WindowsVaultClient::new(pipe_name),
+                &distro,
+                root.as_deref(),
+            );
         }
         let requested = RequestedAction::parse(&action_name, &mut args)?;
 
@@ -179,21 +182,22 @@ mod windows_impl {
     /// answered by one frame on standard output, until the input ends.
     /// `wsl_relay::serve` enforces the allowlist; Desktop is brought forward
     /// the first time the vault is sealed or unreachable.
-    fn relay(client: &WindowsVaultClient, distro: &str) -> Result<(), String> {
+    fn relay(client: &WindowsVaultClient, distro: &str, root: Option<&str>) -> Result<(), String> {
         wsl_relay::serve(
             client,
             distro,
             &mut std::io::stdin().lock(),
             &mut std::io::stdout().lock(),
-            open_desktop,
+            || open_desktop(root),
         )
         .map_err(|error| error.to_string())
     }
 
     /// Bring FactorSeal Desktop forward so the person can unlock: starting
-    /// the Desktop installed beside the broker shows the running instance's
-    /// window, or starts it. Best effort; the request is refused either way.
-    fn open_desktop() {
+    /// the Desktop installed beside the broker, on the vault at `root` if
+    /// given, shows that vault's running instance's window, or starts it.
+    /// Best effort; the request is refused either way.
+    fn open_desktop(root: Option<&str>) {
         use std::os::windows::process::CommandExt as _;
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
@@ -206,6 +210,7 @@ mod windows_impl {
         };
         // No inherited handles: standard output is the relay's channel.
         let _ = std::process::Command::new(desktop)
+            .args(root.iter().flat_map(|root| ["--root", *root]))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

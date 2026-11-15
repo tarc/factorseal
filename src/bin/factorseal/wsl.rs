@@ -32,6 +32,10 @@ pub(super) struct WslConfig {
     pipe: String,
     /// The distro name the broker declares for each request.
     distro: String,
+    /// The vault's root on Windows (`wsl-setup --windows-root`), when it is
+    /// not the default vault; the broker brings that vault's Desktop forward.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    windows_root: Option<String>,
 }
 
 impl WslConfig {
@@ -42,7 +46,8 @@ impl WslConfig {
     }
 
     pub(super) fn client(self) -> Result<BrokerVaultClient, CliError> {
-        Ok(BrokerVaultClient::new(self.broker, self.pipe, self.distro)?)
+        Ok(BrokerVaultClient::new(self.broker, self.pipe, self.distro)?
+            .with_windows_root(self.windows_root)?)
     }
 }
 
@@ -140,10 +145,18 @@ fn windows_config(
         }
     }
     let pipe = format!("{PIPE_PREFIX}{}", installation_id(&cli, windows_root)?);
+    let windows_root = windows_root
+        .map(|root| {
+            root.to_str().map(str::to_owned).ok_or_else(|| {
+                CliError::WslSetup("the Windows vault root is not valid UTF-8".to_owned())
+            })
+        })
+        .transpose()?;
     Ok(WslConfig {
         broker,
         pipe,
         distro,
+        windows_root,
     })
 }
 
@@ -371,6 +384,7 @@ mod tests {
         assert_eq!(config.pipe, r"\\.\pipe\factorseal-abc-1");
         assert_eq!(config.broker, install.join(BROKER));
         assert_eq!(config.distro, "NixOS");
+        assert_eq!(config.windows_root, None);
         assert_eq!(args(), "status\n");
 
         // Another vault, such as the check vault, by its Windows root.
@@ -382,6 +396,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.pipe, r"\\.\pipe\factorseal-abc-1");
+        assert_eq!(config.windows_root.as_deref(), Some(root));
         assert_eq!(args(), format!("--root\n{root}\nstatus\n"));
 
         fs::remove_file(install.join(BROKER)).unwrap();
@@ -401,10 +416,16 @@ mod tests {
             broker: "/mnt/c/FactorSeal/factorseal-wsl-broker.exe".into(),
             pipe: format!("{PIPE_PREFIX}abc"),
             distro: "NixOS".to_owned(),
+            windows_root: Some(r"C:\check\vault".to_owned()),
         };
         let bytes = serde_json::to_vec(&config).unwrap();
         let read: WslConfig = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(read.pipe, config.pipe);
+        assert_eq!(read.windows_root, config.windows_root);
+        // A configuration from before the root was recorded still reads.
+        let older: WslConfig =
+            serde_json::from_slice(br#"{"broker":"b","pipe":"p","distro":"d"}"#).unwrap();
+        assert_eq!(older.windows_root, None);
         assert!(read.client().is_ok());
         assert!(
             serde_json::from_slice::<WslConfig>(br#"{"broker":"b","pipe":"p","distro":"d","x":1}"#)

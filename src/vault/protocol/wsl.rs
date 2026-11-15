@@ -223,6 +223,35 @@ pub fn validate_distro(distro: &str) -> VaultResult<()> {
 /// attributes, no secrets), as the adapter names it.
 const SECRET_SERVICE_INDEX_ITEM: &str = "secret-service-index";
 
+/// Check a Windows vault root before it becomes an argument of Desktop.
+fn validate_windows_root(root: &str) -> VaultResult<()> {
+    if root.is_empty() || root.len() > 32 * 1024 || root.contains('\0') {
+        return Err(VaultError::Protocol(
+            "the Windows vault root is not valid".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// The options after `relay` on the broker's command line: nothing, or
+/// `--root <WINDOWS_ROOT>`, the root of the vault the broker serves, which
+/// it passes to Desktop when it brings it forward.
+pub fn parse_relay_options(
+    mut options: impl Iterator<Item = String>,
+) -> VaultResult<Option<String>> {
+    let invalid = || VaultError::Protocol("usage: relay [--root <WINDOWS_ROOT>]".to_owned());
+    let root = match options.next().as_deref() {
+        None => return Ok(None),
+        Some("--root") => options.next().ok_or_else(invalid)?,
+        Some(_) => return Err(invalid()),
+    };
+    if options.next().is_some() {
+        return Err(invalid());
+    }
+    validate_windows_root(&root)?;
+    Ok(Some(root))
+}
+
 /// Prefix of the keyring namespaces of WSL distros; the distro name follows.
 const WSL_KEYRING_NAMESPACE_PREFIX: &[u8] = b"factorseal/wsl-secret-service/v1/";
 
@@ -288,6 +317,8 @@ pub struct BrokerVaultClient {
     broker: std::path::PathBuf,
     pipe: String,
     distro: String,
+    /// The vault's root on Windows, when it is not the default vault.
+    windows_root: Option<String>,
     relay: std::sync::Mutex<Option<Relay>>,
 }
 
@@ -329,14 +360,31 @@ impl BrokerVaultClient {
             broker,
             pipe,
             distro,
+            windows_root: None,
             relay: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Name the vault's root on Windows (`factorseal.exe --root`), for a
+    /// vault other than the default one, so that the broker brings forward
+    /// the Desktop of that vault when it is sealed.
+    pub fn with_windows_root(mut self, windows_root: Option<String>) -> VaultResult<Self> {
+        if let Some(root) = &windows_root {
+            validate_windows_root(root)?;
+        }
+        self.windows_root = windows_root;
+        Ok(self)
     }
 
     fn start(&self) -> VaultResult<Relay> {
         use std::process::{Command, Stdio};
         let mut child = Command::new(&self.broker)
             .args([self.pipe.as_str(), self.distro.as_str(), "relay"])
+            .args(
+                self.windows_root
+                    .iter()
+                    .flat_map(|root| ["--root", root.as_str()]),
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -544,15 +592,25 @@ mod tests {
     /// new broker for its next request.
     #[cfg(target_os = "linux")]
     fn fake_broker(directory: &std::path::Path, template: &[u8]) -> std::path::PathBuf {
+        fake_broker_expecting(directory, template, &["pipe", "NixOS", "relay"])
+    }
+
+    fn fake_broker_expecting(
+        directory: &std::path::Path,
+        template: &[u8],
+        arguments: &[&str],
+    ) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
         let template_path = directory.join("template.json");
         std::fs::write(&template_path, template).unwrap();
+        let arguments_path = directory.join("arguments.json");
+        std::fs::write(&arguments_path, serde_json::to_vec(arguments).unwrap()).unwrap();
         let script = directory.join("broker");
         std::fs::write(
             &script,
             format!(
                 "#!/usr/bin/env python3\nimport json, struct, sys\n\
-                 assert sys.argv[1:] == ['pipe', 'NixOS', 'relay'], sys.argv\n\
+                 assert sys.argv[1:] == json.load(open('{}')), sys.argv\n\
                  head = sys.stdin.buffer.read(4)\n\
                  request = json.loads(sys.stdin.buffer.read(struct.unpack('<I', head)[0]))\n\
                  response = json.load(open('{}'))\n\
@@ -560,6 +618,7 @@ mod tests {
                  body = json.dumps(response).encode()\n\
                  sys.stdout.buffer.write(struct.pack('<I', len(body)) + body)\n\
                  sys.stdout.buffer.flush()\n",
+                arguments_path.display(),
                 template_path.display()
             ),
         )
@@ -662,6 +721,53 @@ mod tests {
         assert!(
             BrokerVaultClient::new("x".into(), "pipe".to_owned(), "bad/name".to_owned()).is_err()
         );
+    }
+
+    #[test]
+    fn the_broker_is_told_which_vault_root_it_serves() {
+        use super::super::wire::{
+            RequestId, VaultClient as _, VaultRequest, VaultResponse, VaultResponseBody,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let template =
+            VaultResponse::success(RequestId::from_bytes([0; 16]), VaultResponseBody::Stored)
+                .encode()
+                .unwrap();
+        let root = r"C:\Users\me\AppData\Local\FactorSeal-check\vault";
+        let broker = fake_broker_expecting(
+            directory.path(),
+            template.as_ref(),
+            &["pipe", "NixOS", "relay", "--root", root],
+        );
+        let client = BrokerVaultClient::new(broker, "pipe".to_owned(), "NixOS".to_owned())
+            .unwrap()
+            .with_windows_root(Some(root.to_owned()))
+            .unwrap();
+        let response = client
+            .request(&VaultRequest::new(VaultAction::Status).unwrap())
+            .unwrap();
+        assert!(matches!(response.result, Ok(VaultResponseBody::Stored)));
+    }
+
+    #[test]
+    fn the_relay_takes_only_a_vault_root() {
+        let parse = |options: &[&str]| {
+            parse_relay_options(options.iter().map(|option| (*option).to_owned()))
+        };
+        assert_eq!(parse(&[]).unwrap(), None);
+        assert_eq!(
+            parse(&["--root", r"C:\vault"]).unwrap().as_deref(),
+            Some(r"C:\vault")
+        );
+        for invalid in [
+            &["--root"][..],
+            &["--root", ""],
+            &["--root", "a\0b"],
+            &["--root", "a", "b"],
+            &["--other", "a"],
+        ] {
+            assert!(parse(invalid).is_err(), "{invalid:?}");
+        }
     }
 
     /// A vault for [`serve`]: records what reaches it and answers each
