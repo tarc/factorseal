@@ -167,6 +167,17 @@ fn frame_at(bytes: &[u8]) -> Option<(String, Zeroizing<Vec<u8>>)> {
     if !(rest.is_empty() || after_line_end(rest).is_some()) {
         return None;
     }
+    // Checked before decoding, which first allocates and zeroes a buffer
+    // the size of the body: that costs time on Windows even for a body that
+    // fails at its first bytes, and candidates packed before one end line
+    // would add up. The check stops at the first byte that can't be
+    // base64, such as the `-` of a later start marker.
+    if !body
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+    {
+        return None;
+    }
     let content = Zeroizing::new(STANDARD.decode(body).ok()?);
     Some((kind.to_owned(), content))
 }
@@ -720,7 +731,9 @@ mod tests {
 
     /// Output from the distro can't make the parser slow: many start
     /// markers without a newline, or many candidates that all announce a
-    /// length ending at the same end line.
+    /// length ending at the same end line, repeated. The decoder's zeroed
+    /// buffer makes the latter slow on Windows only (glibc hands out fresh
+    /// zero pages), so `build-windows.sh check` is where it bites.
     #[test]
     fn many_frame_markers_parse_in_linear_time() {
         let markers = "FACTORSEAL-FRAME v1 ".repeat(1 << 16);
@@ -729,17 +742,17 @@ mod tests {
         // The last body byte isn't base64, so no candidate is a frame.
         let mut shared_end = "!\nFACTORSEAL-FRAME end\n".to_owned();
         let mut body = 1;
-        for _ in 0..(1 << 14) {
+        for _ in 0..30_000 {
             let header = format!("FACTORSEAL-FRAME v1 inventory {body}\n");
             body += header.len();
             shared_end.insert_str(0, &header);
         }
         assert!(frame_at(&shared_end.as_bytes()[FRAME_START.len()..]).is_none());
-        for output in [markers, shared_end] {
+        for output in [markers, shared_end.repeat(20)] {
             let started = std::time::Instant::now();
             assert!(unframe(output.as_bytes()).is_none());
             assert!(
-                started.elapsed() < Duration::from_secs(1),
+                started.elapsed() < Duration::from_secs(2),
                 "{} bytes took {:?}",
                 output.len(),
                 started.elapsed()
