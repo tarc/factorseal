@@ -160,7 +160,10 @@ second renumbers.
 The broker's grant on a distro namespace is an ordinary grant (`Get`, `Put`,
 `Delete`; no `Seal`, decision 2) **that expires at the lease's absolute
 deadline**, not an exclusive one. That removes the reason for exclusivity (a superseded build
-loses its grant at the seal anyway), so `store_exclusive_grant` stays
+loses its grant when the vault next opens: `ServiceState::new` removes every
+recorded host grant, and the worker grants the current broker right after;
+added after the review, M1, before which it lasted to the absolute deadline
+unless the worker ran), so `store_exclusive_grant` stays
 Linux-only and nothing NetworkManager-related is ever compiled for, or
 granted to, the broker.
 

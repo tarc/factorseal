@@ -74,3 +74,23 @@ pub(crate) fn open_service(root: &Path, now: u64) -> (UnlockGroup, Arc<VaultServ
         Arc::new(VaultService::open(root, unsealed, now, UnsealLeasePolicy::default()).unwrap());
     (unlock_group, service)
 }
+
+/// Seal `service` and unseal the vault in `root` again with `group`,
+/// opening its service at `now`, as the next unlock does.
+pub(crate) fn reopen_service(
+    root: &Path,
+    group: &UnlockGroup,
+    service: Arc<VaultService>,
+    now: u64,
+) -> Arc<VaultService> {
+    service.seal().unwrap();
+    drop(service);
+    let unsealed = Vault::unseal_with_key_protector_group(
+        root,
+        group,
+        UnlockCredentials::none(),
+        &IntegrationProtectorFactory,
+    )
+    .unwrap();
+    Arc::new(VaultService::open(root, unsealed, now, UnsealLeasePolicy::default()).unwrap())
+}

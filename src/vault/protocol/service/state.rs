@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 
 use crate::vault::{Provenance, ServiceReason, VaultError, VaultResult, VaultStore};
 
-use super::super::grant::{list_granted_permissions, revoke_permission, revoke_wsl_grants};
+use super::super::grant::{
+    list_granted_permissions, revoke_permission, revoke_wsl_grants, store_wsl_keyring_hosts,
+};
 use super::super::lease::{ReplayWindow, UnsealLease};
 use super::super::{CallerIdentity, Permission, PermissionWaitStatus, VaultInteractionReference};
 use super::super::{RequestId, UnsealLeasePolicy};
@@ -65,6 +67,13 @@ impl ServiceState {
         )
         .is_err()
         {
+            crate::security::events::record(crate::security::events::Kind::IntegrityFailure);
+        }
+        // The WSL brokers' keyring host grants end with the unseal too. The
+        // desktop worker grants the switched-on distros again right after
+        // opening; a vault served without it (`factorseal agent`), or whose
+        // worker call fails, keeps none. A failure is handled as above.
+        if store_wsl_keyring_hosts(&store, None, &[], now, now).is_err() {
             crate::security::events::record(crate::security::events::Kind::IntegrityFailure);
         }
         let lease = UnsealLease::new(now, policy)?;

@@ -4939,8 +4939,12 @@ fn only_a_permission_manager_switches_wsl_keyrings() {
     }
 }
 
+/// Host grants end with the unseal, whichever process opens the vault next:
+/// the desktop worker grants the switched-on distros again right after; a
+/// vault served without it (`factorseal agent`), or whose worker call
+/// failed, leaves the broker nothing.
 #[test]
-fn an_unlock_removes_wsl_keyring_hosts_left_from_a_session_sealed_early() {
+fn an_unseal_removes_wsl_keyring_hosts_until_the_worker_grants_them_again() {
     // Real time: opening the store evicts by the real clock.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -4951,13 +4955,16 @@ fn an_unlock_removes_wsl_keyring_hosts_left_from_a_session_sealed_early() {
     service
         .set_wsl_keyring_hosts(Some(broker.clone()), &["NixOS".to_owned()], now)
         .unwrap();
-    // Sealed long before the grant's deadline, then NixOS switched off.
+    assert!(reaches_wsl_keyring_at(&service, &broker, "NixOS", now));
+    // Sealed long before the grant's deadline, then opened without the
+    // worker.
     let service = reopen_after_seal(&directory, service, now + 1);
-    assert!(reaches_wsl_keyring_at(&service, &broker, "NixOS", now + 1));
-    service
-        .set_wsl_keyring_hosts(Some(broker.clone()), &[], now + 1)
-        .unwrap();
     assert!(!reaches_wsl_keyring_at(&service, &broker, "NixOS", now + 1));
+    // The worker's call at unlock grants it again.
+    service
+        .set_wsl_keyring_hosts(Some(broker.clone()), &["NixOS".to_owned()], now + 1)
+        .unwrap();
+    assert!(reaches_wsl_keyring_at(&service, &broker, "NixOS", now + 1));
 }
 
 #[test]

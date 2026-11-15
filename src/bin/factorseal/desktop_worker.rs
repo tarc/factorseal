@@ -514,6 +514,25 @@ mod tests {
         assert!(!reaches_wsl_keyring(&service, &wsl_broker(), "NixOS"));
     }
 
+    /// The vault removes host grants when it opens; the worker's call right
+    /// after grants the switched-on distros again, as at every unlock.
+    #[test]
+    fn the_unlock_after_a_seal_grants_the_wsl_broker_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("vault");
+        let now = super::super::commands::unix_time().unwrap();
+        let (group, service) = crate::test_vault::open_service(&root, now);
+        let mut hosts = test_hosts();
+        hosts.wsl_broker = Some(wsl_broker());
+        authorize_wsl_keyrings(&service, &hosts, &["NixOS".to_owned()], now);
+        assert!(reaches_wsl_keyring(&service, &wsl_broker(), "NixOS"));
+
+        let service = crate::test_vault::reopen_service(&root, &group, service, now + 1);
+        assert!(!reaches_wsl_keyring(&service, &wsl_broker(), "NixOS"));
+        authorize_wsl_keyrings(&service, &hosts, &["NixOS".to_owned()], now + 1);
+        assert!(reaches_wsl_keyring(&service, &wsl_broker(), "NixOS"));
+    }
+
     #[test]
     fn executable_identification_overlaps_unlock_on_the_calling_thread() {
         let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);

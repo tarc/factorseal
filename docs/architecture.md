@@ -416,8 +416,9 @@ trusts for this) `Get`, `Put` and `Delete` on the namespace of each distro
 switched on in Desktop's Settings, at every unlock, until the unseal lease's
 absolute deadline; a switch moved while unsealed takes effect at once
 (`SetWslKeyrings`, permission managers only). A record of these host grants
-lets an unlock remove what an earlier session granted beyond the current
-list. The broker gets no `Seal`, so `Lock` from WSL locks nothing.
+lets the vault remove them whenever it opens, whichever process opens it, so
+they end with the unseal like other WSL grants; the worker then grants the
+current list again. The broker gets no `Seal`, so `Lock` from WSL locks nothing.
 
 The vault cannot see the D-Bus caller in WSL, so the host resolves it there,
 as the vault resolves a native caller (uid, executable path, SHA-256 of the
