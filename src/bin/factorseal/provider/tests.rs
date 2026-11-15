@@ -259,6 +259,7 @@ async fn reject_cross_project_addresses(client: &Client) {
 
 /// Serve `provider` over an in-memory stream and initialize it as
 /// SecretSpec would for project `demo` in the current folder.
+#[cfg(target_os = "linux")]
 async fn connected(
     provider: FactorsealProvider,
 ) -> (
