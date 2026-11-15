@@ -189,14 +189,23 @@ fn console_text(bytes: &[u8]) -> String {
     }
 }
 
-/// The first few non-empty lines of `bytes`, for an error message.
-fn first_lines(bytes: &[u8]) -> Vec<String> {
-    console_text(bytes)
+/// The lines of `bytes` that say what went wrong, for an error message:
+/// the CLI's own (`factorseal: …`, or `error: …` from its argument
+/// parser), else the last few. A login shell's output comes first and the
+/// CLI's error last.
+fn error_lines(bytes: &[u8]) -> Vec<String> {
+    let lines: Vec<String> = console_text(bytes)
         .lines()
         .map(|line| line.trim().trim_matches('\0').to_owned())
         .filter(|line| !line.is_empty())
-        .take(3)
-        .collect()
+        .collect();
+    let own: Vec<String> = lines
+        .iter()
+        .filter(|line| line.starts_with("factorseal:") || line.starts_with("error:"))
+        .cloned()
+        .collect();
+    let chosen = if own.is_empty() { lines } else { own };
+    chosen[chosen.len().saturating_sub(3)..].to_vec()
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -233,7 +242,7 @@ fn failure(distro: &str, output: &RunOutput) -> String {
     if stderr.contains("no Secret Service on the session bus") || stderr.contains("no session bus")
     {
         return format!(
-            "No Secret Service runs on {distro}'s session bus, so there is no gnome-keyring to read."
+            "No Secret Service runs on {distro}'s session bus, and none can be started there, so there is no gnome-keyring to read."
         );
     }
     if stderr.contains("unrecognized subcommand") {
@@ -241,9 +250,9 @@ fn failure(distro: &str, output: &RunOutput) -> String {
             "The factorseal in {distro} is too old to export its keyring. Update it, then check again."
         );
     }
-    let mut lines = first_lines(&output.stderr);
+    let mut lines = error_lines(&output.stderr);
     if lines.is_empty() {
-        lines = first_lines(&output.stdout);
+        lines = error_lines(&output.stdout);
     }
     if lines.is_empty() {
         format!("{distro} gave no answer FactorSeal could read.")
@@ -726,8 +735,8 @@ mod tests {
         );
         assert_eq!(console_text("plain é".as_bytes()), "plain é");
         assert_eq!(
-            first_lines(&utf16("\u{feff}\r\nfirst\r\n\r\nsecond\r\nthird\r\nfourth")),
-            ["first", "second", "third"]
+            error_lines(&utf16("\u{feff}\r\nfirst\r\n\r\nsecond\r\nthird\r\nfourth")),
+            ["second", "third", "fourth"]
         );
     }
 
@@ -907,7 +916,7 @@ mod tests {
             ),
             (
                 output("", "factorseal: no Secret Service on the session bus\n", 1),
-                "No Secret Service runs on NixOS's session bus",
+                "No Secret Service runs on NixOS's session bus, and none can be started there",
             ),
             (
                 output("", "factorseal: no session bus: No such file\n", 1),
@@ -927,7 +936,19 @@ mod tests {
                     "factorseal: cannot identify the Secret Service: Permission denied\nmore\n",
                     1,
                 ),
-                "gave no answer FactorSeal could read: factorseal: cannot identify the Secret Service: Permission denied more",
+                "gave no answer FactorSeal could read: factorseal: cannot identify the Secret Service: Permission denied",
+            ),
+            (
+                output(
+                    "",
+                    "warning: a\nwarning: b\nwarning: c\nfactorseal: cannot identify the Secret Service: Permission denied\n",
+                    1,
+                ),
+                "could read: factorseal: cannot identify the Secret Service: Permission denied",
+            ),
+            (
+                output("", "one\ntwo\nthree\nfour\n", 1),
+                "could read: two three four",
             ),
             (
                 output(
