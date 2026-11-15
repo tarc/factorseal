@@ -43,6 +43,19 @@
 #       (FACTORSEAL_LINUX_CLI, default target/debug/factorseal) and builds
 #       SecretSpec from nix/secretspec.nix unless FACTORSEAL_SECRETSPEC names
 #       one.
+#   check.sh keyring
+#       On the test vault, serve this distro's keyring from the Windows vault
+#       with `factorseal wsl-keyring` on a private D-Bus session (never the
+#       person's own bus or gnome-keyring), and use it with libsecret's
+#       secret-tool: a store and a lookup each asked in the popup (which names
+#       the program as declared by WSL, unverified), a second lookup without
+#       a popup, another program asking again (denied), the collection locked
+#       after a seal, and a lookup after the unlock asking again. The broker
+#       is put beside the test Desktop's CLI, where the worker grants it the
+#       keyring, and the test Desktop runs with --wsl-keyring for this distro.
+#       Needs the Linux CLI (FACTORSEAL_LINUX_CLI, default
+#       target/debug/factorseal); builds libsecret from the flake's nixpkgs
+#       unless FACTORSEAL_SECRET_TOOL names a secret-tool.
 #
 # --test-vault targets the throwaway vault in %LOCALAPPDATA%\FactorSeal-check
 # and the Desktop running on it instead of the default vault. Needs the native
@@ -52,8 +65,8 @@
 set -euo pipefail
 
 case ${1:-} in
-    popup | grant | test-desktop | write-once | secretspec-wsl) ;;
-    *) sed -n '2,51p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+    popup | grant | test-desktop | write-once | secretspec-wsl | keyring) ;;
+    *) sed -n '2,64p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
 
 repo=$(cd "$(dirname "$0")/../.." && pwd)
@@ -117,7 +130,7 @@ case $via in
     popup | cli) ;;
     *) die "--via takes popup or cli" ;;
 esac
-case $command in test-desktop | write-once | secretspec-wsl) test_vault=yes ;; esac
+case $command in test-desktop | write-once | secretspec-wsl | keyring) test_vault=yes ;; esac
 
 root_args=()
 [ "$test_vault" = yes ] && root_args=(--root "$test_root")
@@ -146,6 +159,16 @@ require_unsealed() {
     fi
 }
 
+# The test Desktop grants this distro's keyring in the test vault, for
+# `check.sh keyring`; the person's own settings are never read or written.
+test_desktop_args=(--root "$test_root" --wsl-keyring "$distro")
+
+# The running test Desktop's command line.
+desktop_command_line() {
+    powershell.exe -NoProfile -Command "
+        (Get-CimInstance Win32_Process -Filter \"ProcessId=$1\").CommandLine" </dev/null | tr -d '\r'
+}
+
 if [ "$command" = test-desktop ]; then
     powershell test-vault.ps1 -Cli "$(wslpath -w "$cli")" | sed 's/^/test vault:    /'
     pid=$(desktop_pid)
@@ -153,7 +176,7 @@ if [ "$command" = test-desktop ]; then
     if [ -z "$pid" ]; then
         started=yes
         # Detached, with no handle to this shell, so the launch returns.
-        setsid "$desktop" --root "$test_root" </dev/null >/dev/null 2>&1 &
+        setsid "$desktop" "${test_desktop_args[@]}" </dev/null >/dev/null 2>&1 &
         for _ in $(seq 50); do
             pid=$(desktop_pid)
             [ -n "$pid" ] && break
@@ -174,7 +197,7 @@ if [ "$command" = test-desktop ]; then
     if [ "$started" = no ]; then
         # The browser host starts Desktop in the tray, without a window;
         # starting it again shows the running one's window.
-        setsid "$desktop" --root "$test_root" </dev/null >/dev/null 2>&1 &
+        setsid "$desktop" "${test_desktop_args[@]}" </dev/null >/dev/null 2>&1 &
         sleep 2
     fi
     result=$(powershell drive.ps1 -Action unlock -DesktopPid "$pid" -PasswordFile "$test_password" -Seconds 30 || true)
@@ -193,6 +216,35 @@ fi
 
 [ "$command" = write-once ] || [ -x "$broker" ] ||
     die "no broker at $broker; build it with: $here/build-windows.sh --broker"
+
+if [ "$command" = keyring ] && [ -z "${FACTORSEAL_CHECK_PRIVATE_BUS:-}" ]; then
+    # The worker grants WSL keyrings only to the broker beside its CLI, and
+    # finds it when the vault unlocks. With the vault's root in wsl.json the
+    # broker brings forward this test Desktop, never the person's.
+    beside_cli="$windows_tree/target/release/$(basename "$broker")"
+    cmp -s "$broker" "$beside_cli" || cp "$broker" "$beside_cli"
+    pid=$(desktop_pid)
+    if [ -n "$pid" ] && ! desktop_command_line "$pid" | grep -qF -- "--wsl-keyring $distro"; then
+        echo "desktop:       restarting the test Desktop with --wsl-keyring $distro"
+        factorseal seal >/dev/null || true
+        taskkill.exe /F /PID "$pid" >/dev/null
+        for _ in $(seq 50); do
+            [ -z "$(desktop_pid)" ] && break
+            sleep 0.2
+        done
+    fi
+    # Unlocked after the broker is in place, so the worker grants it.
+    if [ -n "$pid" ] && [ "$(desktop_pid)" = "$pid" ] && [ "$(state)" = unsealed ]; then
+        factorseal seal >/dev/null
+        for _ in $(seq 50); do
+            [ "$(state)" = sealed ] && break
+            sleep 0.2
+        done
+    fi
+    "$0" test-desktop | sed 's/^/test-desktop:  /'
+    # Everything else runs on a D-Bus session of its own.
+    exec dbus-run-session -- env FACTORSEAL_CHECK_PRIVATE_BUS=1 "$0" keyring "$@"
+fi
 require_unsealed
 pipe="\\\\.\\pipe\\factorseal-$installation"
 pid=$(desktop_pid)
@@ -633,6 +685,186 @@ secretspec-wsl)
     factorseal permissions deny "$id" >/dev/null
     wait "$after" && die "the denied read after the seal succeeded: $(cat "$base/sealed.out")"
     echo "after a seal:  asked again ($id, denied)"
+    echo "PASS"
+    ;;
+keyring)
+    [ "${DBUS_SESSION_BUS_ADDRESS:-}" != "unix:path=/run/user/$(id -u)/bus" ] ||
+        die "refusing to use the person's own session bus"
+    linux_cli=${FACTORSEAL_LINUX_CLI:-$repo/target/debug/factorseal}
+    [ -x "$linux_cli" ] || die "no Linux CLI at $linux_cli; build it with: cargo build --all-features --bin factorseal"
+    linux_cli=$(readlink -f "$linux_cli")
+    secret_tool=${FACTORSEAL_SECRET_TOOL:-}
+    if [ -z "$secret_tool" ]; then
+        # From the flake's own nixpkgs; --no-link leaves no GC root.
+        rev=$(sed -n '/"nixpkgs": {/,/}/s/.*"rev": "\([0-9a-f]*\)".*/\1/p' "$repo/flake.lock" | head -1)
+        [ -n "$rev" ] || die "no nixpkgs revision in flake.lock"
+        out=$(nix build --no-link --print-out-paths --impure --expr \
+            "(builtins.getFlake \"github:NixOS/nixpkgs/$rev\").legacyPackages.x86_64-linux.libsecret.out") ||
+            die "could not build libsecret"
+        secret_tool="$out/bin/secret-tool"
+    fi
+    [ -x "$secret_tool" ] || die "no secret-tool at $secret_tool"
+    echo "secret-tool:   $secret_tool"
+
+    base=$(mktemp -d "${TMPDIR:-/tmp}/factorseal-keyring.XXXXXX")
+    service="wsl-keyring-check-$(date +%H%M%S)"
+    collection=/org/freedesktop/secrets/collection/factorseal
+    kill_tree() {
+        local child
+        for child in $(ps -o pid= --ppid "$1" 2>/dev/null); do kill_tree "$child"; done
+        kill "$1" 2>/dev/null || true
+    }
+    # This run's pending requests, one per line: its service is in the reason.
+    pending_now() {
+        local id
+        for id in $(factorseal permissions list | grep -F -B6 "System keyring: service/$service\"" |
+            sed -n 's/^"\(prm_[^"]*\)".*/\1/p'); do
+            permission "$id" | grep -q pending && echo "$id"
+        done
+        return 0
+    }
+    pending_request() {
+        local id
+        for _ in $(seq 60); do
+            id=$(pending_now | head -1)
+            if [ -n "$id" ]; then
+                echo "$id"
+                return
+            fi
+            sleep 0.5
+        done
+    }
+    cleanup() {
+        set +e
+        local job id
+        for job in $(jobs -p); do kill_tree "$job"; done
+        for id in $(pending_now); do
+            factorseal permissions deny "$id" >/dev/null
+        done
+        rm -rf "$base"
+    }
+    trap cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    setup=$(XDG_CONFIG_HOME="$base/xdg" FACTORSEAL_WSL_CONFIG="$base/wsl.json" \
+        "$linux_cli" wsl-setup --windows-install "$windows_tree/target/release" --windows-root "$test_root" 2>&1) ||
+        die "factorseal wsl-setup failed: $setup"
+    grep -qF "\"windows_root\"" "$base/wsl.json" || die "wsl-setup did not record the test vault's root: $(cat "$base/wsl.json")"
+    echo "wsl-setup:     test vault, broker beside its CLI"
+
+    FACTORSEAL_WSL_CONFIG="$base/wsl.json" "$linux_cli" wsl-keyring >"$base/host.log" 2>&1 &
+    host=$!
+    owned=no
+    for _ in $(seq 50); do
+        kill -0 "$host" 2>/dev/null || die "wsl-keyring exited: $(cat "$base/host.log")"
+        if dbus-send --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus \
+            org.freedesktop.DBus.NameHasOwner string:org.freedesktop.secrets 2>/dev/null | grep -q 'boolean true'; then
+            owned=yes
+            break
+        fi
+        sleep 0.2
+    done
+    [ "$owned" = yes ] || die "wsl-keyring did not claim org.freedesktop.secrets: $(cat "$base/host.log")"
+    locked() {
+        busctl --user get-property org.freedesktop.secrets "$collection" \
+            org.freedesktop.Secret.Collection Locked 2>/dev/null | awk '{print $2}'
+    }
+    for _ in $(seq 50); do
+        [ "$(locked)" = false ] && break
+        sleep 0.2
+    done
+    [ "$(locked)" = false ] || die "the collection did not unlock: $(cat "$base/host.log")"
+    echo "wsl-keyring:   serving this distro's keyring from the test vault"
+
+    tool() {
+        local program=$1
+        shift
+        timeout 90 "$program" "$@" 2>&1
+    }
+    # The popup's text, once it shows a WSL request.
+    popup_tree() {
+        local tree
+        for _ in $(seq 10); do
+            tree=$(powershell uia-dump.ps1 -DesktopPid "$pid" || true)
+            grep -q "from WSL, unverified" <<<"$tree" && break
+            sleep 1
+        done
+        echo "$tree"
+    }
+    grant_popup() {
+        local result
+        result=$(powershell drive.ps1 -Action grant -DesktopPid "$pid" -PasswordFile "$test_password" || true)
+        grep -q '^popup_closed=True' <<<"$result" || die "the driver could not grant: $result"
+    }
+
+    # 1. A store asks for this program and this item.
+    printf '%s' wsl-keyring-value | tool "$secret_tool" store --label "WSL keyring check" \
+        service "$service" account check >"$base/store.out" &
+    storer=$!
+    id=$(pending_request)
+    [ -n "$id" ] || die "the store did not reach the vault: $(cat "$base/store.out") $(cat "$base/host.log")"
+    record=$(permission "$id")
+    grep -qF "user: \"wsl:$distro:uid:$(id -u)\"" <<<"$record" || die "the request is not for a program in $distro: $record"
+    grep -qF "secret-tool\"" <<<"$record" || die "the request does not name secret-tool: $record"
+    tree=$(popup_tree)
+    grep -q "secret-tool (from WSL, unverified)" <<<"$tree" || die "the popup does not name the program as declared by WSL"
+    grep -q "Text name='When the vault seals'" <<<"$tree" || die "the popup does not say access ends when the vault seals"
+    echo "store:         asked ($id) for secret-tool from WSL, unverified"
+    grant_popup
+    wait "$storer" || die "secret-tool store failed: $(cat "$base/store.out")"
+    echo "store:         stored"
+
+    # 2. A lookup is its own request.
+    tool "$secret_tool" lookup service "$service" account check >"$base/lookup.out" &
+    looker=$!
+    id=$(pending_request)
+    [ -n "$id" ] || die "the lookup did not reach the vault: $(cat "$base/lookup.out")"
+    grant_popup
+    wait "$looker" || die "secret-tool lookup failed: $(cat "$base/lookup.out")"
+    [ "$(cat "$base/lookup.out")" = wsl-keyring-value ] || die "the lookup returned: $(cat "$base/lookup.out")"
+    check_ends_with_unseal "$(permission "$id")"
+    echo "lookup:        granted until the vault seals; value matches"
+
+    # 3. Again, without a popup.
+    started=$(date +%s%N)
+    reply=$(tool "$secret_tool" lookup service "$service" account check) || die "the second lookup failed: $reply"
+    elapsed=$((($(date +%s%N) - started) / 1000000))
+    [ "$reply" = wsl-keyring-value ] || die "the second lookup returned: $reply"
+    [ -z "$(pending_now)" ] || die "the second lookup asked again ($(pending_now))"
+    echo "lookup again:  no popup, $elapsed ms"
+
+    # 4. Another program asks for itself.
+    cp "$secret_tool" "$base/other-tool"
+    tool "$base/other-tool" lookup service "$service" account check >"$base/other.out" &
+    other=$!
+    id=$(pending_request)
+    [ -n "$id" ] || die "another program did not ask: $(cat "$base/other.out")"
+    permission "$id" | grep -qF "other-tool\"" || die "the request does not name other-tool: $(permission "$id")"
+    factorseal permissions deny "$id" >/dev/null
+    wait "$other" && die "the denied lookup succeeded: $(cat "$base/other.out")"
+    echo "other program: asked ($id, denied)"
+
+    # 5. Sealed: the collection locks. A lookup brings the test Desktop
+    # forward, waits for the unlock, and asks again (WSL grants end with the
+    # seal).
+    factorseal seal >/dev/null
+    for _ in $(seq 175); do
+        [ "$(locked)" = true ] && break
+        sleep 0.2
+    done
+    [ "$(locked)" = true ] || die "the collection is not locked after the seal"
+    echo "sealed:        the collection is locked"
+    tool "$secret_tool" lookup service "$service" account check >"$base/sealed.out" &
+    after=$!
+    sleep 3
+    "$0" test-desktop >/dev/null || die "could not unlock the test vault again"
+    pid=$(desktop_pid)
+    id=$(pending_request)
+    [ -n "$id" ] || die "the lookup after the unlock did not ask again: $(cat "$base/sealed.out") $(cat "$base/host.log")"
+    factorseal permissions deny "$id" >/dev/null
+    wait "$after" && die "the denied lookup after the seal succeeded: $(cat "$base/sealed.out")"
+    echo "after unlock:  asked again ($id, denied)"
     echo "PASS"
     ;;
 esac
