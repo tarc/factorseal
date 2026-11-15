@@ -29,12 +29,16 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
     cargo build --locked --release -p factorseal-desktop
     if ($LASTEXITCODE -ne 0) { throw 'Desktop build failed' }
+    # The WSL broker relays requests from WSL2 distros to the vault. Desktop
+    # grants it a distro's keyring only from beside factorseal.exe.
+    cargo build --locked --release --no-default-features --features vault-client --bin factorseal-wsl-broker
+    if ($LASTEXITCODE -ne 0) { throw 'WSL broker build failed' }
     $metadataJson = cargo metadata --locked --no-deps --format-version 1
     if ($LASTEXITCODE -ne 0) { throw 'cargo metadata failed' }
     $metadata = $metadataJson | ConvertFrom-Json
     $factorseal = Join-Path $metadata.target_directory "release/factorseal.exe"
     $desktop = Join-Path $metadata.target_directory 'release/factorseal-desktop.exe'
-    $helpers = @('factorseal-parser', 'factorseal-network', 'factorseal-browser') | ForEach-Object { Join-Path $metadata.target_directory "release/$_.exe" }
+    $helpers = @('factorseal-parser', 'factorseal-network', 'factorseal-browser', 'factorseal-wsl-broker') | ForEach-Object { Join-Path $metadata.target_directory "release/$_.exe" }
     if (-not [string]::IsNullOrWhiteSpace($SigningCertificateThumbprint)) {
         $thumbprint = $SigningCertificateThumbprint.Replace(' ', '')
         if ($thumbprint -notmatch '^[0-9A-Fa-f]{40}$') {

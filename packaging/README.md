@@ -17,8 +17,9 @@ artifact is ready to release:
   `FACTORSEAL_MACOS_DEVELOPMENT_TEAM` to enable team signing.
   Without a team, the package is only for build tests;
 - `build-windows.ps1` creates a ZIP containing Desktop, the CLI and helper
-  executables, the askpass helper, Scheduled Task installer, and one-command
-  physical acceptance runner;
+  executables, the WSL broker (`factorseal-wsl-broker.exe`, through which
+  WSL2 distros reach the vault), the askpass helper, Scheduled Task
+  installer, and one-command physical acceptance runner;
 - `build-windows-msix.ps1` creates the Desktop MSIX submitted to the
   Microsoft Store. Its Start menu entry opens Desktop, and its `factorseal.exe`
   execution alias opens the CLI. The Store package intentionally does not install
@@ -58,9 +59,9 @@ acceptance is separate from archive smoke testing.
 Use the release-candidate runners in [`acceptance/`](../acceptance/README.md)
 on physical hosts and attach their redacted output to the release approval.
 
-A Windows ZIP release build signs Desktop, the CLI, and both helpers with
-`signtool.exe`, requires an RFC 3161 timestamp URL, and verifies the resulting
-Authenticode signatures before packaging them:
+A Windows ZIP release build signs Desktop, the CLI, the helpers and the WSL
+broker with `signtool.exe`, requires an RFC 3161 timestamp URL, and verifies
+the resulting Authenticode signatures before packaging them:
 
 ```powershell
 .\packaging\build-windows.ps1 `
