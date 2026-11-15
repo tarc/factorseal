@@ -223,7 +223,7 @@ pub fn validate_distro(distro: &str) -> VaultResult<()> {
 
 /// The item holding a Secret Service collection's index (labels and
 /// attributes, no secrets), as the adapter names it.
-const SECRET_SERVICE_INDEX_ITEM: &str = "secret-service-index";
+pub const SECRET_SERVICE_INDEX_ITEM: &str = "secret-service-index";
 
 /// Check a Windows vault root before it becomes an argument of Desktop.
 fn validate_windows_root(root: &str) -> VaultResult<()> {

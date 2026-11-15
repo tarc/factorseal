@@ -447,7 +447,12 @@ vault sealed brings Desktop forward too. While installed, the host checks the
 vault by its idle deadline (a status request does not extend the lease) and
 whenever a request finds it sealed; those checks, and the one at start-up,
 go through a broker started with `--no-desktop`, so the host never brings
-Desktop forward by itself, for instance when the vault idle-seals. The host does not run the NetworkManager
+Desktop forward by itself, for instance when the vault idle-seals. When the
+vault refuses the host's own read of the keyring's index without asking
+anyone (the distro is switched off in Desktop), the collection reports
+locked rather than failing each call; the host says once how to switch it
+on and tries again later, waiting longer each time (up to ten minutes), or
+at once when a client asks to unlock. The host does not run the NetworkManager
 agent. WSL keyring items appear in Desktop's inventory and backups under
 their distro's namespace.
 
