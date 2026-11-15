@@ -304,7 +304,11 @@ until the user has seen it in the native build.
    starting with `factorseal` once Nix's wrapper naming is undone (leading
    dots and repeated `-wrapped`: a NixOS Desktop runs as
    `.factorseal-desktop-wrapped`), never a full path, since NixOS store
-   paths change per build.
+   paths change per build. A non-dumpable owner hides `/proc/<pid>/exe`
+   even from its own user: NixOS's gnome-keyring runs through a capability
+   wrapper (`cap_ipc_lock`), and FactorSeal's own agent drops dumpability
+   (`harden_key_owner`). Then `/proc/<pid>/comm` and the program in
+   `/proc/<pid>/cmdline` decide, FactorSeal if either looks like it.
 
    An unlock prompt unanswered for five minutes is dismissed
    (`Prompt.Dismiss`) and its collection reported as "unlock timed out": a
@@ -387,9 +391,15 @@ until the user has seen it in the native build.
    WSL and native partitions, values never in the response, the pinned
    fingerprint from step 3. Mutation: no manager check.
 6. **Desktop: check and move** (Settings → WSL keyrings, per distro row).
-   - "Check gnome-keyring" runs `wsl.exe -d <distro> -- sh -lc 'exec
+   - "Check gnome-keyring" runs `wsl.exe -d <distro> --exec sh -lc 'exec
      factorseal export-secret-service --inventory --framed'` and compares
-     the result with `ListKeyringFingerprints`.
+     the result with `ListKeyringFingerprints`. `--exec`, not `--`: with
+     `--`, WSL hands the command line to the user's login shell (zsh on
+     poita), which parses and expands it before `sh` runs; `--exec` runs
+     `sh` directly (seen on poita, 2026-11-15). Desktop starts `wsl.exe`
+     from Rust with standard Windows argument quoting, to be checked
+     natively (PowerShell 5.1's own quoting of native arguments mangles
+     embedded quotes, so it is no guide).
    - "Move N items" generates a one-time passphrase: 32 characters from the
      OS random source, from an alphabet that passes `validate_new_password`
      (a test asserts that). It runs the `--framed --passphrase-stdin` form,
@@ -490,7 +500,10 @@ until the user has seen it in the native build.
    `org.freedesktop.secrets` activation file, which would compete with the
    home-manager gnome-keyring, and its assertion doesn't catch that.
    gnome-keyring stays. This turns the pending `mode = "wsl"` edit into two
-   edits; the user runs `just switch`.
+   edits; the user runs `just switch`. Done 2026-11-15 (factorseal input
+   at 5dffff3; the full edit kept as a system-flakes stash). That build
+   lacks 4d5dde5, so the installed CLI refuses NixOS's gnome-keyring
+   ("Permission denied") until the input is bumped past it.
 2. **Windows**: the installer (or a manual install) puts this build in
    place. Its WSL step runs `wsl-setup` in NixOS, then it opens Desktop's
    WSL keyrings page.
@@ -522,8 +535,15 @@ until the user has seen it in the native build.
   Documented in the backup docs and `CHANGELOG.md`.
 - **Environment of a `wsl.exe` command**: `factorseal` on `PATH`, the
   session bus (`XDG_RUNTIME_DIR/bus`) and WSLg's display for the gcr prompt
-  must be there in a `sh -lc` started by `wsl.exe`. Check this on poita in
-  step 6 before relying on it. The frame (step 4) covers what the login
+  must be there in a `sh -lc` started by `wsl.exe`. Checked on poita
+  (2026-11-15, after the package-only switch), from PowerShell through
+  `wsl.exe -d NixOS --exec sh -lc …`: `factorseal` at
+  `/run/current-system/sw/bin`, `XDG_RUNTIME_DIR=/run/user/1000`,
+  `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus` (socket present),
+  `DISPLAY=:0`, `WAYLAND_DISPLAY=wayland-0`; `factorseal` is on `PATH`
+  without `-l` too. The inventory came framed, with nothing before the
+  frame. The gcr prompt itself is untested (the collection was
+  unlocked); step 8 covers it. The frame (step 4) covers what the login
   shell prints.
 - **KWallet's Secret Service interface** should work the same way, but it is
   untested; the docs name only gnome-keyring.
@@ -836,3 +856,27 @@ on main), CLI 93 passed; `scripts/test-keyring-import.sh` passes.
   is unchanged; gnome-keyring imports (always with attributes, ids under
   another tag) can't collide with relocated ids; 9a98b33 and b927d1b
   change no behaviour.
+
+### Live check on poita
+
+After the package-only switch (rollout step 1, factorseal input at
+5dffff3), the step 6 environment check ran from Windows: PowerShell
+running `wsl.exe -d NixOS --exec sh -lc …` (see "Notes and risks" for what
+the shell had).
+
+- **Defect found and fixed in 4d5dde5:** `export-secret-service` refused
+  with "cannot identify the Secret Service: Permission denied". NixOS's
+  gnome-keyring runs with `cap_ipc_lock` through
+  `/run/wrappers/bin/gnome-keyring-daemon` (`CapEff 0x4000`), so it isn't
+  dumpable and `/proc/<pid>/exe` can't be read; FactorSeal's agent isn't
+  dumpable either. The check now falls back to `comm` and `cmdline`
+  (step 2). The step 7 script couldn't catch it: nixpkgs' unwrapped
+  daemon is dumpable. A test makes a non-dumpable child and identifies it
+  (failed before with os error 13; ignoring the names fails it).
+- **`wsl.exe --` goes through the user's shell:** zsh expanded `$0` and
+  `$(…)` before `sh` ran. Step 6 now uses `--exec`.
+- **Result with the fix** (debug build, same path): the frame arrived
+  intact; target `wsl:NixOS`; 15 items in the collection `Default`,
+  unlocked, none skipped. Gate: fmt, clippy, lib 555 passed, 1 failed,
+  6 ignored (`libsecret_store_seal_lookup` times out, as on main), CLI 93
+  passed; `scripts/test-keyring-import.sh` passes.
