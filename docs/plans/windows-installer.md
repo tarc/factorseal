@@ -1,7 +1,8 @@
 # Plan: a small Windows installer (`factorseal-setup.exe`)
 
-Status, 2026-11-15: planned, not started. Branch: `feature/wsl2-keyring`.
-It hands off to Desktop's gnome-keyring check and move, planned in
+Status, 2026-11-15: planned, not started; review folded in (see "Review
+record" at the end). Branch: `feature/wsl2-keyring`. It hands off to
+Desktop's gnome-keyring check and move, planned in
 [gnome-keyring-import.md](gnome-keyring-import.md).
 
 ## Goal
@@ -18,11 +19,13 @@ plus manual steps:
 
 **The installer does not change when FactorSeal does.** A new version of
 FactorSeal is a folder of artifacts plus a release manifest that describes
-them. The same `factorseal-setup.exe`, byte for byte, installs it. The
-installer is closed to modification and open to extension through the
-manifest and through hooks the product itself ships. An unchanged installer
-keeps its file hash, so antivirus and SmartScreen reputation built up for it
-carries over, and nothing about installing needs re-reviewing per release.
+them. The same `factorseal-setup.exe`, byte for byte, installs it: the
+binary is built once and stored, not rebuilt per release (see step 8),
+since MSVC builds aren't reproducible by default. The installer is closed
+to modification and open to extension through the manifest and through
+commands the product itself ships. An unchanged installer keeps its file
+hash, so antivirus and SmartScreen reputation built up for it carries over,
+and nothing about installing needs re-reviewing per release.
 
 The installer sits beside the ZIP and the Store MSIX
 (`packaging/README.md`); it does not replace either.
@@ -33,20 +36,22 @@ The installer sits beside the ZIP and the Store MSIX
    pipeline: no new tools on the Windows machine, testable in our harness.
    The Installed apps entry and the uninstaller are ours.
 2. **WSL: distros that already have `factorseal`** (NixOS through the
-   module). For a distro without it, the installer shows what to add. No
-   Linux binary in the Windows installer.
+   package, later the module). For a distro without it, the installer shows
+   what to add. No Linux binary in the Windows installer.
 3. **The gnome-keyring check and move live in Desktop**; the installer only
    opens that page at the end.
 4. **Release manifest, fixed installer.** The installer embeds no payload.
    It reads a `factorseal-release.json` that points at the release's
    artifacts (paths relative to the manifest, each with its SHA-256) and
    lists the install steps as data. Behavior that belongs to a version (how
-   to quit Desktop, how to set up WSL, which page to open) is a command of
-   that version's own executables, named in its manifest. Releasing means
-   building the artifacts and writing the manifest; the setup crate is
-   rebuilt only when the installer itself gains a capability.
+   to quit Desktop, which page to open) is a command of that version's own
+   executables, named in its manifest. WSL setup is the exception: its
+   three command lines are fixed by the installer (see "The rules"), since
+   they are the product CLI's stable interface. Releasing means building
+   the artifacts and writing the manifest. The setup crate is rebuilt only
+   when the installer itself gains a capability.
 
-## Facts this rests on (checked 2026-11-15 on fdb0cb3)
+## Facts this rests on (checked 2026-11-15 on fdb0cb3, re-checked on 52e7f5b)
 
 - **Package contents** (`build-windows.ps1`):
   - executables: `factorseal.exe`, `factorseal-desktop.exe`,
@@ -57,6 +62,12 @@ The installer sits beside the ZIP and the Store MSIX
   - The user's install also needs a `factorseal.exe` built with
     `secretspec-provider` (the SecretSpec claim points at it); ZIP builds
     leave that feature out.
+  - Desktop grants a distro's keyring to the WSL broker only when it runs
+    from beside `factorseal.exe` (`build-windows.ps1:33`).
+- **`build-windows.sh release` already exists**
+  (`scripts/windows-desktop-check/build-windows.sh:74`). It builds Desktop
+  and the CLI into the Windows mirror's `target`, and the
+  `windows-desktop-check` skill and our notes use it.
 - **The user's install today** (manual, since 2026-09-28):
   - Program files: `%LOCALAPPDATA%\Programs\FactorSeal`.
   - Shortcuts: Start menu, desktop (OneDrive-redirected), and Startup
@@ -66,20 +77,31 @@ The installer sits beside the ZIP and the Store MSIX
   - The vault is in `%LOCALAPPDATA%\Factorseal\Factorseal\data` with
     TPM-sealed keys. The installer never touches it.
 - **`wsl-setup` already defaults its Windows install folder** to
-  `%LOCALAPPDATA%\Programs\FactorSeal` (`cli.rs`, `WslSetup`), and has
-  `--remove`.
+  `%LOCALAPPDATA%\Programs\FactorSeal` (`cli.rs:337`, `WslSetup`), and has
+  `--remove`. On Linux it exists only with `secretspec-provider`, which
+  `nix/package.nix` enables.
 - **Desktop is single-instance per vault root** (`instance.rs`): a second
-  launch signals the first through an activation file it watches. There is
-  no way to ask it to quit or to open a page.
+  launch signals the first through an activation file it watches
+  (`main.rs:256`, not with `--background` or `--keyring-activation`). There
+  is no way to ask it to quit or to open a page. Desktops built before this
+  plan:
+  - reject an unknown `--quit` and exit, so the running Desktop stays;
+  - treat any change of the activation file as "activate".
 - **Replacing files needs every FactorSeal process stopped.**
   - The vault worker (`factorseal.exe`) runs only while unsealed and exits
     about 0.4 s after a seal.
   - The browser host keeps running after Desktop quits and locks its exe;
     the extension restarts it on demand.
+  - `factorseal-wsl-broker.exe` is started from the install folder by WSL
+    programs through interop (SecretSpec, the keyring relay), and they can
+    relaunch it at any moment. So can native SecretSpec with the
+    provider-enabled `factorseal.exe`, though only for a short time.
   - A plain `taskkill` only hides Desktop.
+  - Windows refuses to rename a folder while an executable inside it runs,
+    the installer's own included.
 - **Desktop lists distros from `HKCU\…\Lxss`** without starting WSL
   (`wsl_distros.rs`). Probing a distro starts it, so the installer asks
-  first.
+  first. Distro names are the user's choice; `NixOS` is only a default.
 - **There are no signing credentials**, so SmartScreen warns about an
   unknown publisher, as for the ZIP. With a fixed installer the warning
   concerns one unchanging file instead of a new one per release.
@@ -98,20 +120,16 @@ A sketch; the schema is part of step 3 and versioned from the start.
     { "path": "factorseal-desktop.exe", "sha256": "…" },
     { "path": "factorseal.exe", "sha256": "…" }
   ],
+  "stop": { "command": ["factorseal-desktop.exe", "--quit"],
+            "also_stop": ["factorseal-browser.exe", "factorseal-wsl-broker.exe"] },
   "steps": [
-    { "stop": { "command": ["factorseal-desktop.exe", "--quit"],
-                "then_wait_for": "install-folder-processes",
-                "also_stop": ["factorseal-browser.exe"] } },
     { "install_files": {} },
     { "shortcut": { "name": "FactorSeal Desktop", "target": "factorseal-desktop.exe",
                     "places": ["start-menu"], "optional_places": ["startup", "desktop"],
                     "startup_args": ["--background"] } },
-    { "start": { "command": ["factorseal-desktop.exe", "--background"] } },
-    { "wsl": { "probe": ["sh", "-lc", "command -v factorseal"],
-               "setup": ["sh", "-lc", "exec factorseal wsl-setup"],
-               "remove": ["sh", "-lc", "exec factorseal wsl-setup --remove"],
-               "missing_hint": { "NixOS": "services.factorseal = { enable = true; mode = \"wsl\"; };" } } },
-    { "open": { "command": ["factorseal-desktop.exe", "--open", "wsl-keyrings"] } }
+    { "wsl": {} },
+    { "start": { "command": ["factorseal-desktop.exe", "--open", "wsl-keyrings"],
+                 "quiet_command": ["factorseal-desktop.exe", "--background"] } }
   ],
   "uninstall": {
     "registry_cleanup": ["HKCU\\Software\\Microsoft\\Edge\\NativeMessagingHosts\\dev.factorseal.browser", "…"],
@@ -121,68 +139,157 @@ A sketch; the schema is part of step 3 and versioned from the start.
 }
 ```
 
-The rules that keep the installer closed and safe:
+`stop` is not a step any more: it is how **this** version is stopped, and
+the installer records it so the next update or the uninstall can stop this
+version once it is the old one. `start` merges the former `start` and
+`open` into one launch, so no two launches race for the instance lock.
+`quiet_command` is used under `--no-open` or `--quiet`.
 
-- **Step types are the installer's vocabulary**: `stop`, `install_files`,
-  `shortcut`, `start`, `wsl`, `open`, `registry` (values under an allowed
-  HKCU prefix only). A release combines and parameterises them freely. A
-  new kind of step is the only reason to change the installer, and then
-  `requires_setup` rises: an older installer refuses that manifest with
-  "this release needs a newer installer" instead of guessing.
-- **Commands run only executables from the release's own verified files**,
-  addressed relative to the install folder, plus `wsl.exe` through the `wsl`
-  step. The manifest cannot name an arbitrary system program or path.
-- **Every artifact is checked against its SHA-256** before anything stops or
-  changes; one mismatch aborts with the old install untouched.
+### The rules that keep the installer closed and safe
+
+- **Step types are the installer's vocabulary**: `install_files`,
+  `shortcut`, `wsl`, `start`, `registry` (values under an allowed prefix
+  only), plus the `stop` and `uninstall` sections. A release combines and
+  parameterises them freely. A new kind of step is the only reason to
+  change the installer, and then `requires_setup` rises: an older installer
+  refuses that manifest with "this release needs a newer installer"
+  instead of guessing. `requires_setup` is one integer, which assumes every
+  installer capability is cumulative. That holds for now; a capability
+  ever removed would need a capability list instead.
+- **Which version's files a command runs**, per phase:
+  - **Stopping the running version** uses the stop command from
+    `install.json`, which the old version's manifest recorded. Its
+    executable must match the hash recorded for it, not the new manifest.
+    Without a record, or without a stop command in it (the hand-made
+    install, or anything built before `--quit`), the installer asks the
+    user to quit FactorSeal from its tray icon, then waits for the install
+    folder's processes. The tray-click simulation our scripts use is not
+    taken into the installer: it relies on gpui-tray's private message
+    number.
+  - **After `install_files`** (`wsl`, `start`, `registry`), commands run
+    the new files in the install folder, now verified copies. The
+    confinement check uses the new manifest's file list.
+- **Commands run only executables from verified files**, addressed relative
+  to the install folder. The manifest cannot name a system program or a
+  path.
+- **WSL commands are the installer's own, not the manifest's.** The `wsl`
+  step only says that WSL setup is part of this release. The installer runs
+  fixed lines through `wsl.exe -d <distro> -- sh -lc …`:
+  - probe: `command -v factorseal`, and `. /etc/os-release; echo $ID` for
+    the hint;
+  - setup: `exec factorseal wsl-setup`;
+  - removal: `exec factorseal wsl-setup --remove`.
+
+  So a tampered manifest can't run arbitrary shell code in a distro. The
+  hint for a distro without `factorseal` is installer text, keyed by the
+  `ID` from `/etc/os-release` (`nixos`), not by the user-chosen distro name.
+  It says to add the `factorseal` package, and that `services.factorseal`
+  comes after moving gnome-keyring's items (import plan, "Rollout on
+  poita"). Other IDs get a generic "install FactorSeal in this distro".
+- **Registry writes and deletions are confined to listed HKCU prefixes**, in
+  the installer, for `registry` and `registry_cleanup` alike:
+  - `Software\<vendor>\NativeMessagingHosts\dev.factorseal.browser` for
+    the four vendors Desktop writes (`src/browser/registration.rs`):
+    `Mozilla`, `Microsoft\Edge`, `Google\Chrome`, `Chromium`;
+  - `Software\Microsoft\Windows\CurrentVersion\Uninstall\FactorSeal`.
+
+  A `Run` value for autostart would join the list only when Desktop
+  actually moves its autostart there.
+- **`ask_to_delete` paths are confined.** They must lie under
+  `%APPDATA%\Factorseal` or `%LOCALAPPDATA%\Factorseal`. Any path that
+  equals or contains the vault root (`%LOCALAPPDATA%\Factorseal\Factorseal\data`)
+  is refused, so "the vault is always kept" is enforced, not only promised.
+- **Hashes are checked twice.** Every artifact is checked before anything
+  stops or changes, so a mismatch aborts early with the old install
+  untouched. Files are then hashed again **while** they are copied into
+  staging, and the staged copies are verified before the swap. A file
+  changed in the release folder between the two checks therefore aborts
+  instead of being installed.
 - **What the installer did is recorded in `install.json`** in the install
-  folder: version, files, shortcuts, registry values, distros set up.
+  folder:
+  - the version, and the files with their hashes;
+  - the shortcuts and registry values it created;
+  - the distros it set up;
+  - the resolved `stop` and `uninstall` sections of the manifest that
+    installed it.
+
   Uninstall and the next update undo from that record, not from the new
-  manifest, so a release can change its steps without stranding what an
-  older one created.
+  manifest, which may be newer or gone. So a release can change its steps
+  without stranding what an older one created.
 - **The manifest is local**: a path the user gives, or the default
-  `dist\factorseal-<version>\factorseal-release.json` that the build
-  writes. A remote source (a release page) would need a signed manifest and
-  the public key in the installer; that is a later extension, not part of
-  this plan.
+  `dist\factorseal-<version>\factorseal-release.json` beside a setup run
+  from the release folder. A remote source (a release page) would need a
+  signed manifest and the public key in the installer; that is a later
+  extension, not part of this plan.
 
 ## Flows
 
 **Install or update.** Run `factorseal-setup.exe [--manifest PATH]`. The
 installed copy in the program folder serves later updates and appears in
-Start as "Update FactorSeal".
+Start as "Update FactorSeal". Started from there, it doesn't know the new
+version's location: without `--manifest` it opens a file picker for a
+`factorseal-release.json`.
 1. Read and verify the manifest and every artifact.
 2. Read `install.json`. A folder without it but with
-   `factorseal-desktop.exe` is the hand-made install: adopt it, and drop
-   `UNINSTALL.txt` after the user agrees.
-3. Run the manifest's steps in order:
+   `factorseal-desktop.exe` is the hand-made install, which gets adopted:
+   - `UNINSTALL.txt` is dropped after the user agrees;
+   - existing shortcuts in the Start menu, Startup and desktop folders
+     (OneDrive-redirected included) whose target is the install folder's
+     `factorseal-desktop.exe` are recorded as found. The `shortcut` step
+     then replaces them, and uninstall removes them.
+3. If the running setup exe lies inside the install folder, it copies
+   itself to `%TEMP%` and relaunches from there with the same arguments,
+   as uninstall does. Otherwise the swap couldn't rename the folder.
+4. Stop the running version (see "Which version's files a command runs"),
+   then wait for every process whose image is in the install folder,
+   `also_stop` included. The browser host is stopped only after the
+   installer has said that a waiting browser fill will be cancelled.
+5. Run the manifest's steps in order:
    - `install_files` stages into a new folder and swaps it in, renaming the
-     old folder aside and restoring it on any failure.
-   - The setup exe copies itself into the folder only if its version is
-     newer than the copy already there.
-4. Register in Installed apps
+     old folder aside and restoring it on any failure. The setup exe copies
+     itself into the **staging** folder when its version is newer than the
+     installed copy, and carries the installed copy over otherwise, so it
+     isn't lost with the old folder.
+   - `wsl`: the distro page (below), then setup in the chosen distros.
+   - `start`: one launch of the new Desktop, on the WSL keyrings page. With
+     the vault sealed (it always is after a stop), Desktop shows the unlock
+     first and then the page.
+6. Register in Installed apps
    (`HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\FactorSeal`,
    the version from the manifest, and `UninstallString` pointing at the
    installed setup with `--uninstall`).
 
+A WSL program or SecretSpec can relaunch the broker or the CLI between the
+stop and the swap. The swap then fails and rolls back, leaving the old
+install intact, and the installer says which process held the folder.
+
 **Uninstall.**
-1. The `stop` step of the recorded version.
-2. The recorded `wsl` removals.
-3. Delete the recorded shortcuts and registry values, the manifest's
-   `registry_cleanup` keys, the Installed apps key and the folder, running
-   from a temporary copy so the setup exe can delete itself.
-4. Ask before deleting the `ask_to_delete` paths.
-5. Show the `keep_note`. **The vault is always kept.**
+1. Relaunch from a temporary copy, so the setup exe can delete itself.
+2. The first page lists what will be removed. That includes the recorded
+   distros, with the warning that removal starts them; the user can untick
+   them. Under `--quiet`, `--wsl` or `--no-wsl` is required.
+3. The recorded stop command, or the ask-to-quit fallback.
+4. The recorded `wsl` removals, in the distros the user kept.
+5. Delete the recorded shortcuts and registry values, the recorded
+   `registry_cleanup` keys (confined as above), the Installed apps key and
+   the folder.
+6. Ask before deleting the recorded `ask_to_delete` paths (confined as
+   above).
+7. Show the recorded `keep_note`. **The vault is always kept.**
 
 **UI**: Win32 task dialogs (`TaskDialogIndirect`): native, accessible
 through UI Automation, small. Four pages:
 1. Install or update: current and new version, and the optional places;
 2. Progress;
-3. WSL distros;
+3. WSL distros (ask before probing; the hint for those without FactorSeal);
 4. Done.
 
-`--quiet` with explicit options (`--install-dir`, `--no-wsl`, `--no-start`)
-is for our harness and scripts. The texts come from the installer, never the
-manifest, apart from version strings and the per-distro hint.
+`--quiet` with explicit options (`--install-dir`, `--wsl`/`--no-wsl`,
+`--no-start`, `--no-open`) is for our harness and scripts. Task dialogs
+can't run headless, so `--quiet` reports through its exit code (0 success,
+non-zero per failure class) and a log file (`--log PATH`, default
+`%TEMP%\factorseal-setup.log`). The texts come from the installer, never
+the manifest, apart from version strings.
 
 ## Steps
 
@@ -193,13 +300,17 @@ in the native build.
 
 1. **Desktop `--quit`**: a second launch with `--quit` asks the running
    Desktop of that root, through the instance channel, to seal and exit; it
-   returns once it has, or fails after a timeout. Unit test on the instance
-   channel; live: the test Desktop unlocked, `--quit`, no FactorSeal process
-   left. This also replaces the tray-click dance in our scripts
-   (`drive.ps1`, the install notes).
+   returns once it has, or fails after a timeout. The request is a new,
+   distinct message, so an older Desktop that receives it only activates;
+   the installer's timeout and fallback cover that case. Unit test on the
+   instance channel. Live: the test Desktop unlocked, `--quit`, no
+   FactorSeal process left. This also replaces the tray-click dance in our
+   scripts (`drive.ps1`, the install notes) for Desktops that have it.
 2. **Desktop `--open <page>`**: the same channel brings Desktop forward on a
-   page (`wsl-keyrings` first). It changes navigation, so the user sees it
-   natively.
+   page (`wsl-keyrings` first). When the launch becomes the primary
+   instance itself (nothing running), it starts on that page. A sealed
+   vault shows the unlock first and then the page. It changes navigation,
+   so the user sees it natively.
 3. **Manifest schema and verification** (new crate
    `packaging/windows/setup`; the parsing and checks are plain Rust, tested
    on Linux too):
@@ -207,47 +318,80 @@ in the native build.
    - paths confined to the release folder (no `..`, no absolute paths,
      no links out);
    - commands confined to verified release files;
-   - registry values confined to the allowed HKCU prefixes;
+   - registry values and `registry_cleanup` keys confined to the listed
+     HKCU prefixes;
+   - `ask_to_delete` confined, and the vault root refused;
    - every hash checked before any change.
 
    Tests cover each refusal. One test pins that a manifest written for
    schema 1 with a new version and new files installs with an unchanged
    installer.
-4. **Install engine**: `install_files` with staging, swap and rollback,
-   adopting a hand-made install, and `install.json` as the record undo works
-   from. Native tests in temporary folders: a failed copy rolls back, a
-   locked file stops the update cleanly, and an update whose new manifest
-   drops a shortcut still removes the old one.
-5. **Steps `shortcut`, `registry`, `start`, `open`, and uninstall**: the
-   registry root is configurable so tests write under a test key, never the
-   real Uninstall key; uninstall self-deletion. Native tests.
-6. **Step `stop`**: the command, the process wait scoped to the install
-   folder, `also_stop`. Live on a test install with the test vault.
-7. **Step `wsl`** behind a command runner trait: probe, setup, remove,
-   hints. Tests with a fake runner; the real run is on the user's NixOS
-   during rollout, with consent.
-8. **The build writes the manifest**: `build-windows.sh release` puts the
-   artifacts (provider-enabled `factorseal.exe` included) and
-   `factorseal-release.json` in `dist\factorseal-<version>\`.
-   `build-windows.sh setup` builds the installer on its own, only when its
-   crate changes. A check builds two releases and asserts that the installer
-   is the same file for both. Record the outputs in the footprint ledger.
-9. **Task dialog UI**: the four pages, then the user tries it natively
-   (install into a test folder, update to a second build with the same
-   installer, uninstall) before it is committed.
-10. **Docs**:
+4. **Install engine**: `install_files` with hashing while staging, staged
+   verification, swap and rollback. Also the relaunch from `%TEMP%`, the
+   self-copy into staging, adopting a hand-made install (shortcuts
+   included), and `install.json` as the full record undo works from. Native
+   tests in temporary folders:
+   - a failed copy rolls back;
+   - a locked file stops the update cleanly;
+   - an artifact changed between verify and copy aborts;
+   - an update whose new manifest drops a shortcut still removes the old
+     one;
+   - an update run from inside the install folder succeeds through the
+     relaunch.
+5. **Steps `shortcut`, `registry`, `start`**: the registry root is
+   configurable so tests write under a test key, never the real Uninstall
+   key. Native tests.
+6. **Stopping**: the recorded command checked against its recorded hash,
+   the process wait scoped to the install folder, `also_stop`, and the
+   ask-to-quit fallback (no record, or no stop command). Live on a test
+   install with the test vault: a stop through `--quit`, and one through
+   the fallback with a Desktop built before step 1.
+7. **Step `wsl`** behind a command runner trait: the fixed probe, setup and
+   removal lines, the `/etc/os-release` hint, consent. Tests with a fake
+   runner. The real run is on the user's NixOS during rollout, with
+   consent.
+8. **Uninstall**: everything recorded is undone; self-deletion; the distro
+   consent; the confinement of `registry_cleanup` and `ask_to_delete`; the
+   vault untouched. Native tests under the test registry root and a
+   temporary folder (with a fake WSL runner).
+9. **The build writes the release**: a new mode, `build-windows.sh dist`,
+   leaving `release` as it is for its current callers.
+   - It puts the artifacts and `factorseal-release.json` in
+     `dist\factorseal-<version>\`. Its `factorseal.exe` is built with
+     `secretspec-provider`. The ZIP (`build-windows.ps1`) stays without the
+     feature, as upstream ships it, so the two packages differ in that
+     feature only, and `packaging/README.md` says so.
+   - It checks that its Desktop was built without the import plan's
+     `wsl-test-hooks` feature.
+   - The installer binary is built by `build-windows.sh setup` only when the
+     setup crate changes. It is stored in the Windows mirror as
+     `dist\setup\factorseal-setup-<setup version>.exe`, with its SHA-256 in
+     `dist\setup\SHA256SUMS`, and recorded in the footprint ledger. `dist`
+     copies the stored binary into the release folder and never rebuilds
+     it.
+   - The check asserts that copying, not reproducibility: two `dist` runs
+     give an installer equal to the stored file. Making MSVC builds
+     reproducible (`/Brepro`, path remapping) is not attempted.
+10. **Task dialog UI**: the four pages and the uninstall page. Then the
+    user tries it natively (install into a test folder, update to a second
+    build with the same installer, uninstall) before it is committed.
+11. **Docs**:
     - `packaging/README.md`: the installer beside the ZIP and MSIX, the
-      manifest, SmartScreen.
+      manifest, the provider feature difference, SmartScreen.
     - `usage.md`: Windows install and update.
     - The WSL keyring section points at the installer.
-    - A short "Releasing" note: build, manifest, run the installed setup.
-11. **Rollout on the user's machine**, with the user, as step 2 of "Rollout
+    - A short "Releasing" note: `build-windows.sh dist`, the stored
+      installer, run the installed setup.
+12. **Rollout on the user's machine**, with the user, as step 2 of "Rollout
     on poita" in the import plan:
     1. back up the vault first;
     2. the installer adopts the hand-made install and updates it from this
-       build's manifest;
+       build's manifest. The old Desktop predates `--quit`, so this run
+       takes the ask-to-quit fallback;
     3. the WSL step runs in NixOS;
-    4. Desktop opens on WSL keyrings.
+    4. Desktop opens on WSL keyrings, behind the unlock;
+    5. a WSL keyring lookup still works through the broker from the new
+       folder.
 
     Later versions then go through "Update FactorSeal" with a new manifest.
     Update the `project_windows_install` notes: the uninstaller replaces
@@ -256,8 +400,9 @@ in the native build.
 ## Order with the import plan
 
 1. Import core: steps 1–4 and 7 of the import plan (CLI usable by hand).
-2. The vault action and the Desktop page: import steps 5, 6 and 8.
-3. This installer, steps 1–10.
+2. The vault action and the Desktop page: import steps 5, 6 and 8, then its
+   docs (step 9).
+3. This installer, steps 1–11.
 4. Rollout: the import plan's "Rollout on poita", with this installer as its
    step 2.
 
@@ -265,18 +410,81 @@ in the native build.
 
 - **Updates while a browser fill waits**: stopping the browser host cancels
   it. The installer says so before stopping it.
-- **The update swaps folders**, so a running process the wait missed (one
-  started from elsewhere) makes the swap fail. The update then rolls back,
-  leaving the old install intact.
+- **The update swaps folders**, so a running process the wait missed, or one
+  relaunched after it (the broker, the SecretSpec CLI), makes the swap
+  fail. The update then rolls back, leaving the old install intact.
 - **A storage migration in a new version**: Desktop runs it at the next
   unlock, as today. The installer does not back up the vault itself, but
   the rollout step does, and the docs advise an export before major updates.
-- **The manifest is code in disguise**: it decides what runs. The limits
-  above (step vocabulary, verified release executables, HKCU prefixes,
-  confined paths) are what keep a tampered manifest from doing more than a
-  tampered release folder could anyway. A remote source needs signing first.
+- **The manifest is code in disguise**: it decides what runs on Windows.
+  The limits above (step vocabulary, verified release executables, fixed
+  WSL lines, HKCU prefixes, confined paths) keep a tampered manifest from
+  doing more than a tampered release folder could anyway: the release's
+  unsigned executables run regardless. A remote source needs signing first.
 - **Antivirus**: a fixed installer helps with the installer, not with the
   product's new executables, which are unsigned and new each release.
   Signing the release files is the real fix, outside this plan.
 - **Upstream ships the ZIP and the Store MSIX**; this installer is
   additional packaging, kept separate in `packaging/windows/setup`.
+
+## Review record
+
+The review of 2026-11-15 (against 52e7f5b) is folded in above. Each finding
+and what became of it:
+
+1. **The first stop can't use `--quit`.** Accepted. "Which version's files a
+   command runs" adds the ask-to-quit fallback, used without a record or a
+   recorded stop command. The rollout names it, and step 6 tests it live.
+   The tray-message candidate was rejected for the installer: it depends on
+   gpui-tray's private message number, which a fixed installer can't track.
+2. **Which version's commands run.** Accepted: the rule per phase, with stop
+   checked against the record's hashes.
+3. **`install.json` lacks what undo needs.** Accepted: it records the
+   resolved `stop` and `uninstall` sections and file hashes.
+4. **Update can't swap the folder it runs from.** Accepted:
+   - the relaunch from `%TEMP%` (Flows, step 3);
+   - the self-copy into staging;
+   - the file picker or `--manifest` for "Update FactorSeal".
+5. **Verify-then-copy window.** Accepted: hashing while staging and staged
+   verification, with a test.
+6. **The `wsl` step runs arbitrary shell code.** Accepted, with the
+   recommended option: the installer owns the three lines, and the manifest
+   only enables the step.
+7. **`registry_cleanup` and `ask_to_delete` unconfined.** Accepted:
+   - the prefixes are listed;
+   - paths are confined, and the vault root is refused.
+
+   `Run` is left off the list until an autostart uses it.
+8. **Byte-identical means a stored binary.** Accepted in all parts:
+   - the binary is stored in `dist\setup\` with its hash;
+   - the check asserts copying, not reproducibility;
+   - the new mode is named `dist`, since `release` exists
+     (`build-windows.sh:74`, confirmed);
+   - the ZIP keeps the CLI without the provider feature, and the release
+     has it.
+9. **The hint contradicts the two-switch rollout, and is keyed by name.**
+   Accepted: the hint is installer text keyed by `/etc/os-release` `ID`,
+   saying "add the package" first. It is consistent with the import plan's
+   rollout step 1.
+10. **Processes the stop must expect.** Accepted:
+    - the broker in `also_stop`;
+    - the relaunch window and rollback written down (Flows, Notes);
+    - a live WSL lookup after the update (rollout step 5).
+11. **`open` right after `start`.** Accepted:
+    - `start` and `open` merged into one launch, which removes the race;
+    - the sealed vault shows the unlock first (step 2).
+12. **Uninstall starts distros.** Accepted: the uninstall page lists them
+    with consent, and `--quiet` requires `--wsl`/`--no-wsl`.
+13. **Smaller points.** All accepted:
+    - uninstall moved to its own step 8, after stop and `wsl`;
+    - adoption records the existing shortcuts by target;
+    - `requires_setup` documented as cumulative;
+    - `--quiet` uses exit codes and a log file.
+
+The review's deliberate exclusions stay out of scope here as well:
+- code signing, SmartScreen and antivirus beyond the notes;
+- the remote manifest;
+- the MSIX and the ZIP (apart from noting the provider-feature
+  difference);
+- the dialog wording, left to the native review;
+- Rust versus WiX or Inno, already decided with the user.
