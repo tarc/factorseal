@@ -5172,3 +5172,328 @@ fn an_unlock_without_wsl_keyrings_writes_nothing() {
         .unwrap();
     assert_eq!(authorization_generation(&directory), before);
 }
+
+fn keyring_item(
+    id: &str,
+    attributes: &[(&str, &str)],
+    label: &str,
+    modified: u64,
+) -> crate::vault::secret_service_data::IndexItem {
+    crate::vault::secret_service_data::IndexItem {
+        id: id.into(),
+        label: label.into(),
+        attributes: attributes
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect(),
+        content_type: "text/plain".into(),
+        created: modified,
+        modified,
+    }
+}
+
+fn import_keyring_item(
+    service: &VaultService,
+    manager: &CallerIdentity,
+    partition: &[u8],
+    item: &crate::vault::secret_service_data::IndexItem,
+    value: &[u8],
+    replace_existing: bool,
+    now: u64,
+) -> VaultEntryImportStatus {
+    use crate::vault::secret_service_data::PortableItem;
+    let entry = VaultEntryMetadata {
+        access_project: None,
+        display_name: None,
+        display_type: None,
+        display_username: None,
+        display_website: None,
+        updated_at: None,
+        favorite: false,
+        document_kind: DocumentKind::LinuxSecretService,
+        partition: partition.to_vec(),
+        address: item.address().unwrap(),
+    };
+    let imported = service.handle(
+        manager,
+        VaultRequest::new(VaultAction::ImportVaultEntry {
+            entry,
+            value: PortableItem::new(item.clone(), WireSecret::new(value.to_vec()).unwrap())
+                .encode()
+                .unwrap(),
+            evict_at: None,
+            replace_existing,
+        })
+        .unwrap(),
+        now,
+    );
+    match imported.result {
+        Ok(VaultResponseBody::VaultEntryImported { status }) => status,
+        other => panic!("import failed: {other:?}"),
+    }
+}
+
+/// Every keyring item in `partition`, in index order, read back through
+/// the index and exported with its value.
+fn keyring_items(
+    service: &VaultService,
+    manager: &CallerIdentity,
+    partition: &[u8],
+    now: u64,
+) -> Vec<(crate::vault::secret_service_data::IndexItem, Vec<u8>)> {
+    use crate::vault::secret_service_data::PortableItem;
+    let listed = service.handle(
+        manager,
+        VaultRequest::new(VaultAction::ListVaultEntries {
+            cursor: None,
+            limit: 8,
+        })
+        .unwrap(),
+        now,
+    );
+    let VaultResponseBody::VaultEntries { entries, .. } = listed.result.unwrap() else {
+        panic!("expected the inventory");
+    };
+    let mut items: Vec<_> = entries
+        .into_iter()
+        .filter(|entry| entry.partition == partition)
+        .map(|entry| {
+            let exported = service.handle(
+                manager,
+                VaultRequest::new(VaultAction::ExportVaultEntry {
+                    entry: entry.clone(),
+                })
+                .unwrap(),
+                now,
+            );
+            let Ok(VaultResponseBody::VaultEntrySecret { value, .. }) = exported.result else {
+                panic!("expected the exported item, got {:?}", exported.result);
+            };
+            let portable = PortableItem::decode(value.expose(), &entry.address).unwrap();
+            (portable.item, portable.value.expose().to_vec())
+        })
+        .collect();
+    items.sort_by(|a, b| a.0.id.cmp(&b.0.id));
+    items
+}
+
+fn keyring_partitions() -> [Vec<u8>; 2] {
+    [
+        crate::vault::secret_service_data::NAMESPACE.to_vec(),
+        crate::vault::wsl_relay::wsl_keyring_namespace("NixOS").unwrap(),
+    ]
+}
+
+const GH: &[(&str, &str)] = &[("service", "gh:github.com"), ("username", "octo")];
+
+#[test]
+fn a_restored_keyring_item_with_identical_attributes_is_kept() {
+    for partition in keyring_partitions() {
+        let (_directory, service) = service(100, UnsealLeasePolicy::default());
+        let manager = caller();
+        service.authorize_permission_manager(&manager, 100).unwrap();
+        let old = keyring_item("11111111111111111111111111111111", GH, "old", 5);
+        let new = keyring_item("22222222222222222222222222222222", GH, "new", 9);
+        assert_eq!(
+            import_keyring_item(&service, &manager, &partition, &old, b"one", false, 101),
+            VaultEntryImportStatus::Added
+        );
+        assert_eq!(
+            import_keyring_item(&service, &manager, &partition, &new, b"two", false, 102),
+            VaultEntryImportStatus::KeptExisting
+        );
+        assert_eq!(
+            keyring_items(&service, &manager, &partition, 103),
+            vec![(old, b"one".to_vec())]
+        );
+    }
+}
+
+#[test]
+fn a_replaced_keyring_item_keeps_its_id_and_created_time() {
+    for partition in keyring_partitions() {
+        let (_directory, service) = service(100, UnsealLeasePolicy::default());
+        let manager = caller();
+        service.authorize_permission_manager(&manager, 100).unwrap();
+        let old = keyring_item("11111111111111111111111111111111", GH, "old", 5);
+        let mut new = keyring_item("22222222222222222222222222222222", GH, "new", 9);
+        new.created = 7;
+        new.content_type = "application/octet-stream".into();
+        import_keyring_item(&service, &manager, &partition, &old, b"one", false, 101);
+        assert_eq!(
+            import_keyring_item(&service, &manager, &partition, &new, b"two", true, 102),
+            VaultEntryImportStatus::Replaced
+        );
+        let expected = crate::vault::secret_service_data::IndexItem {
+            id: old.id.clone(),
+            created: old.created,
+            ..new
+        };
+        assert_eq!(
+            keyring_items(&service, &manager, &partition, 103),
+            vec![(expected, b"two".to_vec())]
+        );
+    }
+}
+
+#[test]
+fn the_second_of_two_identical_restored_keyring_items_is_kept() {
+    for partition in keyring_partitions() {
+        let (_directory, service) = service(100, UnsealLeasePolicy::default());
+        let manager = caller();
+        service.authorize_permission_manager(&manager, 100).unwrap();
+        let first = keyring_item("11111111111111111111111111111111", GH, "first", 5);
+        let second = keyring_item("22222222222222222222222222222222", GH, "second", 6);
+        let statuses: Vec<_> = [(&first, b"one"), (&second, b"two")]
+            .into_iter()
+            .map(|(item, value)| {
+                import_keyring_item(&service, &manager, &partition, item, value, false, 101)
+            })
+            .collect();
+        assert_eq!(
+            statuses,
+            [
+                VaultEntryImportStatus::Added,
+                VaultEntryImportStatus::KeptExisting
+            ]
+        );
+        assert_eq!(
+            keyring_items(&service, &manager, &partition, 102),
+            vec![(first, b"one".to_vec())]
+        );
+    }
+}
+
+#[test]
+fn a_restored_keyring_item_whose_id_is_taken_gets_a_new_id() {
+    for partition in keyring_partitions() {
+        for replace_existing in [false, true] {
+            let (_directory, service) = service(100, UnsealLeasePolicy::default());
+            let manager = caller();
+            service.authorize_permission_manager(&manager, 100).unwrap();
+            let id = "11111111111111111111111111111111";
+            let old = keyring_item(id, &[("service", "changed")], "old", 5);
+            let new = keyring_item(id, GH, "new", 9);
+            import_keyring_item(&service, &manager, &partition, &old, b"one", false, 101);
+            assert_eq!(
+                import_keyring_item(
+                    &service,
+                    &manager,
+                    &partition,
+                    &new,
+                    b"two",
+                    replace_existing,
+                    102
+                ),
+                VaultEntryImportStatus::Added
+            );
+            let items = keyring_items(&service, &manager, &partition, 103);
+            assert_eq!(items.len(), 2, "{items:?}");
+            assert_eq!(items[0], (old.clone(), b"one".to_vec()));
+            assert_ne!(items[1].0.id, id);
+            assert_eq!(
+                items[1],
+                (
+                    crate::vault::secret_service_data::IndexItem {
+                        id: items[1].0.id.clone(),
+                        ..new.clone()
+                    },
+                    b"two".to_vec()
+                )
+            );
+        }
+    }
+}
+
+#[test]
+fn a_restored_keyring_item_matches_the_first_of_existing_duplicates() {
+    use crate::vault::secret_service_data::{INDEX_ITEM, Index};
+    use crate::vault::{DocumentOperation, SecretAddress};
+    for partition in keyring_partitions() {
+        let (_directory, service) = service(100, UnsealLeasePolicy::default());
+        let manager = caller();
+        service.authorize_permission_manager(&manager, 100).unwrap();
+        // Two attribute-identical items already in the vault, as
+        // CreateItem with replace=false leaves them. Index order puts the
+        // higher id first.
+        let first = keyring_item("ffffffffffffffffffffffffffffffff", GH, "first", 5);
+        let second = keyring_item("00000000000000000000000000000000", GH, "second", 6);
+        let mut index = Index::default();
+        index.items = vec![first.clone(), second.clone()];
+        let state = service.state.lock_live(Instant::now()).unwrap();
+        state
+            .store()
+            .mutate(
+                DocumentKind::LinuxSecretService,
+                &partition,
+                vec![
+                    DocumentOperation::Put {
+                        address: first.address().unwrap(),
+                        value: zeroize::Zeroizing::new(b"one".to_vec()),
+                        evict_at: None,
+                    },
+                    DocumentOperation::Put {
+                        address: second.address().unwrap(),
+                        value: zeroize::Zeroizing::new(b"two".to_vec()),
+                        evict_at: None,
+                    },
+                    DocumentOperation::Put {
+                        address: SecretAddress::new(INDEX_ITEM, None).unwrap(),
+                        value: zeroize::Zeroizing::new(serde_json::to_vec(&index).unwrap()),
+                        evict_at: None,
+                    },
+                ],
+                &Provenance::caller(&manager, None),
+                100,
+            )
+            .unwrap();
+        drop(state);
+        let new = keyring_item("22222222222222222222222222222222", GH, "new", 9);
+        assert_eq!(
+            import_keyring_item(&service, &manager, &partition, &new, b"three", true, 101),
+            VaultEntryImportStatus::Replaced
+        );
+        let items = keyring_items(&service, &manager, &partition, 102);
+        assert_eq!(
+            items,
+            vec![
+                (second, b"two".to_vec()),
+                (
+                    crate::vault::secret_service_data::IndexItem {
+                        id: first.id.clone(),
+                        created: first.created,
+                        ..new
+                    },
+                    b"three".to_vec()
+                ),
+            ]
+        );
+    }
+}
+
+#[test]
+fn restored_keyring_items_without_attributes_match_by_id_only() {
+    for partition in keyring_partitions() {
+        let (_directory, service) = service(100, UnsealLeasePolicy::default());
+        let manager = caller();
+        service.authorize_permission_manager(&manager, 100).unwrap();
+        let one = keyring_item("11111111111111111111111111111111", &[], "one", 5);
+        let two = keyring_item("22222222222222222222222222222222", &[], "two", 6);
+        assert_eq!(
+            import_keyring_item(&service, &manager, &partition, &one, b"one", false, 101),
+            VaultEntryImportStatus::Added
+        );
+        assert_eq!(
+            import_keyring_item(&service, &manager, &partition, &two, b"two", false, 102),
+            VaultEntryImportStatus::Added
+        );
+        assert_eq!(
+            import_keyring_item(&service, &manager, &partition, &one, b"three", false, 103),
+            VaultEntryImportStatus::KeptExisting
+        );
+        assert_eq!(
+            keyring_items(&service, &manager, &partition, 104),
+            vec![(one, b"one".to_vec()), (two, b"two".to_vec())]
+        );
+    }
+}

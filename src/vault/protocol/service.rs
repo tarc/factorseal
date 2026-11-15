@@ -981,20 +981,38 @@ fn import_secret_service_item(
             "unsupported portable keyring partition or expiry".to_owned(),
         ));
     }
-    let portable = PortableItem::decode(value.expose(), &entry.address)?;
+    let mut portable = PortableItem::decode(value.expose(), &entry.address)?;
     let mut index = secret_service_index(store, partition, now)?;
-    let existing = index
-        .items
-        .iter()
-        .position(|item| item.id == portable.item.id);
-    if existing.is_some() && !replace_existing {
-        return Ok(super::VaultEntryImportStatus::KeptExisting);
-    }
+    // An item that answers the same lookup is the existing one, matched as
+    // CreateItem with replace=true matches: the first in index order. An
+    // item without attributes answers no lookup, so it matches by id only.
+    let existing = index.items.iter().position(|item| {
+        if portable.item.attributes.is_empty() {
+            item.id == portable.item.id && item.attributes.is_empty()
+        } else {
+            item.attributes == portable.item.attributes
+        }
+    });
     if let Some(position) = existing {
-        index.items[position] = portable.item;
+        if !replace_existing {
+            return Ok(super::VaultEntryImportStatus::KeptExisting);
+        }
+        let kept = &index.items[position];
+        portable.item.id.clone_from(&kept.id);
+        portable.item.created = kept.created;
+        index.items[position] = portable.item.clone();
     } else {
-        index.items.push(portable.item);
+        // An id taken by an item with other attributes (a program changed
+        // them after an earlier import) gets a fresh id, so the restore
+        // never overwrites an item that answers another lookup.
+        while index.items.iter().any(|item| item.id == portable.item.id) {
+            let mut bytes = [0_u8; 16];
+            getrandom::fill(&mut bytes)?;
+            portable.item.id = hex::encode(bytes);
+        }
+        index.items.push(portable.item.clone());
     }
+    let address = portable.item.address()?;
     let index_bytes =
         serde_json::to_vec(&index).map_err(|e| VaultError::InvalidData(e.to_string()))?;
     // An imported index must remain writable through the bounded native
@@ -1004,8 +1022,7 @@ fn import_secret_service_item(
         mutations: vec![
             super::VaultMutation::Put {
                 address: super::WireSecretAddress::new(
-                    entry
-                        .address
+                    address
                         .as_local()
                         .ok_or_else(|| VaultError::Protocol("invalid keyring address".to_owned()))?
                         .0,
@@ -1027,7 +1044,7 @@ fn import_secret_service_item(
         partition,
         vec![
             DocumentOperation::Put {
-                address: entry.address.clone(),
+                address,
                 value: zeroize::Zeroizing::new(portable.value.expose().to_vec()),
                 evict_at: None,
             },
