@@ -1160,20 +1160,19 @@ fn category_guidance(kind: factorseal::DocumentKind) -> CategoryGuidance {
         },
         factorseal::DocumentKind::SecretSpecProject => CategoryGuidance {
             title: "Projects",
-            description: "Secrets declared by your SecretSpec projects and profiles.",
+            description: "Secrets you store for a project with the FactorSeal command line, for scripts and tools.",
             instructions: const {
                 &[
                     command_step(
-                        "Run this in your project directory, then declare the secrets your application needs in secretspec.toml.",
-                        "secretspec init",
+                        "Store a value. FactorSeal asks for it.",
+                        "factorseal set --project my-app TOKEN",
                     ),
                     command_step(
-                        "Store a value.",
-                        "secretspec set TOKEN --provider factorseal://default",
+                        "Read it back, for example in a script.",
+                        "factorseal get --project my-app TOKEN",
                     ),
-                    command_step(
-                        "Start your application.",
-                        "secretspec run --provider factorseal://default -- your-command",
+                    step(
+                        "SecretSpec does not read these values. What SecretSpec stores through factorseal://default appears under Provider cache.",
                     ),
                 ]
             },
@@ -1230,20 +1229,24 @@ fn category_guidance(kind: factorseal::DocumentKind) -> CategoryGuidance {
         },
         factorseal::DocumentKind::SecretSpecProviderCache => CategoryGuidance {
             title: "Provider cache",
-            description: "Expiring local copies that make remote SecretSpec providers faster.",
+            description: "Values SecretSpec stores through factorseal://default. Those saved with secretspec set do not expire; copies cached for another provider do.",
             instructions: const {
                 &[
                     command_step(
-                        "Add this under [providers] in secretspec.toml.",
-                        "factorseal = \"factorseal://default\"",
+                        "Run this in your project directory, then declare the secrets your application needs in secretspec.toml.",
+                        "secretspec init",
                     ),
                     command_step(
-                        "Add this to an authoritative provider alias.",
+                        "Store a value.",
+                        "secretspec set TOKEN --provider factorseal://default",
+                    ),
+                    command_step(
+                        "Start your application.",
+                        "secretspec run --provider factorseal://default -- your-command",
+                    ),
+                    command_step(
+                        "To keep expiring copies of another provider's values here, add factorseal = \"factorseal://default\" under [providers] in secretspec.toml, then this to that provider's alias.",
                         "cache = { provider = \"factorseal\", max_age = \"8h\" }",
-                    ),
-                    command_step(
-                        "Use that alias normally. Run this when you need to clear its local copies.",
-                        "secretspec cache clear",
                     ),
                 ]
             },
@@ -1267,13 +1270,13 @@ fn category_documentation(
         )),
         factorseal::DocumentKind::SecretSpecProject => Some((
             "secretspec-projects-documentation",
-            "Open the SecretSpec Quick Start",
-            "https://secretspec.dev/quick-start/",
+            "Read how to store project secrets",
+            "https://github.com/cachix/factorseal/blob/main/docs/usage.md#quick-start",
         )),
         factorseal::DocumentKind::SecretSpecProviderCache => Some((
             "secretspec-cache-documentation",
-            "Read the SecretSpec provider caching guide",
-            "https://secretspec.dev/concepts/providers/caching/",
+            "Open the SecretSpec Quick Start",
+            "https://secretspec.dev/quick-start/",
         )),
         _ => None,
     }
@@ -5293,26 +5296,45 @@ mod tests {
 
     #[test]
     fn provides_usage_guidance_for_empty_vault_categories() {
-        let project = category_guidance(DocumentKind::SecretSpecProject);
-        assert_eq!(project.title, "Projects");
-        assert!(
-            project
+        // Projects holds what the command line stores; SecretSpec's
+        // provider reads and writes Provider cache, so its steps live there.
+        let commands = |kind| {
+            category_guidance(kind)
                 .instructions
                 .iter()
-                .any(|instruction| instruction.command == Some("secretspec init"))
+                .filter_map(|instruction| instruction.command)
+                .collect::<Vec<_>>()
+        };
+        let project = category_guidance(DocumentKind::SecretSpecProject);
+        assert_eq!(project.title, "Projects");
+        let project_commands = commands(DocumentKind::SecretSpecProject);
+        assert!(project_commands.contains(&"factorseal set --project my-app TOKEN"));
+        assert!(
+            project_commands
+                .iter()
+                .all(|command| !command.starts_with("secretspec"))
+        );
+        assert!(
+            commands(DocumentKind::SecretSpecProviderCache)
+                .contains(&"secretspec set TOKEN --provider factorseal://default")
+        );
+        assert!(
+            category_guidance(DocumentKind::SecretSpecProviderCache)
+                .description
+                .contains("do not expire")
         );
         assert_eq!(
             category_documentation(DocumentKind::SecretSpecProject)
                 .expect("project documentation")
                 .2,
-            "https://secretspec.dev/quick-start/"
+            "https://github.com/cachix/factorseal/blob/main/docs/usage.md#quick-start"
         );
 
         assert_eq!(
             category_documentation(DocumentKind::SecretSpecProviderCache)
                 .expect("cache documentation")
                 .2,
-            "https://secretspec.dev/concepts/providers/caching/"
+            "https://secretspec.dev/quick-start/"
         );
 
         let access = category_guidance(DocumentKind::Authorization);
