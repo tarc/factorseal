@@ -129,6 +129,7 @@ pub(super) fn execute_action(
         VaultAction::ClearCache { project } => Ok((context.clear(project.as_bytes())?, true)),
         VaultAction::SealCache { project } => Ok((context.seal(project.as_bytes())?, false)),
         VaultAction::ListVaultEntries { .. }
+        | VaultAction::ListKeyringFingerprints { .. }
         | VaultAction::ExportVaultEntry { .. }
         | VaultAction::ImportVaultEntry { .. }
         | VaultAction::ExportRevision

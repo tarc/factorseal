@@ -254,6 +254,18 @@ impl VaultService {
                     revision: state.store().export_revision()?,
                 });
             }
+            VaultAction::ListKeyringFingerprints { distro, cursor } => {
+                require_live_manager(&state, caller, clock, valid_until)?;
+                let partition = match distro {
+                    Some(distro) => super::wsl::wsl_keyring_namespace(&distro)?,
+                    None => crate::vault::secret_service_data::NAMESPACE.to_vec(),
+                };
+                let index = secret_service_index(state.store(), &partition, now)?;
+                let (now, monotonic_now) = clock.sample();
+                clock.check(valid_until.get())?;
+                state.touch(now, monotonic_now)?;
+                return Ok(keyring_fingerprint_page(index, cursor.as_deref())?);
+            }
             VaultAction::ListVaultEntries { cursor, limit } => {
                 return inventory(
                     &mut state,
@@ -943,6 +955,50 @@ fn permission_page(
     Ok(VaultResponseBody::Permissions {
         revision,
         permissions: page,
+        next_cursor,
+    })
+}
+
+/// The fingerprints of `index`'s items after `cursor`, by ID, as many as fit
+/// in a response. Items without attributes have none and are left out.
+fn keyring_fingerprint_page(
+    index: crate::vault::secret_service_data::Index,
+    cursor: Option<&str>,
+) -> VaultResult<VaultResponseBody> {
+    let mut items: Vec<_> = index
+        .items
+        .into_iter()
+        .filter(|item| cursor.is_none_or(|cursor| item.id.as_str() > cursor))
+        .filter_map(|item| {
+            crate::vault::keyring_fingerprint(&item.attributes).map(|fingerprint| {
+                super::KeyringFingerprint {
+                    fingerprint: hex::encode(fingerprint),
+                    id: item.id,
+                    modified: item.modified,
+                }
+            })
+        })
+        .collect();
+    items.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut remaining = super::wire::MAX_MESSAGE_BYTES - 4096;
+    let mut fingerprints = Vec::new();
+    let mut next_cursor = None;
+    for item in items {
+        let bytes = serde_json::to_vec(&item)
+            .map_err(|e| VaultError::Protocol(e.to_string()))?
+            .len()
+            + 1;
+        if bytes > remaining {
+            next_cursor = fingerprints
+                .last()
+                .map(|last: &super::KeyringFingerprint| last.id.clone());
+            break;
+        }
+        remaining -= bytes;
+        fingerprints.push(item);
+    }
+    Ok(VaultResponseBody::KeyringFingerprints {
+        fingerprints,
         next_cursor,
     })
 }

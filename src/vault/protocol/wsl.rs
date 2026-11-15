@@ -1043,6 +1043,13 @@ mod tests {
         ));
         assert!(!relay_allows(&VaultAction::ListPermissions, "NixOS"));
         assert!(!relay_allows(
+            &VaultAction::ListKeyringFingerprints {
+                distro: Some("NixOS".to_owned()),
+                cursor: None,
+            },
+            "NixOS"
+        ));
+        assert!(!relay_allows(
             &VaultAction::ListProjects {
                 cursor: None,
                 limit: 1,

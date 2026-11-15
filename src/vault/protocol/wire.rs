@@ -17,7 +17,9 @@ use crate::vault::{
 // Version 17 adds personal-item usernames and favorites to inventory and marks awaited approvals.
 // Version 18 adds caller-declared launch chains and single-use write approvals.
 // Version 19 adds the caller-declared WSL origin hint on VaultApplicationContext.
-pub(super) const PROTOCOL_VERSION: u8 = 20;
+// Version 20 adds WslKeyringAccess.
+// Version 21 adds ListKeyringFingerprints.
+pub(super) const PROTOCOL_VERSION: u8 = 21;
 pub(super) const REQUEST_ID_BYTES: usize = 16;
 pub(super) const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 /// Maximum bounded wait accepted by [`VaultAction::WaitPermissions`].
@@ -191,6 +193,18 @@ impl DeclaredKeyringCaller {
             None,
         )
     }
+}
+
+/// One keyring item's fingerprint
+/// ([`keyring_fingerprint`](crate::vault::keyring_fingerprint)).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyringFingerprint {
+    /// 64 lowercase hex digits.
+    pub fingerprint: String,
+    /// The item's ID, 32 hex digits.
+    pub id: String,
+    pub modified: u64,
 }
 
 /// Replay-resistant request identifier.
@@ -715,6 +729,16 @@ pub enum VaultAction {
         cursor: Option<String>,
         limit: u16,
     },
+    /// The fingerprint of each item in a keyring (the WSL distro's, or the
+    /// native one), for telling which items another Secret Service would
+    /// add. No values and no attributes. Permission managers only. Sorted by
+    /// item ID; `cursor` is the last ID of the previous page.
+    ListKeyringFingerprints {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        distro: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+    },
     /// Read one inventory entry for a portable backup. Permission managers only.
     ExportVaultEntry {
         entry: VaultEntryMetadata,
@@ -977,6 +1001,19 @@ impl VaultAction {
                 validate_list_limit(*limit)?;
                 if let Some(cursor) = cursor {
                     validate_address_cursor(cursor)?;
+                }
+                Ok(())
+            }
+            Self::ListKeyringFingerprints { distro, cursor } => {
+                if let Some(distro) = distro {
+                    super::wsl::validate_distro(distro)?;
+                }
+                if cursor.as_ref().is_some_and(|cursor| {
+                    cursor.len() != 32 || !cursor.bytes().all(|byte| byte.is_ascii_hexdigit())
+                }) {
+                    return Err(VaultError::Protocol(
+                        "invalid keyring fingerprint cursor".to_owned(),
+                    ));
                 }
                 Ok(())
             }
@@ -1250,6 +1287,11 @@ pub enum VaultResponseBody {
     },
     VaultEntries {
         entries: Vec<VaultEntryMetadata>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_cursor: Option<String>,
+    },
+    KeyringFingerprints {
+        fingerprints: Vec<KeyringFingerprint>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         next_cursor: Option<String>,
     },

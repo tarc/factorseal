@@ -5497,3 +5497,155 @@ fn restored_keyring_items_without_attributes_match_by_id_only() {
         );
     }
 }
+
+fn keyring_fingerprints(
+    service: &VaultService,
+    caller: &CallerIdentity,
+    distro: Option<&str>,
+    cursor: Option<String>,
+    now: u64,
+) -> VaultResult<(Vec<crate::KeyringFingerprint>, Option<String>, String)> {
+    let response = service.handle(
+        caller,
+        VaultRequest::new(VaultAction::ListKeyringFingerprints {
+            distro: distro.map(str::to_owned),
+            cursor,
+        })?,
+        now,
+    );
+    let json = String::from_utf8(response.encode()?.to_vec()).unwrap();
+    match response.result {
+        Ok(VaultResponseBody::KeyringFingerprints {
+            fingerprints,
+            next_cursor,
+        }) => Ok((fingerprints, next_cursor, json)),
+        Ok(other) => panic!("unexpected response: {other:?}"),
+        Err(error) => Err(VaultError::Protocol(format!("{error:?}"))),
+    }
+}
+
+#[test]
+fn keyring_fingerprints_are_listed_without_values_or_attributes() {
+    for (distro, partition) in [
+        (None, keyring_partitions()[0].clone()),
+        (Some("NixOS"), keyring_partitions()[1].clone()),
+    ] {
+        let (_directory, service) = service(100, UnsealLeasePolicy::default());
+        let manager = caller();
+        service.authorize_permission_manager(&manager, 100).unwrap();
+        let port = keyring_item(
+            "22222222222222222222222222222222",
+            &[
+                ("xdg:schema", "test.int"),
+                ("port", "8080"),
+                ("host", "example.org"),
+            ],
+            "port",
+            9,
+        );
+        let bare = keyring_item("11111111111111111111111111111111", &[], "bare", 5);
+        import_keyring_item(
+            &service,
+            &manager,
+            &partition,
+            &port,
+            b"very-secret-value",
+            false,
+            101,
+        );
+        import_keyring_item(
+            &service,
+            &manager,
+            &partition,
+            &bare,
+            b"bare-secret",
+            false,
+            101,
+        );
+        let (fingerprints, next_cursor, json) =
+            keyring_fingerprints(&service, &manager, distro, None, 102).unwrap();
+        // The fingerprint pinned in the import mapping's tests; the item
+        // without attributes has none.
+        assert_eq!(
+            fingerprints,
+            [crate::KeyringFingerprint {
+                fingerprint: "786097a0da05fd756c858c9f65ec38f3fd9485f684d626d40504649cbdf8cbc7"
+                    .to_owned(),
+                id: port.id.clone(),
+                modified: 9,
+            }]
+        );
+        assert_eq!(next_cursor, None);
+        for leaked in [
+            "very-secret-value",
+            "bare-secret",
+            "example.org",
+            "8080",
+            "test.int",
+            "port",
+        ] {
+            assert!(!json.contains(leaked), "{leaked} in {json}");
+        }
+        // The other keyring is empty.
+        let other = if distro.is_some() {
+            None
+        } else {
+            Some("NixOS")
+        };
+        assert_eq!(
+            keyring_fingerprints(&service, &manager, other, None, 102)
+                .unwrap()
+                .0,
+            []
+        );
+    }
+}
+
+#[test]
+fn keyring_fingerprints_are_for_permission_managers_only() {
+    let (_directory, service) = service(100, UnsealLeasePolicy::default());
+    let manager = caller();
+    service.authorize_permission_manager(&manager, 100).unwrap();
+    let partition = keyring_partitions()[1].clone();
+    let item = keyring_item("22222222222222222222222222222222", GH, "gh", 9);
+    import_keyring_item(&service, &manager, &partition, &item, b"x", false, 101);
+    let other = CallerIdentity::new(
+        CallerPlatform::Linux,
+        "uid:1000",
+        "dev.example.other",
+        [8; 32],
+        None,
+    )
+    .unwrap();
+    // Even with the distro's keyring namespace grant, as the WSL host has.
+    service
+        .authorize_namespace(
+            &other,
+            &partition,
+            [GrantPermission::Get, GrantPermission::Put],
+            None,
+            101,
+        )
+        .unwrap();
+    assert!(keyring_fingerprints(&service, &other, Some("NixOS"), None, 102).is_err());
+    assert!(keyring_fingerprints(&service, &other, None, None, 102).is_err());
+}
+
+#[test]
+fn keyring_fingerprints_page_by_item_id() {
+    let (_directory, service) = service(100, UnsealLeasePolicy::default());
+    let manager = caller();
+    service.authorize_permission_manager(&manager, 100).unwrap();
+    let partition = keyring_partitions()[0].clone();
+    for (index, id) in ["cc", "aa", "bb"].into_iter().enumerate() {
+        let item = keyring_item(&id.repeat(16), &[("n", id)], id, index as u64);
+        import_keyring_item(&service, &manager, &partition, &item, b"x", false, 101);
+    }
+    let (all, _, _) = keyring_fingerprints(&service, &manager, None, None, 102).unwrap();
+    let ids: Vec<_> = all.iter().map(|entry| &entry.id[..2]).collect();
+    assert_eq!(ids, ["aa", "bb", "cc"]);
+    let (after, next, _) =
+        keyring_fingerprints(&service, &manager, None, Some("aa".repeat(16)), 102).unwrap();
+    assert_eq!(after, all[1..]);
+    assert_eq!(next, None);
+}
