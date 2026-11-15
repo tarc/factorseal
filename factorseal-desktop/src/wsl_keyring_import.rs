@@ -120,9 +120,17 @@ fn after_line_end(bytes: &[u8]) -> Option<&[u8]> {
         .or_else(|| bytes.strip_prefix(b"\n"))
 }
 
+/// The longest `<kind> <length>\r` a header can have. Looking no further
+/// for its newline keeps the scan linear however many start markers the
+/// output holds.
+const MAX_HEADER_BYTES: usize = 64;
+
 /// The frame whose header's `<kind> <length>` starts `bytes`.
 fn frame_at(bytes: &[u8]) -> Option<(String, Zeroizing<Vec<u8>>)> {
-    let header_end = bytes.iter().position(|byte| *byte == b'\n')?;
+    let header_end = bytes
+        .iter()
+        .take(MAX_HEADER_BYTES)
+        .position(|byte| *byte == b'\n')?;
     let header = std::str::from_utf8(&bytes[..header_end]).ok()?;
     let header = header.strip_suffix('\r').unwrap_or(header);
     let (kind, length) = header.split_once(' ')?;
@@ -635,6 +643,35 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&content).unwrap(),
             json
         );
+    }
+
+    /// Output from the distro can't make the parser slow: many start
+    /// markers without a newline, or many candidates that all announce a
+    /// length ending at the same end line.
+    #[test]
+    fn many_frame_markers_parse_in_linear_time() {
+        let markers = "FACTORSEAL-FRAME v1 ".repeat(1 << 16);
+        // Built from the back: each header announces exactly the bytes up
+        // to the one end line, so every candidate reaches its body check.
+        // The last body byte isn't base64, so no candidate is a frame.
+        let mut shared_end = "!\nFACTORSEAL-FRAME end\n".to_owned();
+        let mut body = 1;
+        for _ in 0..(1 << 14) {
+            let header = format!("FACTORSEAL-FRAME v1 inventory {body}\n");
+            body += header.len();
+            shared_end.insert_str(0, &header);
+        }
+        assert!(frame_at(&shared_end.as_bytes()[FRAME_START.len()..]).is_none());
+        for output in [markers, shared_end] {
+            let started = std::time::Instant::now();
+            assert!(unframe(output.as_bytes()).is_none());
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "{} bytes took {:?}",
+                output.len(),
+                started.elapsed()
+            );
+        }
     }
 
     #[test]
