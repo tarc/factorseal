@@ -48,6 +48,9 @@ assert unit.serviceConfig.Type == "dbus";
 assert unit.serviceConfig.BusName == "org.freedesktop.secrets";
 assert unit.serviceConfig.ExecStart == "${package}/bin/factorseal wsl-keyring";
 assert unit.environment.DBUS_SESSION_BUS_ADDRESS == "unix:path=%t/bus";
+# Hardened like the agent, but WSL interop needs AF_VSOCK to run the broker.
+assert unit.serviceConfig.MemoryDenyWriteExecute;
+assert builtins.elem "AF_VSOCK" unit.serviceConfig.RestrictAddressFamilies;
 pkgs.runCommand "factorseal-wsl-module-evaluation" { } ''
   service=${activation}/share/dbus-1/services/org.freedesktop.secrets.service
   grep -Fx "Name=org.freedesktop.secrets" "$service"

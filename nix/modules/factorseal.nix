@@ -245,6 +245,18 @@ in
         UMask = "0077";
         LimitCORE = 0;
         NoNewPrivileges = true;
+        # As the agent, without a mount namespace: the host reads its D-Bus
+        # callers' /proc/<pid>/exe and cwd. WSL interop runs Windows
+        # programs over AF_VSOCK, so that family stays allowed.
+        LockPersonality = true;
+        MemoryDenyWriteExecute = true;
+        RestrictAddressFamilies = [
+          "AF_UNIX"
+          "AF_VSOCK"
+        ];
+        RestrictRealtime = true;
+        RestrictSUIDSGID = true;
+        SystemCallArchitectures = "native";
       };
     };
   };

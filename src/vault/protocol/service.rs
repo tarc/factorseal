@@ -565,6 +565,8 @@ impl VaultService {
                     absolute_deadline,
                     now,
                 )?;
+                let (now, monotonic_now) = clock.sample();
+                state.touch(now, monotonic_now)?;
                 return Ok(VaultResponseBody::WslKeyringsSet);
             }
             VaultAction::ListPermissions | VaultAction::ListPermissionsPage { .. } => {

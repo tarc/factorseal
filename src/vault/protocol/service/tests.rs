@@ -3020,6 +3020,41 @@ fn status_requests_do_not_refresh_the_idle_deadline() {
     assert!(service.expire_if_needed_at(105, idle_expires_at).unwrap());
 }
 
+/// A Settings switch is the person using the vault, like any other change
+/// Desktop makes: it refreshes the idle deadline.
+#[test]
+fn a_wsl_keyring_switch_refreshes_the_idle_deadline() {
+    let policy = UnsealLeasePolicy {
+        idle_timeout: Duration::from_secs(5),
+        maximum_lifetime: Duration::from_secs(10),
+    };
+    let (_directory, service) = service(100, policy);
+    let manager = CallerIdentity::new(
+        CallerPlatform::Windows,
+        "S-1-5-21-1000",
+        r"C:\FactorSeal\factorseal-desktop.exe",
+        [9; 32],
+        None,
+    )
+    .unwrap();
+    service.authorize_permission_manager(&manager, 100).unwrap();
+    let idle_expires_at = service.state.idle_expires_at();
+    let switched = service.handle_at(
+        &manager,
+        VaultRequest::new(VaultAction::SetWslKeyrings {
+            distros: Vec::new(),
+        })
+        .unwrap(),
+        104,
+        idle_expires_at.checked_sub(Duration::from_secs(1)).unwrap(),
+    );
+    assert!(matches!(
+        switched.result,
+        Ok(VaultResponseBody::WslKeyringsSet)
+    ));
+    assert!(!service.expire_if_needed_at(105, idle_expires_at).unwrap());
+}
+
 #[test]
 fn wall_clock_rollback_does_not_extend_the_unseal_lease() {
     let policy = UnsealLeasePolicy {

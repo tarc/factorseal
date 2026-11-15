@@ -46,11 +46,22 @@ pub(crate) fn parse_registered(output: &str) -> Vec<String> {
     distros
 }
 
+/// Windows' own `reg.exe`, by full path: a bare `reg.exe` is looked up in
+/// the application's folder first.
+#[cfg(any(windows, test))]
+fn system_reg_exe(system_root: Option<std::ffi::OsString>) -> std::ffi::OsString {
+    let mut path = system_root
+        .filter(|root| !root.is_empty())
+        .unwrap_or_else(|| r"C:\Windows".into());
+    path.push(r"\System32\reg.exe");
+    path
+}
+
 #[cfg(windows)]
 fn registered() -> Result<Vec<String>, String> {
     use std::os::windows::process::CommandExt as _;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let output = std::process::Command::new("reg.exe")
+    let output = std::process::Command::new(system_reg_exe(std::env::var_os("SystemRoot")))
         .args([
             "query",
             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss",
@@ -75,5 +86,19 @@ mod tests {
         let output = "\r\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss\\{2f1d}\r\n    DistributionName    REG_SZ    NixOS\r\n\r\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss\\{9a3c}\r\n    DistributionName    REG_SZ    Ubuntu-24.04\r\n\r\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss\\{bad}\r\n    DistributionName    REG_SZ    not/valid\r\n    DistributionName    REG_SZ    NixOS\r\n\r\nFim da pesquisa: 3 correspond\u{ea}ncias encontradas.\r\n";
         assert_eq!(parse_registered(output), ["NixOS", "Ubuntu-24.04"]);
         assert_eq!(parse_registered(""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn reg_exe_is_windows_own() {
+        assert_eq!(
+            system_reg_exe(Some(r"D:\Win".into())),
+            std::ffi::OsString::from(r"D:\Win\System32\reg.exe")
+        );
+        for missing in [None, Some(std::ffi::OsString::new())] {
+            assert_eq!(
+                system_reg_exe(missing),
+                std::ffi::OsString::from(r"C:\Windows\System32\reg.exe")
+            );
+        }
     }
 }

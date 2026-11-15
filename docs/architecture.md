@@ -418,7 +418,10 @@ absolute deadline; a switch moved while unsealed takes effect at once
 (`SetWslKeyrings`, permission managers only). A record of these host grants
 lets the vault remove them whenever it opens, whichever process opens it, so
 they end with the unseal like other WSL grants; the worker then grants the
-current list again. The broker gets no `Seal`, so `Lock` from WSL locks nothing.
+current list again. The worker identifies the broker once, at unlock: a
+broker replaced while the vault is unsealed (an update) gets nothing from a
+later switch, and is granted at the next unlock. The broker gets no `Seal`,
+so `Lock` from WSL locks nothing.
 
 The vault cannot see the D-Bus caller in WSL, so the host resolves it there,
 as the vault resolves a native caller (uid, executable path, SHA-256 of the
