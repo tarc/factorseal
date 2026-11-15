@@ -1,8 +1,8 @@
 # Plan: the Windows vault for WSL2 (SecretSpec and the keyring)
 
 Status, 2026-11-15: milestone 1 (SecretSpec in WSL) is done on
-`feature/wsl2-keyring` (backed up on the fork as `wip/wsl2-keyring` at
-3ecbb9a, no PR), and the fixes from its independent review are committed
+`feature/wsl2-keyring` (backed up on the fork as `wip/wsl2-keyring`,
+last at 8c8bda9 on 2026-11-15, no PR), and the fixes from its independent review are committed
 on top (see "Review fixes" below), the Desktop popup fix (finding 1)
 included once the user saw it in the native build.
 Milestone 2 (the WSL keyring) is done and committed, its Desktop UI
@@ -240,6 +240,32 @@ server authentication and caller identification on Windows, then keep one
 connection per broker if that is the cost. Dropping the separate check
 before each delegated action would remove one round trip per operation
 (proposed to the user).
+
+### Broker cost (2026-11-15)
+
+The 2 s repeat lookup came from the Windows vault, not the relay or the
+keyring: the worker's own parse timings in the diagnostics log showed
+193–350 ms per request for the sandboxed parser, which copied
+`factorseal-parser.exe` into a new temporary folder for every request.
+Windows checks a freshly written executable when it first runs: starting the
+installed parser took 6–10 ms, a fresh copy 173–275 ms (PowerShell, 8 runs
+each). The accept loop also slept 100 ms whenever no client waited. Both are
+upstream code, used by every Windows client; the user chose the fixes.
+
+| Commit | What, and how it was verified |
+|---|---|
+| 2732c32 | Helpers run one private copy per executable, shared by every launch while a launch or a holder keeps it; the Windows vault keeps the parser's while it serves. The copy's folder grants read/execute only to a capability every helper holds (`factorsealHelperCode`; helpers are less-privileged AppContainers, so ALL APPLICATION PACKAGES would not reach them); each launch keeps its own AppContainer identity, and the helpers' token check expects the capability. Native test `launches_share_one_executable_copy_while_it_is_kept` (failed with a per-launch copy: two paths); the sandbox probes and installed parser/network helper tests pass natively. |
+| 3f7d930 | A thread waits in a blocking accept; the loop checks the lease and stop flag at the poll interval and wakes the accept with its own connection on the way out. Native test `a_request_after_a_quiet_moment_is_served_at_once` (1 s poll, five requests after 300 ms gaps under 1.5 s): 3.1 s with the old loop. A worker exits 0.4 s after a seal. |
+| (this commit) | `drive.ps1 unlock` ignores the approval popup's password field (automation id `factorseal.access.password`): with fast requests the popup of a lookup waiting for the unlock opened within the driver's 1.5 s settle time and failed `check.sh keyring` step 5, though the vault was unsealed. |
+
+`build-windows.sh check` OK (Windows clippy, Desktop 175 tests, relay 14).
+Live on the test vault (native release build): `check.sh keyring` PASS
+twice, repeat lookup 228 and 217 ms (was 2007–2338 ms); one long-lived broker
+answers a `Status` in 26–32 ms and an index read in 32–41 ms (was 290–440
+ms); `check.sh secretspec-wsl` PASS, a read again 118 ms for the whole
+`secretspec` command (was 470 ms). The proposal to drop the separate check
+before each delegated action now saves about 30 ms per operation instead of
+400; not done.
 
 Notes for later: libsecret clients give up after D-Bus's 25 s while an
 approval waits (the request stays pending); the user chose (2026-11-15) to

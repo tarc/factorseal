@@ -214,6 +214,16 @@ function Find($window, [string]$name, [switch]$Button) {
     $window.FindFirst($scope::Descendants, (New-Object System.Windows.Automation.AndCondition($byName, $condition)))
 }
 
+# The main window's password field, not an approval popup's (which has the
+# same name and sits under the main window in the tree).
+function MainPasswordField($window) {
+    $byName = New-Object System.Windows.Automation.PropertyCondition($auto::NameProperty, 'FactorSeal password')
+    foreach ($element in $window.FindAll($scope::Descendants, $byName)) {
+        if ($element.Current.AutomationId -ne 'factorseal.access.password') { return $element }
+    }
+    return $null
+}
+
 # Waits for a named control to be enabled and returns it.
 function WaitFor($window, [string]$name, [int]$seconds, [switch]$Button) {
     $deadline = [DateTime]::UtcNow.AddSeconds($seconds)
@@ -323,11 +333,13 @@ switch ($Action) {
         ClickOn $window $button 'Unlock vault'
         # The password field goes away once the vault is unsealed. It also
         # disappears briefly while an attempt runs, and comes back after a
-        # wrong password, so it must stay away.
+        # wrong password, so it must stay away. A request waiting for the
+        # unlock can open its approval popup within that time; its own
+        # password field does not count.
         $deadline = [DateTime]::UtcNow.AddSeconds(20)
         $goneSince = $null
         while ([DateTime]::UtcNow -lt $deadline) {
-            if (Find $window 'FactorSeal password') {
+            if (MainPasswordField $window) {
                 $goneSince = $null
             } elseif (-not $goneSince) {
                 $goneSince = [DateTime]::UtcNow
@@ -336,7 +348,7 @@ switch ($Action) {
             }
             Start-Sleep -Milliseconds 200
         }
-        $done = $goneSince -and -not (Find $window 'FactorSeal password')
+        $done = $goneSince -and -not (MainPasswordField $window)
         Emit "unlocked=$done"
     }
     'grant' {
