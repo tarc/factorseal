@@ -5389,17 +5389,19 @@ fn a_restored_keyring_item_whose_id_is_taken_gets_a_new_id() {
             );
             let items = keyring_items(&service, &manager, &partition, 103);
             assert_eq!(items.len(), 2, "{items:?}");
-            assert_eq!(items[0], (old.clone(), b"one".to_vec()));
-            assert_ne!(items[1].0.id, id);
+            // The fresh id is random, so find each item by id, not position.
+            let (kept, added): (Vec<_>, Vec<_>) =
+                items.into_iter().partition(|(item, _)| item.id == id);
+            assert_eq!(kept, [(old.clone(), b"one".to_vec())]);
             assert_eq!(
-                items[1],
-                (
+                added,
+                [(
                     crate::vault::secret_service_data::IndexItem {
-                        id: items[1].0.id.clone(),
+                        id: added[0].0.id.clone(),
                         ..new.clone()
                     },
                     b"two".to_vec()
-                )
+                )]
             );
         }
     }
