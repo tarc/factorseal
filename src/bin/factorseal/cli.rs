@@ -280,6 +280,55 @@ pub(super) enum Command {
         dry_run: bool,
     },
 
+    /// Write the items of gnome-keyring (the Secret Service on the session
+    /// bus) as a FactorSeal archive of keyring items, to restore like a
+    /// backup. gnome-keyring keeps its items.
+    ///
+    /// In WSL the items are for this distro's keyring in the Windows vault
+    /// unless --wsl-distro or --native says otherwise. --inventory lists
+    /// what an export would bring and why it leaves items out, reading no
+    /// secrets and never unlocking. An export unlocks each locked
+    /// collection through gnome-keyring's own prompt.
+    #[cfg(all(target_os = "linux", feature = "vault"))]
+    ExportSecretService {
+        /// Destination archive. Existing files are replaced with mode 0600.
+        #[arg(
+            value_hint = ValueHint::FilePath,
+            required_unless_present_any = ["inventory", "framed"],
+            conflicts_with_all = ["inventory", "framed"]
+        )]
+        file: Option<PathBuf>,
+
+        /// List the items as JSON instead of exporting them.
+        #[arg(long)]
+        inventory: bool,
+
+        /// Items for this WSL distro's keyring in the Windows vault.
+        #[arg(long, value_name = "NAME", conflicts_with = "native")]
+        wsl_distro: Option<String>,
+
+        /// Items for the native Linux keyring.
+        #[arg(long)]
+        native: bool,
+
+        /// Write one framed record to standard output, for FactorSeal Desktop.
+        #[arg(long)]
+        framed: bool,
+
+        /// With --framed, take the archive passphrase from the first line of
+        /// standard input.
+        #[arg(long, requires = "framed", conflicts_with = "inventory")]
+        passphrase_stdin: bool,
+
+        /// Read the archive passphrase from a private regular file.
+        #[arg(
+            long,
+            value_hint = ValueHint::FilePath,
+            conflicts_with_all = ["inventory", "framed"]
+        )]
+        passphrase_file: Option<PathBuf>,
+    },
+
     /// Remove this vault and backend-owned keys; retained TPM backups are not revoked.
     Destroy {
         /// Required acknowledgement because this cannot be undone.
@@ -383,6 +432,8 @@ impl Command {
             Self::History { .. } => "history",
             Self::Export { .. } => "export",
             Self::Import { .. } => "import",
+            #[cfg(all(target_os = "linux", feature = "vault"))]
+            Self::ExportSecretService { .. } => "export_secret_service",
             Self::Destroy { .. } => "destroy",
             Self::GrantCli { .. } => "grant_cli",
             Self::HardwareSelfTest { .. } => "hardware_self_test",

@@ -43,6 +43,8 @@ mod linux;
 #[cfg(all(feature = "secret-service-host", target_os = "linux"))]
 mod secret_service;
 #[cfg(all(feature = "secret-service-host", target_os = "linux"))]
+pub use secret_service::legacy::{SecretServiceRead, read_secret_service};
+#[cfg(all(feature = "secret-service-host", target_os = "linux"))]
 pub use secret_service::{
     NAMESPACE as SECRET_SERVICE_NAMESPACE, SecretServiceHost, SecretServiceHostOptions,
     SecretServicePrompter, WifiMigrationEntry, WifiMigrationReport,

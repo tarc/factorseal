@@ -6,9 +6,6 @@
 //! ([`Legacy::read_all`]), unlocking locked collections one at a time only
 //! when the caller asks.
 
-// Until `factorseal export-secret-service` uses it.
-#![allow(dead_code)]
-
 use std::collections::{HashMap, HashSet};
 
 use zbus::export::futures_core::Stream;
@@ -32,11 +29,34 @@ pub(crate) struct Legacy {
 /// under `gkr:compat:hashed:<name>` and a placeholder `xdg:schema`.
 pub(crate) type LegacyItem = crate::vault::KeyringSourceItem;
 
-/// What a read found, and the collections it could not read with why.
+/// What a read of another Secret Service found, and the collections it
+/// could not read with why.
 #[derive(Default)]
-pub(crate) struct LegacyRead {
-    pub(crate) items: Vec<LegacyItem>,
-    pub(crate) skipped_collections: Vec<(String, String)>,
+pub struct SecretServiceRead {
+    pub items: Vec<crate::vault::KeyringSourceItem>,
+    pub skipped_collections: Vec<(String, String)>,
+}
+
+/// Read the Secret Service on the session bus, refusing FactorSeal itself:
+/// with `values`, every item with its secret, unlocking each locked
+/// collection through its own prompt; without, every item's metadata only,
+/// never unlocking.
+///
+/// # Errors
+///
+/// No session bus, no Secret Service on it, FactorSeal owning it, or a
+/// failed D-Bus call.
+pub fn read_secret_service(values: bool) -> Result<SecretServiceRead, String> {
+    zbus::block_on(async {
+        let legacy = Legacy::connect_foreign().await?;
+        let read = if values {
+            legacy.read_all(true).await
+        } else {
+            legacy.inventory().await
+        };
+        legacy.close().await;
+        read.map_err(|error| format!("cannot read the Secret Service: {error}"))
+    })
 }
 
 pub(crate) async fn proxy<'a>(
@@ -220,8 +240,8 @@ impl Legacy {
 
     /// Every item of every collection, locked ones included, with what the
     /// service shows without an unlock. Never unlocks, never reads a secret.
-    pub(crate) async fn inventory(&self) -> zbus::Result<LegacyRead> {
-        let mut read = LegacyRead::default();
+    pub(crate) async fn inventory(&self) -> zbus::Result<SecretServiceRead> {
+        let mut read = SecretServiceRead::default();
         for path in self.collections().await? {
             read.items
                 .extend(self.items(&path).await?.into_iter().map(|(_, item)| item));
@@ -233,8 +253,8 @@ impl Legacy {
     /// `unlock` is set, one collection at a time, so each password-protected
     /// collection gets its own prompt; a dismissed prompt skips that
     /// collection and the others continue.
-    pub(crate) async fn read_all(&self, unlock: bool) -> zbus::Result<LegacyRead> {
-        let mut read = LegacyRead::default();
+    pub(crate) async fn read_all(&self, unlock: bool) -> zbus::Result<SecretServiceRead> {
+        let mut read = SecretServiceRead::default();
         for path in self.collections().await? {
             let name = collection_name(path.as_str());
             if self.collection_locked(&path).await? {

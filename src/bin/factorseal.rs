@@ -12,6 +12,9 @@ mod commands;
 mod completion;
 #[path = "factorseal/desktop_worker.rs"]
 mod desktop_worker;
+#[cfg(all(target_os = "linux", feature = "vault"))]
+#[path = "factorseal/export_secret_service.rs"]
+mod export_secret_service;
 #[path = "factorseal/factor.rs"]
 mod factor;
 #[path = "factorseal/platform.rs"]
@@ -149,6 +152,10 @@ enum CliError {
     #[error("diagnostics failed: {0}")]
     Diagnostics(std::io::Error),
 
+    #[cfg(all(target_os = "linux", feature = "vault"))]
+    #[error("{0}")]
+    SecretServiceExport(String),
+
     #[cfg(all(target_os = "linux", feature = "secretspec-provider"))]
     #[error("WSL setup failed: {0}")]
     WslSetup(String),
@@ -200,6 +207,42 @@ fn run(cli: Cli) -> Result<(), CliError> {
             );
         }
         return Ok(());
+    }
+    #[cfg(all(target_os = "linux", feature = "vault"))]
+    if let Command::ExportSecretService {
+        file,
+        inventory,
+        wsl_distro,
+        native,
+        framed,
+        passphrase_stdin,
+        passphrase_file,
+        ..
+    } = cli.command
+    {
+        use export_secret_service::{Output, Target};
+        let target = Target::choose(wsl_distro, native, std::env::var("WSL_DISTRO_NAME").ok())?;
+        let output = match (inventory, file) {
+            (true, _) => Output::Inventory { framed },
+            (false, Some(file)) => Output::File {
+                file,
+                passphrase_file,
+            },
+            (false, None) if passphrase_stdin => Output::Framed,
+            (false, None) => {
+                return Err(CliError::SecretServiceExport(
+                    "a framed export takes its passphrase from --passphrase-stdin".to_owned(),
+                ));
+            }
+        };
+        return export_secret_service::run(
+            &target,
+            &output,
+            factorseal::vault::read_secret_service,
+            &mut std::io::stdin().lock(),
+            &mut std::io::stdout().lock(),
+            &mut std::io::stderr().lock(),
+        );
     }
     let root = resolve_root(cli.root.as_deref())?;
     let socket = cli.socket.as_deref();
@@ -332,6 +375,8 @@ fn run(cli: Cli) -> Result<(), CliError> {
             feature = "vault"
         ))]
         Command::WslKeyring => wsl_keyring::serve(),
+        #[cfg(all(target_os = "linux", feature = "vault"))]
+        Command::ExportSecretService { .. } => unreachable!("handled before vault access"),
     }
 }
 

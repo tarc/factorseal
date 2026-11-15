@@ -357,7 +357,7 @@ fn private_bus() -> bool {
 /// Collection, locked, label, modified and value of each item.
 type Summary = (String, bool, Option<String>, Option<u64>, Option<Vec<u8>>);
 
-fn summary(read: &LegacyRead) -> Vec<Summary> {
+fn summary(read: &SecretServiceRead) -> Vec<Summary> {
     read.items
         .iter()
         .map(|item| {
