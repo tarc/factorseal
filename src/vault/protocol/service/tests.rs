@@ -5840,3 +5840,101 @@ fn a_look_alike_never_stands_in_for_an_item_whose_id_is_taken() {
         }
     }
 }
+
+/// Remove the keyring item `id` from `partition`, as a program deleting
+/// it through the Secret Service would: its value and its index entry.
+fn delete_keyring_item(service: &VaultService, partition: &[u8], id: &str, now: u64) {
+    use crate::vault::secret_service_data::INDEX_ITEM;
+    use crate::vault::{DocumentOperation, SecretAddress};
+    let state = service.state.lock_live(Instant::now()).unwrap();
+    let mut index = super::secret_service_index(state.store(), partition, now).unwrap();
+    let position = index.items.iter().position(|item| item.id == id).unwrap();
+    let removed = index.items.remove(position);
+    state
+        .store()
+        .mutate(
+            DocumentKind::LinuxSecretService,
+            partition,
+            vec![
+                DocumentOperation::Delete {
+                    address: removed.address().unwrap(),
+                },
+                DocumentOperation::Put {
+                    address: SecretAddress::new(INDEX_ITEM, None).unwrap(),
+                    value: zeroize::Zeroizing::new(serde_json::to_vec(&index).unwrap()),
+                    evict_at: None,
+                },
+            ],
+            &Provenance::caller(&caller(), None),
+            now,
+        )
+        .unwrap();
+}
+
+#[test]
+fn a_freed_link_in_the_chain_doesnt_hide_a_moved_attribute_less_item() {
+    let a = "11111111111111111111111111111111";
+    let first = super::relocated_keyring_id(a);
+    for partition in keyring_partitions() {
+        // The middle link freed: the taker holds a, r (with attributes)
+        // moved to the first link, x (without) to the second; r is deleted.
+        // Then the item at a itself freed: x moved to the first link, the
+        // taker is deleted.
+        for freed in [first.as_str(), a] {
+            let (_directory, service) = service(100, UnsealLeasePolicy::default());
+            let manager = caller();
+            service.authorize_permission_manager(&manager, 100).unwrap();
+            let taker = keyring_item(a, &[("k", "v")], "t", 1);
+            let r = keyring_item(a, &[("r", "1")], "r", 2);
+            let x = keyring_item(a, &[], "x", 3);
+            import_keyring_item(&service, &manager, &partition, &taker, b"t", false, 101);
+            if freed == first {
+                import_keyring_item(&service, &manager, &partition, &r, b"r", false, 101);
+            }
+            assert_eq!(
+                import_keyring_item(&service, &manager, &partition, &x, b"x", false, 102),
+                VaultEntryImportStatus::Added
+            );
+            delete_keyring_item(&service, &partition, freed, 103);
+            assert_eq!(
+                import_keyring_item(&service, &manager, &partition, &x, b"x", false, 104),
+                VaultEntryImportStatus::KeptExisting,
+                "freed {freed}"
+            );
+            let copies = keyring_items(&service, &manager, &partition, 105)
+                .into_iter()
+                .filter(|(item, _)| item.label == "x")
+                .count();
+            assert_eq!(copies, 1, "freed {freed}");
+        }
+    }
+}
+
+/// Known limitation (plan step 1): a backup holding an attribute-less item
+/// at an id and another at that id's relocated id, both from one lineage,
+/// restored where an item with attributes holds the id, keeps only one.
+/// Pinned so that a change to it is deliberate.
+#[test]
+fn known_limitation_one_lineage_items_of_one_backup_can_merge() {
+    let a = "11111111111111111111111111111111";
+    let first = super::relocated_keyring_id(a);
+    for partition in keyring_partitions() {
+        let (_directory, service) = service(100, UnsealLeasePolicy::default());
+        let manager = caller();
+        service.authorize_permission_manager(&manager, 100).unwrap();
+        let taker = keyring_item(a, &[("k", "v")], "t", 1);
+        import_keyring_item(&service, &manager, &partition, &taker, b"t", false, 101);
+        let w = keyring_item(a, &[], "w", 6);
+        let x = keyring_item(&first, &[], "x", 6);
+        assert_eq!(
+            [(&w, b"w"), (&x, b"x")].map(|(item, value)| {
+                import_keyring_item(&service, &manager, &partition, item, value, false, 102)
+            }),
+            [
+                VaultEntryImportStatus::Added,
+                VaultEntryImportStatus::KeptExisting
+            ]
+        );
+        assert_eq!(keyring_items(&service, &manager, &partition, 103).len(), 2);
+    }
+}
