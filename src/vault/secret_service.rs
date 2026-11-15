@@ -174,7 +174,11 @@ impl SecretServiceHost {
     /// an async runtime.
     #[cfg(feature = "vault")]
     pub fn install_wsl(&self, client: Box<dyn VaultClient>, distro: &str) -> VaultResult<()> {
-        self.install_store(Store::wsl(client, distro, Arc::new(declare_dbus_caller))?)?
+        // One resolver per collection: each unique bus name is asked of
+        // the bus once, however often its program calls.
+        let resolver = super::linux::DbusCallerResolver::default();
+        let declarer = move |sender: &str| declare_dbus_caller(&resolver, sender);
+        self.install_store(Store::wsl(client, distro, Arc::new(declarer))?)?
             .blocking_recv()
             .map_err(|_| stopped())?
     }
@@ -288,8 +292,11 @@ impl Default for SecretServiceHostOptions {
 /// The program behind D-Bus `sender` and its folder, resolved as the vault
 /// resolves a native caller, for the vault of a WSL keyring to approve.
 #[cfg(feature = "vault")]
-fn declare_dbus_caller(sender: &str) -> VaultResult<(super::DeclaredKeyringCaller, String)> {
-    let (identity, folder) = super::linux::dbus_caller_identity(sender)?;
+fn declare_dbus_caller(
+    resolver: &super::linux::DbusCallerResolver,
+    sender: &str,
+) -> VaultResult<(super::DeclaredKeyringCaller, String)> {
+    let (identity, folder) = resolver.resolve(sender)?;
     let uid = identity
         .user_id()
         .strip_prefix("uid:")
@@ -326,6 +333,12 @@ enum Command {
     DismissPrompts,
     Stop,
 }
+
+/// How often a pending approval is asked about.
+const APPROVAL_POLL: Duration = Duration::from_millis(100);
+/// The longest wait between asking about a WSL keyring's pending approval;
+/// the wait doubles from [`APPROVAL_POLL`] up to it.
+const MAX_WSL_APPROVAL_POLL: Duration = Duration::from_secs(1);
 
 /// State shared between the interface objects and the host.
 struct Shared {
@@ -470,6 +483,7 @@ impl Shared {
     ) -> Result<Arc<Agent>, SecretServiceError> {
         let agent = self.agent()?;
         let mut pending = None;
+        let mut poll = APPROVAL_POLL;
         let deadline = tokio::time::Instant::now() + Duration::from_mins(2);
         loop {
             let response = tokio::task::spawn_blocking({
@@ -528,7 +542,13 @@ impl Shared {
                     "FactorSeal permission request timed out after 120 seconds".to_owned(),
                 ));
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(poll).await;
+            // Each poll of a WSL keyring crosses interop and the broker into
+            // the Windows vault: wait longer each time while the person
+            // decides.
+            if agent.store.declares_callers() {
+                poll = poll.saturating_mul(2).min(MAX_WSL_APPROVAL_POLL);
+            }
         }
     }
 
@@ -2166,6 +2186,100 @@ mod tests {
         });
     }
 
+    /// A vault that leaves every keyring access pending, counting how often
+    /// it is asked.
+    struct PendingVault(std::sync::atomic::AtomicUsize);
+
+    impl VaultClient for PendingVault {
+        fn request(&self, request: &crate::VaultRequest) -> VaultResult<crate::VaultResponse> {
+            let asked = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(if asked == 0 {
+                crate::VaultResponse::failure(
+                    request.request_id(),
+                    crate::VaultResponseError {
+                        code: crate::VaultResponseErrorCode::AuthorizationRequired,
+                        message: "approve".to_owned(),
+                        interaction: Some(crate::vault::VaultInteractionReference {
+                            id: "prm_0123456789abcdef0123456789abcdef".to_owned(),
+                            expires_at: u64::MAX,
+                        }),
+                    },
+                )
+            } else {
+                crate::VaultResponse::success(
+                    request.request_id(),
+                    super::super::VaultResponseBody::PermissionWait {
+                        status: super::super::PermissionWaitStatus::Pending,
+                    },
+                )
+            })
+        }
+    }
+
+    /// While a WSL keyring approval waits, each poll crosses into the
+    /// Windows vault: the host asks less often as the wait goes on (100,
+    /// 200, 400, 800 ms, then every second), where a native vault's host
+    /// asks every 100 ms.
+    #[test]
+    fn a_wsl_keyring_asks_about_a_pending_approval_less_and_less_often() {
+        struct Counted(Arc<PendingVault>);
+        impl VaultClient for Counted {
+            fn request(&self, request: &crate::VaultRequest) -> VaultResult<crate::VaultResponse> {
+                self.0.request(request)
+            }
+        }
+        let count = |wsl: bool| {
+            let vault = Arc::new(PendingVault(std::sync::atomic::AtomicUsize::new(0)));
+            let client = Box::new(Counted(Arc::clone(&vault)));
+            let store = if wsl {
+                Store::wsl(
+                    client,
+                    "NixOS",
+                    Arc::new(|_: &str| {
+                        Ok((
+                            super::super::DeclaredKeyringCaller {
+                                uid: 1000,
+                                executable: "/usr/bin/secret-tool".to_owned(),
+                                executable_digest: [3; 32],
+                            },
+                            "/home/me".to_owned(),
+                        ))
+                    }),
+                )
+                .unwrap()
+            } else {
+                Store::remote(client)
+            };
+            let shared = Shared::new(Arc::new(NoPrompter));
+            shared.set_agent(Some(Arc::new(Agent { store }))).unwrap();
+            runtime().block_on(async {
+                let waited = tokio::time::timeout(
+                    Duration::from_millis(1600),
+                    shared.authorized_agent(
+                        ":1.42",
+                        "demo",
+                        Some(
+                            crate::SecretAddress::new(
+                                secret_item("0123456789abcdef0123456789abcdef"),
+                                None,
+                            )
+                            .unwrap(),
+                        ),
+                        super::super::PermissionOperation::Get,
+                    ),
+                )
+                .await;
+                assert!(waited.is_err(), "the approval is still pending");
+            });
+            vault.0.load(std::sync::atomic::Ordering::Relaxed)
+        };
+        // 0, 100, 300, 700, 1500 ms: five requests in 1.6 s.
+        let wsl = count(true);
+        assert!((3..=7).contains(&wsl), "{wsl} requests");
+        let native = count(false);
+        assert!(native >= 8, "{native} requests");
+    }
+
     #[test]
     fn a_wsl_caller_is_declared_as_the_vault_would_resolve_it() {
         runtime().block_on(async {
@@ -2173,11 +2287,13 @@ mod tests {
                 return;
             };
             let sender = connection.unique_name().unwrap().to_string();
-            let (caller, folder) =
-                tokio::task::spawn_blocking(move || declare_dbus_caller(&sender))
-                    .await
-                    .unwrap()
-                    .unwrap();
+            let resolver = Arc::new(crate::vault::linux::DbusCallerResolver::default());
+            let declare = |resolver: &Arc<crate::vault::linux::DbusCallerResolver>| {
+                let resolver = Arc::clone(resolver);
+                let sender = sender.clone();
+                tokio::task::spawn_blocking(move || declare_dbus_caller(&resolver, &sender))
+            };
+            let (caller, folder) = declare(&resolver).await.unwrap().unwrap();
             let native = crate::vault::linux::linux_caller_identity_for_executable(
                 std::env::current_exe().unwrap(),
             )
@@ -2186,6 +2302,23 @@ mod tests {
             assert_eq!(caller.executable, native.application_id());
             assert_eq!(caller.executable_digest, *native.executable_digest());
             assert!(folder.starts_with('/'), "{folder}");
+
+            // The same name again: the same answer, without asking the bus.
+            let (again, again_folder) = declare(&resolver).await.unwrap().unwrap();
+            assert_eq!(again, caller);
+            assert_eq!(again_folder, folder);
+            assert_eq!(resolver.bus_lookups(), 1);
+
+            // A remembered process that no longer matches (another start
+            // time: its PID was reused) is refused and forgotten; the next
+            // call asks the bus again.
+            resolver.remember_for_test(&sender, |start_time| start_time + 1);
+            assert!(matches!(
+                declare(&resolver).await.unwrap(),
+                Err(VaultError::AuthorizationRequired)
+            ));
+            assert!(declare(&resolver).await.unwrap().is_ok());
+            assert_eq!(resolver.bus_lookups(), 2);
             assert!(connection.release_name(BUS_NAME).await.unwrap());
         });
     }

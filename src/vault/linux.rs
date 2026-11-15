@@ -612,12 +612,109 @@ pub(crate) fn dbus_caller_identity(name: &str) -> VaultResult<(CallerIdentity, S
     })
 }
 
-fn dbus_caller_identity_blocking(name: &str) -> VaultResult<(CallerIdentity, String)> {
-    zbus::block_on(dbus_caller_identity_async(name))
+/// Resolves D-Bus callers as [`dbus_caller_identity`] does, remembering
+/// each unique name's user, process and its start time. A unique name is
+/// never reused on a bus, so a later call for the same name makes no bus
+/// round trip: it checks again on `/proc` that the process is the one that
+/// owned the name (its start time), that it is not traced or started under
+/// loader injection, and its executable (re-hashed by the identity cache
+/// when the image changed), and reads its folder again, since the process
+/// may have changed directory.
+#[derive(Default)]
+pub(crate) struct DbusCallerResolver {
+    names: Mutex<std::collections::HashMap<String, (u32, i32, u64)>>,
+    identities: CallerIdentityCache,
+    #[cfg(test)]
+    bus_lookups: std::sync::atomic::AtomicUsize,
 }
 
-async fn dbus_caller_identity_async(name: &str) -> VaultResult<(CallerIdentity, String)> {
-    static CACHE: std::sync::OnceLock<CallerIdentityCache> = std::sync::OnceLock::new();
+#[cfg(test)]
+impl DbusCallerResolver {
+    /// How often a name was asked of the bus.
+    pub(crate) fn bus_lookups(&self) -> usize {
+        self.bus_lookups.load(Ordering::Relaxed)
+    }
+
+    /// Change what is remembered of `name`'s process start time.
+    pub(crate) fn remember_for_test(&self, name: &str, start_time: impl FnOnce(u64) -> u64) {
+        let mut names = self.names.lock().unwrap();
+        let entry = names.get_mut(name).expect("a remembered name");
+        entry.2 = start_time(entry.2);
+    }
+}
+
+impl DbusCallerResolver {
+    pub(crate) fn resolve(&self, name: &str) -> VaultResult<(CallerIdentity, String)> {
+        let known = self
+            .names
+            .lock()
+            .map_err(|_| VaultError::WorkerUnavailable)?
+            .get(name)
+            .copied();
+        let (uid, pid, start_time) = if let Some(known) = known {
+            known
+        } else {
+            #[cfg(test)]
+            self.bus_lookups.fetch_add(1, Ordering::Relaxed);
+            let process = dbus_name_process(name)?;
+            let mut names = self
+                .names
+                .lock()
+                .map_err(|_| VaultError::WorkerUnavailable)?;
+            if names.len() >= super::MAX_CALLER_IDENTITY_CACHE_ENTRIES {
+                names.clear();
+            }
+            names.insert(name.to_owned(), process);
+            process
+        };
+        let resolved = (|| {
+            if process_start_time(pid)? != start_time {
+                return Err(VaultError::AuthorizationRequired);
+            }
+            let identity = process_identity(uid, pid, &self.identities)?;
+            if process_start_time(pid)? != start_time {
+                return Err(VaultError::AuthorizationRequired);
+            }
+            Ok((identity, process_folder(pid)?))
+        })();
+        if resolved.is_err()
+            && let Ok(mut names) = self.names.lock()
+        {
+            names.remove(name);
+        }
+        resolved
+    }
+}
+
+/// The user, process and process start time behind unique bus name `name`,
+/// on a connection of its own (see [`dbus_caller_identity`]). The name is
+/// asked for its process again after the start time is read, so the start
+/// time is that of the name's owner, not of a process that reused its PID.
+fn dbus_name_process(name: &str) -> VaultResult<(u32, i32, u64)> {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("factorseal-dbus-identity".to_owned())
+            .spawn_scoped(scope, || {
+                zbus::block_on(async {
+                    let (proxy, uid, pid) = dbus_name_owner(name).await?;
+                    let start_time = process_start_time(pid)?;
+                    let current: Result<u32, _> =
+                        proxy.call("GetConnectionUnixProcessID", &(name,)).await;
+                    if current.ok().and_then(|current| i32::try_from(current).ok()) != Some(pid) {
+                        return Err(VaultError::AuthorizationRequired);
+                    }
+                    Ok((uid, pid, start_time))
+                })
+            })
+            .map_err(|_| VaultError::WorkerUnavailable)?
+            .join()
+            .map_err(|_| VaultError::WorkerUnavailable)?
+    })
+}
+
+/// A bus proxy on a new session connection, and the user and process
+/// behind unique name `name`.
+async fn dbus_name_owner(name: &str) -> VaultResult<(zbus::Proxy<'static>, u32, i32)> {
     if !name.starts_with(':') {
         return Err(VaultError::AuthorizationRequired);
     }
@@ -626,8 +723,8 @@ async fn dbus_caller_identity_async(name: &str) -> VaultResult<(CallerIdentity, 
         .build()
         .await
         .map_err(|error| VaultError::Protocol(error.to_string()))?;
-    let proxy = zbus::Proxy::new(
-        &connection,
+    let proxy = zbus::Proxy::new_owned(
+        connection,
         "org.freedesktop.DBus",
         "/org/freedesktop/DBus",
         "org.freedesktop.DBus",
@@ -642,27 +739,39 @@ async fn dbus_caller_identity_async(name: &str) -> VaultResult<(CallerIdentity, 
         .call("GetConnectionUnixProcessID", &(name,))
         .await
         .map_err(|_| VaultError::AuthorizationRequired)?;
-    let identity = process_identity(
-        uid,
-        i32::try_from(pid).map_err(|_| VaultError::AuthorizationRequired)?,
-        CACHE.get_or_init(CallerIdentityCache::default),
-    )?;
-    // The unique bus name must still refer to the same live connection.
-    let current: Result<u32, _> = proxy.call("GetConnectionUnixProcessID", &(name,)).await;
-    if current.ok() != Some(pid) {
-        return Err(VaultError::AuthorizationRequired);
-    }
+    let pid = i32::try_from(pid).map_err(|_| VaultError::AuthorizationRequired)?;
+    Ok((proxy, uid, pid))
+}
+
+/// A caller's folder: the nearest ancestor of its working directory holding
+/// `secretspec.toml`, or that directory.
+fn process_folder(pid: i32) -> VaultResult<String> {
     let cwd = fs::canonicalize(format!("/proc/{pid}/cwd"))
         .map_err(|_| VaultError::AuthorizationRequired)?;
     let folder = cwd
         .ancestors()
         .find(|folder| folder.join("secretspec.toml").is_file())
         .unwrap_or(&cwd);
-    let folder = folder
+    Ok(folder
         .to_str()
         .ok_or(VaultError::AuthorizationRequired)?
-        .to_owned();
-    Ok((identity, folder))
+        .to_owned())
+}
+
+fn dbus_caller_identity_blocking(name: &str) -> VaultResult<(CallerIdentity, String)> {
+    zbus::block_on(dbus_caller_identity_async(name))
+}
+
+async fn dbus_caller_identity_async(name: &str) -> VaultResult<(CallerIdentity, String)> {
+    static CACHE: std::sync::OnceLock<CallerIdentityCache> = std::sync::OnceLock::new();
+    let (proxy, uid, pid) = dbus_name_owner(name).await?;
+    let identity = process_identity(uid, pid, CACHE.get_or_init(CallerIdentityCache::default))?;
+    // The unique bus name must still refer to the same live connection.
+    let current: Result<u32, _> = proxy.call("GetConnectionUnixProcessID", &(name,)).await;
+    if current.ok().and_then(|current| i32::try_from(current).ok()) != Some(pid) {
+        return Err(VaultError::AuthorizationRequired);
+    }
+    Ok((identity, process_folder(pid)?))
 }
 
 fn process_identity(
