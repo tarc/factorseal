@@ -5719,3 +5719,68 @@ fn restoring_an_attribute_less_item_whose_id_is_taken_twice_adds_it_once() {
         assert_eq!(keyring_items(&service, &manager, &partition, 104).len(), 2);
     }
 }
+
+#[test]
+fn different_attribute_less_items_with_one_label_and_time_are_both_restored() {
+    for partition in keyring_partitions() {
+        for replace_existing in [false, true] {
+            let (_directory, service) = service(100, UnsealLeasePolicy::default());
+            let manager = caller();
+            service.authorize_permission_manager(&manager, 100).unwrap();
+            let a = keyring_item("11111111111111111111111111111111", &[], "Unnamed", 6);
+            let b = keyring_item("22222222222222222222222222222222", &[], "Unnamed", 6);
+            let statuses: Vec<_> = [(&a, b"one"), (&b, b"two")]
+                .into_iter()
+                .map(|(item, value)| {
+                    import_keyring_item(
+                        &service,
+                        &manager,
+                        &partition,
+                        item,
+                        value,
+                        replace_existing,
+                        101,
+                    )
+                })
+                .collect();
+            assert_eq!(
+                statuses,
+                [VaultEntryImportStatus::Added, VaultEntryImportStatus::Added]
+            );
+            assert_eq!(
+                keyring_items(&service, &manager, &partition, 102),
+                vec![(a, b"one".to_vec()), (b, b"two".to_vec())]
+            );
+        }
+    }
+}
+
+#[test]
+fn an_attribute_less_item_matches_its_own_id_before_a_look_alike() {
+    for partition in keyring_partitions() {
+        let (_directory, service) = service(100, UnsealLeasePolicy::default());
+        let manager = caller();
+        service.authorize_permission_manager(&manager, 100).unwrap();
+        // The look-alike comes first in index order.
+        let look_alike = keyring_item("99999999999999999999999999999999", &[], "Unnamed", 6);
+        let own = keyring_item("11111111111111111111111111111111", &[], "Unnamed", 6);
+        import_keyring_item(
+            &service,
+            &manager,
+            &partition,
+            &look_alike,
+            b"x",
+            false,
+            101,
+        );
+        import_keyring_item(&service, &manager, &partition, &own, b"old", false, 101);
+        assert_eq!(
+            import_keyring_item(&service, &manager, &partition, &own, b"new", true, 102),
+            VaultEntryImportStatus::Replaced
+        );
+        assert_eq!(
+            keyring_items(&service, &manager, &partition, 103),
+            vec![(own, b"new".to_vec()), (look_alike, b"x".to_vec())]
+        );
+    }
+}

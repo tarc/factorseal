@@ -1019,6 +1019,28 @@ fn secret_service_index(
     Index::decode(bytes.as_deref())
 }
 
+/// The existing item an incoming attribute-less item is, if any: the
+/// attribute-less item with its id; none when its id is free (it is added
+/// under that id); and only when an item with attributes took its id, the
+/// first attribute-less item with its label, content type and created time,
+/// which an earlier restore added under a fresh id. Without that last rule
+/// every restore of the same backup would add another copy.
+fn attribute_less_match(
+    items: &[crate::vault::secret_service_data::IndexItem],
+    incoming: &crate::vault::secret_service_data::IndexItem,
+) -> Option<usize> {
+    match items.iter().position(|item| item.id == incoming.id) {
+        Some(position) if items[position].attributes.is_empty() => Some(position),
+        None => None,
+        Some(_) => items.iter().position(|item| {
+            item.attributes.is_empty()
+                && item.label == incoming.label
+                && item.content_type == incoming.content_type
+                && item.created == incoming.created
+        }),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn import_secret_service_item(
     store: &VaultStore,
@@ -1041,21 +1063,16 @@ fn import_secret_service_item(
     let mut index = secret_service_index(store, partition, now)?;
     // An item that answers the same lookup is the existing one, matched as
     // CreateItem with replace=true matches: the first in index order. An
-    // item without attributes answers no lookup, so it matches by id, or,
-    // once a taken id gave it a fresh one, by label, content type and
-    // creation time, so a repeated restore keeps it instead of adding it
-    // again.
-    let existing = index.items.iter().position(|item| {
-        if portable.item.attributes.is_empty() {
-            item.attributes.is_empty()
-                && (item.id == portable.item.id
-                    || (item.label == portable.item.label
-                        && item.content_type == portable.item.content_type
-                        && item.created == portable.item.created))
-        } else {
-            item.attributes == portable.item.attributes
-        }
-    });
+    // item without attributes answers no lookup, so it matches only by id;
+    // see attribute_less_match.
+    let existing = if portable.item.attributes.is_empty() {
+        attribute_less_match(&index.items, &portable.item)
+    } else {
+        index
+            .items
+            .iter()
+            .position(|item| item.attributes == portable.item.attributes)
+    };
     if let Some(position) = existing {
         if !replace_existing {
             return Ok(super::VaultEntryImportStatus::KeptExisting);
