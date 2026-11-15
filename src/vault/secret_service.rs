@@ -3312,6 +3312,104 @@ mod tests {
             assert_eq!(secret.2, b"backup");
         });
     }
+    /// Driven by `scripts/test-keyring-import.sh` on its private bus: restore
+    /// the archive `export-secret-service --native` wrote into a test vault,
+    /// serve it, and look each item up with secret-tool. Each line of the
+    /// lookups file is the expected value, then attribute names and values,
+    /// tab-separated.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "run by scripts/test-keyring-import.sh"]
+    fn restored_gnome_keyring_archive_is_found_by_secret_tool() {
+        let variable = |name: &str| std::env::var_os(name).unwrap_or_else(|| panic!("{name}"));
+        let tool = variable("FACTORSEAL_TEST_SECRET_TOOL");
+        let archive = std::fs::read(variable("FACTORSEAL_TEST_KEYRING_ARCHIVE")).unwrap();
+        let passphrase = variable("FACTORSEAL_TEST_KEYRING_PASSPHRASE");
+        let lookups = std::fs::read_to_string(variable("FACTORSEAL_TEST_KEYRING_LOOKUPS")).unwrap();
+        let archive =
+            crate::decrypt_vault_archive(&archive, passphrase.as_encoded_bytes()).unwrap();
+        runtime().block_on(async {
+            let (probe, _bus_guard) = free_session_bus()
+                .await
+                .expect("test needs an isolated, unused bus");
+            let client = Connection::session().await.unwrap();
+            let bus = fdo::DBusProxy::new(&client).await.unwrap();
+            let mut owners = bus
+                .receive_name_owner_changed_with_args(&[(0, BUS_NAME)])
+                .await
+                .unwrap();
+            let (_directory, service, caller) = test_service();
+            service
+                .authorize_permission_manager(&caller, unix_time())
+                .unwrap();
+            for entry in archive.entries {
+                let response = service.handle(
+                    &caller,
+                    crate::VaultRequest::new(crate::VaultAction::ImportVaultEntry {
+                        entry: entry.metadata,
+                        value: entry.value,
+                        evict_at: None,
+                        replace_existing: false,
+                    })
+                    .unwrap(),
+                    unix_time(),
+                );
+                assert!(
+                    matches!(
+                        response.result,
+                        Ok(crate::VaultResponseBody::VaultEntryImported {
+                            status: crate::VaultEntryImportStatus::Added
+                        })
+                    ),
+                    "{:?}",
+                    response.result
+                );
+            }
+            let (sender, _requested) = mpsc::unbounded_channel();
+            let host = SecretServiceHost::start_with(
+                Arc::new(ChannelPrompter(sender)),
+                Duration::from_millis(1),
+            )
+            .unwrap();
+            probe.release_name(BUS_NAME).await.unwrap();
+            while next(&mut owners)
+                .await
+                .unwrap()
+                .args()
+                .unwrap()
+                .new_owner()
+                .is_none()
+            {}
+            host.install_store(Store::in_process(Arc::clone(&service), caller.clone()))
+                .unwrap()
+                .await
+                .unwrap()
+                .unwrap();
+            for line in lookups.lines().filter(|line| !line.is_empty()) {
+                let mut fields = line.split('\t');
+                let expected = fields.next().unwrap().to_owned();
+                let attributes: Vec<String> = fields.map(str::to_owned).collect();
+                let tool = tool.clone();
+                let output = tokio::task::spawn_blocking(move || {
+                    std::process::Command::new(tool)
+                        .arg("lookup")
+                        .args(&attributes)
+                        .output()
+                        .unwrap()
+                })
+                .await
+                .unwrap();
+                assert!(
+                    output.status.success(),
+                    "lookup {line}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(String::from_utf8_lossy(&output.stdout), expected, "{line}");
+            }
+            drop(host);
+        });
+    }
+
     #[test]
     fn concurrent_keyring_import_and_create_preserve_both_items() {
         let (_source_dir, source) = archive_agent();
