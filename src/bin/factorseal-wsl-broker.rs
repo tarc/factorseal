@@ -14,7 +14,8 @@
 //!   factorseal-wsl-broker.exe <pipe-name> <distro> get <project> <profile> <key>
 //!   factorseal-wsl-broker.exe <pipe-name> <distro> relay
 //!
-//! `relay` serves a Linux client (the SecretSpec provider in WSL) over
+//! `relay` serves a Linux client (the SecretSpec provider or the keyring
+//! host `factorseal wsl-keyring` in WSL) over
 //! standard input and output until the input ends; see
 //! `factorseal::vault::wsl_relay` for the framing, the folder translation
 //! and the requests it forwards.

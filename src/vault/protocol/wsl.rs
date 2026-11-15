@@ -1,6 +1,7 @@
 //! Relaying vault requests from WSL2 through `factorseal-wsl-broker.exe`.
 //!
-//! A Linux client in WSL (the SecretSpec provider) writes each encoded
+//! A Linux client in WSL (the SecretSpec provider, or the WSL keyring host
+//! `factorseal wsl-keyring`) writes each encoded
 //! [`VaultRequest`] to the broker's standard input and reads the encoded
 //! [`VaultResponse`] from its standard output. Each message is a frame: a
 //! four-byte little-endian length, then that many bytes.
@@ -68,20 +69,38 @@ pub fn write_frame(writer: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
     writer.flush()
 }
 
-/// Whether the broker forwards a request with this action to the vault:
-/// exactly what the SecretSpec provider sends from WSL. Everything else is
-/// answered by the broker, so the relay never raises an approval prompt for
-/// it (see the module documentation for what that does not prevent).
+/// Whether the broker for `distro` forwards a request with this action to
+/// the vault: exactly what the WSL clients send. The SecretSpec provider's
+/// cache actions and permission waits; and the WSL keyring host's access
+/// checks, whose action may only read or write `distro`'s keyring, plus its
+/// own read of that keyring's index (labels and attributes, no secrets).
+/// Item values only travel inside an access check for a declared caller,
+/// and nothing seals the vault. Everything else is answered by the broker,
+/// so the relay never raises an approval prompt for it (see the module
+/// documentation for what that does not prevent).
 #[must_use]
-pub const fn relay_allows(action: &VaultAction) -> bool {
-    matches!(
-        action,
+pub fn relay_allows(action: &VaultAction, distro: &str) -> bool {
+    let in_keyring = |namespace: &[u8]| wsl_keyring_distro(namespace) == Some(distro);
+    match action {
         VaultAction::Status
-            | VaultAction::WaitPermission { .. }
-            | VaultAction::GetCache { .. }
-            | VaultAction::PutCache { .. }
-            | VaultAction::DeleteCache { .. }
-    )
+        | VaultAction::WaitPermission { .. }
+        | VaultAction::GetCache { .. }
+        | VaultAction::PutCache { .. }
+        | VaultAction::DeleteCache { .. } => true,
+        VaultAction::WslKeyringAccess { action, .. } => match action.as_deref() {
+            None => true,
+            Some(VaultAction::Get { namespace, .. } | VaultAction::Mutate { namespace, .. }) => {
+                in_keyring(namespace)
+            }
+            Some(_) => false,
+        },
+        VaultAction::Get { namespace, address } => {
+            in_keyring(namespace)
+                && address.item == SECRET_SERVICE_INDEX_ITEM
+                && address.field.is_none()
+        }
+        _ => false,
+    }
 }
 
 /// Serve one Linux client in the broker: answer each request frame read
@@ -133,7 +152,7 @@ fn relay_one(client: &dyn VaultClient, distro: &str, frame: &[u8]) -> (VaultResp
             );
         }
     };
-    if !relay_allows(&request.action) {
+    if !relay_allows(&request.action, distro) {
         return (
             refusal(
                 id,
@@ -199,6 +218,10 @@ pub fn validate_distro(distro: &str) -> VaultResult<()> {
         ))
     }
 }
+
+/// The item holding a Secret Service collection's index (labels and
+/// attributes, no secrets), as the adapter names it.
+const SECRET_SERVICE_INDEX_ITEM: &str = "secret-service-index";
 
 /// Prefix of the keyring namespaces of WSL distros; the distro name follows.
 const WSL_KEYRING_NAMESPACE_PREFIX: &[u8] = b"factorseal/wsl-secret-service/v1/";
@@ -788,15 +811,122 @@ mod tests {
 
     #[test]
     fn only_the_providers_actions_are_relayed() {
-        assert!(relay_allows(&VaultAction::Status));
-        assert!(relay_allows(&VaultAction::WaitPermission {
-            id: "prm_x".to_owned(),
-            timeout_ms: 1,
-        }));
-        assert!(!relay_allows(&VaultAction::ListPermissions));
-        assert!(!relay_allows(&VaultAction::ListProjects {
-            cursor: None,
-            limit: 1,
-        }));
+        assert!(relay_allows(&VaultAction::Status, "NixOS"));
+        assert!(relay_allows(
+            &VaultAction::WaitPermission {
+                id: "prm_x".to_owned(),
+                timeout_ms: 1,
+            },
+            "NixOS"
+        ));
+        assert!(!relay_allows(&VaultAction::ListPermissions, "NixOS"));
+        assert!(!relay_allows(
+            &VaultAction::ListProjects {
+                cursor: None,
+                limit: 1,
+            },
+            "NixOS"
+        ));
+    }
+
+    fn keyring_get(distro: &str, item: &str) -> VaultAction {
+        VaultAction::Get {
+            namespace: wsl_keyring_namespace(distro).unwrap(),
+            address: super::super::wire::WireSecretAddress::new(item, None),
+        }
+    }
+
+    fn keyring_access(action: Option<VaultAction>) -> VaultAction {
+        VaultAction::WslKeyringAccess {
+            caller: super::super::wire::DeclaredKeyringCaller {
+                uid: 1000,
+                executable: "/usr/bin/secret-tool".to_owned(),
+                executable_digest: [3; 32],
+            },
+            entry: None,
+            service: "demo".to_owned(),
+            operation: super::super::wire::PermissionOperation::Get,
+            action: action.map(Box::new),
+            pending: None,
+        }
+    }
+
+    #[test]
+    fn the_relay_forwards_only_this_distros_keyring_and_never_seals() {
+        const ITEM: &str = "item/0123456789abcdef0123456789abcdef";
+        let mutate = |distro| VaultAction::Mutate {
+            namespace: wsl_keyring_namespace(distro).unwrap(),
+            mutations: vec![super::super::wire::VaultMutation::Delete {
+                address: super::super::wire::WireSecretAddress::new(ITEM, None),
+            }],
+        };
+        let forwarded = [
+            keyring_access(None),
+            keyring_access(Some(keyring_get("NixOS", ITEM))),
+            keyring_access(Some(mutate("NixOS"))),
+            // The host reads the index (labels and attributes) on its own.
+            keyring_get("NixOS", SECRET_SERVICE_INDEX_ITEM),
+        ];
+        let refused = [
+            keyring_access(Some(keyring_get("Debian", ITEM))),
+            keyring_access(Some(mutate("Debian"))),
+            // Item values only through an access check for a caller.
+            keyring_get("NixOS", ITEM),
+            keyring_get("Debian", SECRET_SERVICE_INDEX_ITEM),
+            mutate("NixOS"),
+            VaultAction::Seal {
+                namespace: wsl_keyring_namespace("NixOS").unwrap(),
+            },
+            VaultAction::KeyringAccess {
+                entry: None,
+                sender: ":1.5".to_owned(),
+                service: "demo".to_owned(),
+                operation: super::super::wire::PermissionOperation::Get,
+                action: None,
+                pending: None,
+            },
+            VaultAction::SetWslKeyrings {
+                distros: vec!["NixOS".to_owned()],
+            },
+        ];
+        let forwarded_count = forwarded.len();
+        let vault = RecordingVault {
+            seen: std::sync::Mutex::new(Vec::new()),
+            answers: std::sync::Mutex::new(
+                (0..forwarded_count)
+                    .map(|_| Ok(VaultResponseErrorCode::Conflict))
+                    .collect(),
+            ),
+        };
+        let frames: Vec<_> = forwarded
+            .into_iter()
+            .chain(refused)
+            .map(|action| encoded(action).1)
+            .collect();
+        let (responses, _) = served(&vault, &frames);
+        for (index, response) in responses.iter().enumerate() {
+            let expected = if index < forwarded_count {
+                VaultResponseErrorCode::Conflict
+            } else {
+                VaultResponseErrorCode::AuthorizationRequired
+            };
+            assert_eq!(code(response), Some(expected), "request {index}");
+        }
+        assert_eq!(vault.seen.lock().unwrap().len(), forwarded_count);
+        // Decoding already refuses other inner actions; the allowlist does
+        // not rely on it.
+        let seal = VaultAction::Seal {
+            namespace: wsl_keyring_namespace("NixOS").unwrap(),
+        };
+        assert!(!relay_allows(&keyring_access(Some(seal)), "NixOS"));
+    }
+
+    #[cfg(feature = "vault-store")]
+    #[test]
+    fn the_relay_names_the_adapters_index_item() {
+        assert_eq!(
+            SECRET_SERVICE_INDEX_ITEM,
+            crate::vault::secret_service_data::INDEX_ITEM
+        );
     }
 }
