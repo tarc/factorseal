@@ -575,12 +575,14 @@ impl AccessView {
         if grants.is_empty() {
             return;
         }
-        let (duration, single_use) = grant_choice(&grants, self.choice).lifetime();
-        if single_use && !single_write_allowed(&grants) {
-            self.error = Some("The requests changed. Choose how long to allow access.".to_owned());
-            cx.notify();
-            return;
-        }
+        let (duration, single_use) = match approval_lifetime(&grants, self.choice) {
+            Ok(lifetime) => lifetime,
+            Err(error) => {
+                self.error = Some(error.to_owned());
+                cx.notify();
+                return;
+            }
+        };
         let Some(metadata) = self.snapshot.metadata().cloned() else {
             return;
         };
@@ -1035,6 +1037,30 @@ fn grant_choice(grants: &[factorseal::Permission], choice: Option<GrantChoice>) 
         None => GrantChoice::Hour,
     }
 }
+
+// The duration and single-use flag to approve `grants` with. A choice the
+// person made for other requests no longer fits when requests arrive or
+// leave while the popup is open, so it needs a fresh choice: "Until the vault
+// seals" means "until revoked" to the vault for a native request, and a
+// native duration would outlast what the card shows for WSL requests.
+fn approval_lifetime(
+    grants: &[factorseal::Permission],
+    choice: Option<GrantChoice>,
+) -> Result<(Option<u64>, bool), &'static str> {
+    let choice = grant_choice(grants, choice);
+    let fits = match choice {
+        GrantChoice::ThisWriteOnly => single_write_allowed(grants),
+        GrantChoice::UntilSeal => all_relayed_from_wsl(grants),
+        GrantChoice::Hour | GrantChoice::UntilRevoked => !all_relayed_from_wsl(grants),
+    };
+    if fits {
+        Ok(choice.lifetime())
+    } else {
+        Err(CHOICE_CHANGED)
+    }
+}
+
+const CHOICE_CHANGED: &str = "The requests changed. Choose how long to allow access.";
 
 // A SecretSpec grant binds the provider, not the program that ran
 // `secretspec`, so say who it covers in those terms.
@@ -1937,8 +1963,58 @@ mod tests {
         // Mixed with a native request, the native durations stay.
         assert!(!all_relayed_from_wsl(&[wsl_read.clone(), mixed[1].clone()]));
         assert_eq!(
-            grant_choice(&[wsl_read, mixed[1].clone()], None),
+            grant_choice(&[wsl_read.clone(), mixed[1].clone()], None),
             GrantChoice::Hour
+        );
+        // A choice carried over from other requests needs a fresh choice: a
+        // native request that joins a WSL one must not be approved until
+        // revoked, and a WSL request left alone must not get a native
+        // duration.
+        let native_read = mixed[1].clone();
+        assert_eq!(
+            approval_lifetime(std::slice::from_ref(&wsl_read), None),
+            Ok((None, false))
+        );
+        assert_eq!(
+            approval_lifetime(
+                &[wsl_read.clone(), native_read.clone()],
+                Some(GrantChoice::UntilSeal)
+            ),
+            Err(CHOICE_CHANGED)
+        );
+        assert_eq!(
+            approval_lifetime(
+                std::slice::from_ref(&native_read),
+                Some(GrantChoice::UntilSeal)
+            ),
+            Err(CHOICE_CHANGED)
+        );
+        for choice in [GrantChoice::Hour, GrantChoice::UntilRevoked] {
+            assert_eq!(
+                approval_lifetime(std::slice::from_ref(&wsl_read), Some(choice)),
+                Err(CHOICE_CHANGED)
+            );
+        }
+        assert_eq!(
+            approval_lifetime(
+                &[wsl_read.clone(), native_read.clone()],
+                Some(GrantChoice::Hour)
+            ),
+            Ok((Some(3600), false))
+        );
+        assert_eq!(
+            approval_lifetime(
+                std::slice::from_ref(&native_read),
+                Some(GrantChoice::ThisWriteOnly)
+            ),
+            Err(CHOICE_CHANGED)
+        );
+        assert_eq!(
+            approval_lifetime(
+                std::slice::from_ref(&relayed(write.clone())),
+                Some(GrantChoice::ThisWriteOnly)
+            ),
+            Ok((None, true))
         );
         grant.scope = Some(factorseal::DocumentKind::LinuxSecretService);
 
