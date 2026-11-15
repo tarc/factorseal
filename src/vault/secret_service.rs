@@ -3342,28 +3342,34 @@ mod tests {
             service
                 .authorize_permission_manager(&caller, unix_time())
                 .unwrap();
-            for entry in archive.entries {
-                let response = service.handle(
-                    &caller,
-                    crate::VaultRequest::new(crate::VaultAction::ImportVaultEntry {
-                        entry: entry.metadata,
-                        value: entry.value,
-                        evict_at: None,
-                        replace_existing: false,
-                    })
-                    .unwrap(),
-                    unix_time(),
-                );
-                assert!(
-                    matches!(
-                        response.result,
-                        Ok(crate::VaultResponseBody::VaultEntryImported {
-                            status: crate::VaultEntryImportStatus::Added
+            // Stable ids and the attribute match make a second restore a
+            // no-op.
+            for (pass, status) in [
+                (1, crate::VaultEntryImportStatus::Added),
+                (2, crate::VaultEntryImportStatus::KeptExisting),
+            ] {
+                for entry in &archive.entries {
+                    let response = service.handle(
+                        &caller,
+                        crate::VaultRequest::new(crate::VaultAction::ImportVaultEntry {
+                            entry: entry.metadata.clone(),
+                            value: crate::WireSecret::new(entry.value.expose().to_vec()).unwrap(),
+                            evict_at: None,
+                            replace_existing: false,
                         })
-                    ),
-                    "{:?}",
-                    response.result
-                );
+                        .unwrap(),
+                        unix_time(),
+                    );
+                    assert!(
+                        matches!(
+                            &response.result,
+                            Ok(crate::VaultResponseBody::VaultEntryImported { status: actual })
+                                if *actual == status
+                        ),
+                        "pass {pass}: {:?}",
+                        response.result
+                    );
+                }
             }
             let (sender, _requested) = mpsc::unbounded_channel();
             let host = SecretServiceHost::start_with(

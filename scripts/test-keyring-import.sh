@@ -11,9 +11,8 @@
 #    restarted locked, then the framed export runs unlocked; both must
 #    give the same fingerprints.
 # 3. The archive is restored into a test vault.
-# 4. That vault's agent serves the Secret Service on a private bus, and
-#    secret-tool lookup must return each value (each lookup approved with
-#    `factorseal permissions approve`).
+# 4. That vault serves the Secret Service on a private bus, and secret-tool
+#    lookup must return each value; a second restore keeps every item.
 #
 # Usage: scripts/test-keyring-import.sh
 # FACTORSEAL_CLI overrides the CLI (default target/debug/factorseal, built
@@ -92,14 +91,27 @@ schema = Secret.Schema.new("test.int", Secret.SchemaFlags.NONE, {
 })
 assert Secret.password_store_sync(schema, {"port": "8080", "host": "example.org"},
     Secret.COLLECTION_DEFAULT, "Port check", "port_check_value", None)
+# No schema at all, as go-keyring (gh) and python-keyring store items.
+service = Secret.Service.get_sync(Secret.ServiceFlags.LOAD_COLLECTIONS, None)
+collection = Secret.Collection.for_alias_sync(service, "default", Secret.CollectionFlags.NONE, None)
+Secret.Item.create_sync(collection, None, {"service": "schemaless", "username": "octo"},
+    "Schema-less check", Secret.Value.new("schemaless_check_value", -1, "text/plain"),
+    Secret.ItemCreateFlags.NONE, None)
 PY
 '
-echo "seeded:     2 items (one with an INTEGER attribute)"
+echo "seeded:     3 items (an INTEGER attribute, a schema-less item)"
 
 # 2. Inventory locked, export unlocked.
 phase '
 start_keyring
 "$CLI" export-secret-service --inventory --native >"$BASE/inventory.json" 2>"$BASE/inventory.err"
+'
+# Locked again after an unlock in the same daemon: attributes stay plain.
+phase '
+start_keyring unlocked
+dbus-send --session --print-reply --dest=org.freedesktop.secrets /org/freedesktop/secrets \
+    org.freedesktop.Secret.Service.Lock array:objpath:/org/freedesktop/secrets/collection/login >/dev/null
+"$CLI" export-secret-service --inventory --native >"$BASE/relocked.json" 2>"$BASE/relocked.err"
 '
 phase '
 start_keyring unlocked
@@ -110,6 +122,7 @@ printf "%s\n" "opal nebula lantern saffron velocity" |
 import base64, json, sys
 base = sys.argv[1]
 inventory = json.load(open(f"{base}/inventory.json"))
+relocked = json.load(open(f"{base}/relocked.json"))
 text = open(f"{base}/export.out").read().splitlines()
 start = next(i for i, line in enumerate(text) if line.startswith("FACTORSEAL-FRAME v1 export "))
 assert text[start + 2] == "FACTORSEAL-FRAME end", "no frame end"
@@ -118,17 +131,20 @@ open(f"{base}/keyring.fsarchive", "wb").write(base64.b64decode(record["archive"]
 locked = sorted(item["fingerprint"] for item in inventory["items"])
 unlocked = sorted(item["fingerprint"] for item in record["items"])
 assert all(item["locked"] and "label" not in item for item in inventory["items"]), inventory
-assert len(locked) == 2 and locked == unlocked, (locked, unlocked)
+again = sorted(item["fingerprint"] for item in relocked["items"])
+assert len(locked) == 3 and locked == unlocked == again, (locked, unlocked, again)
+assert all(item["locked"] and "label" in item for item in relocked["items"]), relocked
 # The INTEGER item's fingerprint pinned in the unit tests (host, port, xdg:schema).
 assert "786097a0da05fd756c858c9f65ec38f3fd9485f684d626d40504649cbdf8cbc7" in locked, locked
 assert record["skipped"] == [] and inventory["skipped"] == [], (record, inventory)
 PY
-echo "fingerprints: locked inventory = unlocked export (2 items)"
+echo "fingerprints: locked, locked-again and unlocked agree (3 items)"
 
 # 3 and 4. Restore into a test vault (the library's, with a mock key
 # protector: a Linux CLI vault needs a TPM), serve it, look the values up.
 printf 'gho_check_value\tservice\tgh:github.com\tusername\tocto\n' >"$base/lookups"
 printf 'port_check_value\tport\t8080\thost\texample.org\n' >>"$base/lookups"
+printf 'schemaless_check_value\tservice\tschemaless\tusername\tocto\n' >>"$base/lookups"
 (
     cd "$repo"
     FACTORSEAL_TEST_SECRET_TOOL=$secret_tool \
@@ -138,5 +154,5 @@ printf 'port_check_value\tport\t8080\thost\texample.org\n' >>"$base/lookups"
         bash scripts/test-with-dbus.sh cargo test --all-features --lib -- \
         --ignored --exact vault::secret_service::tests::restored_gnome_keyring_archive_is_found_by_secret_tool
 ) >"$base/restore.log" 2>&1 || die "restore and lookup: $(grep -E 'panicked|assert|lookup|error' "$base/restore.log" | head -10)"
-echo "restored:   secret-tool finds both values in FactorSeal"
+echo "restored:   secret-tool finds all three values; a second restore keeps them all"
 echo "PASS"
