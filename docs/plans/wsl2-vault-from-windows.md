@@ -5,9 +5,9 @@ Status, 2026-11-15: milestone 1 (SecretSpec in WSL) is done on
 3ecbb9a, no PR), and the fixes from its independent review are committed
 on top (see "Review fixes" below), the Desktop popup fix (finding 1)
 included once the user saw it in the native build.
-Milestone 2 (the WSL keyring) is implemented and committed, except its
-Desktop UI, which waits for the user's review in the native build (see
-"Milestone 2: progress" below). Nothing is pushed. This branch
+Milestone 2 (the WSL keyring) is done and committed, its Desktop UI
+included after the user saw it in the native build (see "Milestone 2:
+progress" below). Nothing is pushed. This branch
 sits on `stack/7-browser-windows`, the top of the WSL2 PR stack (#42 → #43 →
 #44 → #46 → #47, index #40); rebase it with `git rebase --onto` when the stack
 changes or merges.
@@ -204,11 +204,12 @@ ignored), CLI 79, Desktop 187. poita built (`nix build --no-link`) with the
 proposed system-flakes edit: the activation file runs `factorseal
 wsl-keyring`, no gnome-keyring unit.
 
-Uncommitted, for the user's review in the native build: Settings → WSL
-keyrings and the popup's "(from WSL, unverified)"; the Projects/Provider
-cache copy; `check.sh keyring` (asserts the popup text); the docs (SECURITY.md,
-architecture, usage), which describe the Settings switch. The system-flakes edit (poita) is a proposal, not
-committed there.
+After the user's review in the native build (2026-11-15, "the UI changes look
+good"), committed with the gate before each: 0838a7b Settings → WSL keyrings
+and the popup's "(from WSL, unverified)"; be99435 the Projects/Provider-cache
+copy; 69f362a `check.sh keyring`; f305112 the docs (SECURITY.md,
+architecture, usage). The system-flakes edit (poita) is a proposal, built
+but not committed there; the user switches.
 
 Notes for later: libsecret clients give up after D-Bus's 25 s while an
 approval waits (the request stays pending); the native headless agent has the
@@ -316,8 +317,8 @@ split the flows: Projects = `factorseal set/get --project` for scripts, with a
 line that SecretSpec does not read these; Provider cache = what SecretSpec
 stores through factorseal://default (`secretspec set` values do not expire),
 with the init/set/run steps and the cache alias; the links follow
-(FactorSeal's usage docs, SecretSpec's Quick Start). Done, uncommitted until
-the user has seen it.
+(FactorSeal's usage docs, SecretSpec's Quick Start). Committed be99435 after
+the user saw it.
 
 ## Working notes for the next session
 
