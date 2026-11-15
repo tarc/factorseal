@@ -4189,22 +4189,22 @@ fn wsl_single_use_grant_ends_with_the_unseal_too() {
         let asked = service.handle(&provider, wsl_write(b"first"), now + 1);
         assert!(asked.result.unwrap_err().interaction.is_some());
         approve_only_pending(&directory, &service, &manager, true, now + 2).unwrap();
-        let expected = lifetime.map_or(now + 2 + SINGLE_USE_GRANT_SECONDS, |lifetime| {
-            (now + lifetime).min(now + 2 + SINGLE_USE_GRANT_SECONDS)
-        });
         let permissions = listed_permissions(&service, &manager, now + 3);
-        assert!(
-            matches!(
-                permissions[0].state,
-                PermissionState::Granted {
-                    single_use: true,
-                    expires_at: Some(deadline),
-                    ..
-                } if deadline == expected
-            ),
-            "{:?}, expected expiry {expected}",
-            permissions[0].state
-        );
+        let PermissionState::Granted {
+            granted_at,
+            expires_at: Some(expires_at),
+            single_use: true,
+        } = permissions[0].state
+        else {
+            panic!("expected a single-use grant: {:?}", permissions[0].state);
+        };
+        // A request's clock advances while it runs (`RequestTime`), so the
+        // approval sent at now + 2 can be stamped a second later.
+        assert!((now + 2..now + 5).contains(&granted_at), "{granted_at}");
+        let window_end = granted_at + SINGLE_USE_GRANT_SECONDS;
+        // The lease's absolute deadline is fixed when the vault opens at `now`.
+        let expected = lifetime.map_or(window_end, |lifetime| window_end.min(now + lifetime));
+        assert_eq!(expires_at, expected);
 
         // Unspent when the vault seals: the next unseal removes it.
         let service = reopen_after_seal(&directory, service, now + 4);
