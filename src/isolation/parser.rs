@@ -58,6 +58,25 @@ pub(crate) fn parse(bytes: &[u8]) -> VaultResult<VaultRequest> {
     }
 }
 
+/// Keeps the parser helper's executable copy while held, which every
+/// request's helper then runs: starting a freshly written copy makes Windows
+/// check it first, on each request. A server holds it while it serves.
+#[cfg(all(windows, feature = "vault"))]
+pub(crate) struct ParserCode(#[allow(dead_code)] Option<super::windows::HelperCode>);
+
+#[cfg(all(windows, feature = "vault"))]
+#[must_use]
+pub(crate) fn keep_code() -> ParserCode {
+    // Without it every request copies the helper, as before; a helper that
+    // cannot be found fails each parse with its own error.
+    ParserCode(
+        std::env::current_exe()
+            .and_then(|host| process::helper_executable(&host, "factorseal-parser"))
+            .and_then(|executable| super::windows::keep_helper_code(&executable))
+            .ok(),
+    )
+}
+
 #[cfg(all(any(unix, windows), feature = "vault"))]
 fn parse_with(
     executable: &std::path::Path,

@@ -1,11 +1,12 @@
 use super::registration::Registration;
-use super::{Local, NETWORK_CAPABILITIES, Sid, error, string};
+use super::{CODE_CAPABILITY, Local, NETWORK_CAPABILITIES, Sid, error, string};
 use nt_token::OwnedToken;
 use std::{
     fs::OpenOptions,
     io,
     os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
-    path::Path,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, Weak},
 };
 use windows::Win32::{
     Foundation::{ERROR_SUCCESS, HANDLE},
@@ -30,7 +31,7 @@ use windows::core::HSTRING;
 pub(in crate::isolation::windows) struct Identity {
     pub(in crate::isolation::windows) package: Sid,
     pub(in crate::isolation::windows) capabilities: Vec<Sid>,
-    pub(in crate::isolation::windows) code: CodeDirectory,
+    pub(in crate::isolation::windows) code: Arc<CodeDirectory>,
     _registration: Registration,
 }
 impl Identity {
@@ -38,12 +39,7 @@ impl Identity {
         executable: &Path,
         root: Option<&Path>,
     ) -> io::Result<Self> {
-        let user = OwnedToken::from_current_process(TOKEN_QUERY)
-            .map_err(error)?
-            .user()
-            .map_err(error)?
-            .to_string()
-            .map_err(error)?;
+        let user = current_user()?;
         // Every launch owns its registration, including concurrent parser
         // requests. No writable profile or AppData directory is created.
         let mut nonce = [0; 16];
@@ -57,19 +53,13 @@ impl Identity {
         }
         let package = package?;
         let registration = Registration::new(&package, &name)?;
-        let capabilities = if root.is_some() {
-            NETWORK_CAPABILITIES
-                .iter()
-                .map(|name| Sid::capability(name))
-                .collect::<io::Result<_>>()?
-        } else {
-            Vec::new()
-        };
-        // Installed MSIX/Program Files binaries may have immutable ACLs. Make
-        // a private executable copy and grant RX only there, never on the
-        // installation directory or on a parent of the vault.
-        let code = CodeDirectory::new(&user, &package)?;
-        std::fs::copy(executable, code.path().join("helper.exe"))?;
+        let mut capabilities = vec![Sid::capability(CODE_CAPABILITY)?];
+        if root.is_some() {
+            for name in NETWORK_CAPABILITIES {
+                capabilities.push(Sid::capability(name)?);
+            }
+        }
+        let code = keep_code(executable, &user)?;
         if let Some(root) = root {
             protect_tree(root, &user, &package, 0, &mut 0)?;
         }
@@ -82,15 +72,69 @@ impl Identity {
     }
 }
 
+fn current_user() -> io::Result<String> {
+    OwnedToken::from_current_process(TOKEN_QUERY)
+        .map_err(error)?
+        .user()
+        .map_err(error)?
+        .to_string()
+        .map_err(error)
+}
+
+/// The private copy of `executable` that helpers run, shared by every
+/// launch while any launch or holder keeps it.
+///
+/// Installed MSIX/Program Files binaries may have immutable ACLs, so helpers
+/// run a private copy whose folder grants read and execute only to
+/// [`CODE_CAPABILITY`], never the installation directory or a parent of the
+/// vault. Windows checks a freshly written executable when it first runs
+/// (about 175 ms measured, against under 10 ms for one it has seen), so a
+/// copy per launch made every vault request pay that; one copy serves all
+/// launches instead. Each launch still has its own AppContainer identity.
+pub(in crate::isolation::windows) fn keep_code(
+    executable: &Path,
+    user: &str,
+) -> io::Result<Arc<CodeDirectory>> {
+    static COPIES: Mutex<Vec<(PathBuf, Weak<CodeDirectory>)>> = Mutex::new(Vec::new());
+    let mut copies = COPIES
+        .lock()
+        .map_err(|_| io::Error::other("helper code cache is unavailable"))?;
+    copies.retain(|(_, copy)| copy.strong_count() > 0);
+    if let Some(code) = copies
+        .iter()
+        .filter(|(source, _)| source == executable)
+        .find_map(|(_, copy)| copy.upgrade())
+        // A temporary-files cleanup may have removed it.
+        .filter(|code| code.executable().is_file())
+    {
+        return Ok(code);
+    }
+    let code = Arc::new(CodeDirectory::new(
+        user,
+        &Sid::capability(CODE_CAPABILITY)?,
+    )?);
+    std::fs::copy(executable, code.executable())?;
+    copies.retain(|(source, _)| source != executable);
+    copies.push((executable.to_owned(), Arc::downgrade(&code)));
+    Ok(code)
+}
+
+/// [`keep_code`] for the current user.
+pub(in crate::isolation::windows) fn keep_code_for_current_user(
+    executable: &Path,
+) -> io::Result<Arc<CodeDirectory>> {
+    keep_code(executable, &current_user()?)
+}
+
 pub(in crate::isolation::windows) struct CodeDirectory(std::path::PathBuf);
 impl CodeDirectory {
-    fn new(user: &str, package: &Sid) -> io::Result<Self> {
+    fn new(user: &str, reader: &Sid) -> io::Result<Self> {
         let mut nonce = [0; 24];
         getrandom::fill(&mut nonce).map_err(|error| io::Error::other(error.to_string()))?;
         let path = std::env::temp_dir().join(format!("factorseal-helper-{}", hex::encode(nonce)));
         let sddl = HSTRING::from(format!(
             "O:{user}D:P(A;OICI;FA;;;{user})(A;OICI;GRGX;;;{})",
-            package.string()?
+            reader.string()?
         ));
         let mut descriptor = PSECURITY_DESCRIPTOR::default();
         unsafe {
@@ -116,6 +160,9 @@ impl CodeDirectory {
     }
     pub(in crate::isolation::windows) fn path(&self) -> &Path {
         &self.0
+    }
+    pub(in crate::isolation::windows) fn executable(&self) -> PathBuf {
+        self.0.join("helper.exe")
     }
 }
 impl Drop for CodeDirectory {

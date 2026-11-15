@@ -25,7 +25,12 @@ mod launch;
 #[cfg(any(feature = "vault", feature = "personal-sync-network"))]
 mod registration;
 #[cfg(any(feature = "vault", feature = "personal-sync-network"))]
-pub(super) use launch::Identity;
+pub(super) use launch::{CodeDirectory, Identity, keep_code_for_current_user};
+
+/// Every helper holds this capability, and only it reads and runs the
+/// helper's private executable copy, which therefore serves every launch
+/// from the same executable (see [`launch::keep_code`]).
+const CODE_CAPABILITY: &str = "factorsealHelperCode";
 
 pub(super) struct Sid(Vec<u32>);
 impl Sid {
@@ -79,7 +84,7 @@ impl Sid {
         }
         result
     }
-    fn string(&self) -> io::Result<String> {
+    pub(in crate::isolation::windows) fn string(&self) -> io::Result<String> {
         string(self.raw())
     }
 }
@@ -135,6 +140,7 @@ pub(super) fn verify(network: bool) -> io::Result<()> {
     } else {
         Vec::new()
     };
+    expected.push(Sid::capability(CODE_CAPABILITY)?.string()?);
     actual.sort();
     expected.sort();
     if actual != expected {

@@ -169,6 +169,9 @@ fn accept_until_sealed(
     stopping: &AtomicBool,
 ) -> VaultResult<()> {
     let caller_cache = CallerIdentityCache::default();
+    // Every request is parsed by a helper started from one executable copy,
+    // kept while this server serves.
+    let _parser = crate::isolation::parser::keep_code();
     let active = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         while !stopping.load(Ordering::Acquire) {

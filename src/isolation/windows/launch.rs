@@ -369,6 +369,41 @@ mod tests {
         listener: std::net::SocketAddr,
     }
 
+    /// While kept, every launch from one executable runs the same private
+    /// copy (one first-run check by Windows instead of one per request),
+    /// each under its own AppContainer identity; the copy goes with its
+    /// last holder. `cmd.exe` stands in for a helper: it is only copied.
+    #[test]
+    fn launches_share_one_executable_copy_while_it_is_kept() {
+        let mut system = vec![0_u16; 32768];
+        let length = unsafe {
+            windows::Win32::System::SystemInformation::GetSystemDirectoryW(Some(&mut system))
+        };
+        let executable =
+            PathBuf::from(String::from_utf16(&system[..length as usize]).unwrap()).join("cmd.exe");
+        let kept = super::super::keep_helper_code(&executable).unwrap();
+        let first = access::Identity::new(&executable, None).unwrap();
+        let second = access::Identity::new(&executable, None).unwrap();
+        assert_eq!(first.code.path(), kept.0.path());
+        assert_eq!(second.code.path(), kept.0.path());
+        assert!(first.code.executable().is_file());
+        assert_ne!(
+            first.package.string().unwrap(),
+            second.package.string().unwrap()
+        );
+        let folder = kept.0.path().to_owned();
+        drop((first, second, kept));
+        assert!(!folder.exists(), "the copy outlived its holders");
+
+        // Without a holder, each launch makes its own copy and removes it.
+        let first = access::Identity::new(&executable, None).unwrap();
+        let first_folder = first.code.path().to_owned();
+        drop(first);
+        assert!(!first_folder.exists());
+        let second = access::Identity::new(&executable, None).unwrap();
+        assert_ne!(second.code.path(), first_folder.as_path());
+    }
+
     #[test]
     fn parser_appcontainer_cannot_read_vault_files_inspect_parent_or_spawn() {
         probe(false);

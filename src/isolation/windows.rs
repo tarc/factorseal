@@ -25,6 +25,17 @@ pub(crate) use access::current_app_sid;
 #[cfg(any(feature = "vault", feature = "personal-sync-network"))]
 pub(super) use launch::{Owner, spawn};
 
+/// Keeps a helper's private executable copy while held, so that every
+/// launch from that executable runs one copy Windows has already checked
+/// instead of a fresh one.
+#[cfg(any(feature = "vault", feature = "personal-sync-network"))]
+pub(crate) struct HelperCode(#[allow(dead_code)] std::sync::Arc<access::CodeDirectory>);
+
+#[cfg(any(feature = "vault", feature = "personal-sync-network"))]
+pub(crate) fn keep_helper_code(executable: &std::path::Path) -> io::Result<HelperCode> {
+    access::keep_code_for_current_user(executable).map(HelperCode)
+}
+
 pub(super) fn verify(network: bool) -> io::Result<()> {
     access::verify(network)
 }
