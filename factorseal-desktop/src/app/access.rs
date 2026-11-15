@@ -1775,6 +1775,7 @@ mod tests {
                 maximum_lifetime: std::time::Duration::from_mins(1),
             },
             secret_service: false,
+            wsl_keyrings: Vec::new(),
         });
         let mut popup = None;
         let (_, cx) = cx.add_window_view(|window, cx| {

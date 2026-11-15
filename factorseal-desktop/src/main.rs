@@ -177,6 +177,21 @@ struct Args {
     /// Absolute maximum seconds for one unseal lease.
     #[arg(long, env = "FACTORSEAL_MAXIMUM_SECONDS")]
     maximum_seconds: Option<u64>,
+
+    /// Grant the WSL broker this distro's keyring, instead of the distros
+    /// switched on in Settings; repeat for more. For development instances.
+    #[arg(long = "wsl-keyring", value_name = "DISTRO", hide = true)]
+    wsl_keyrings: Vec<String>,
+}
+
+/// The WSL keyrings this instance grants: those named on the command line,
+/// else those switched on in Settings.
+fn wsl_keyrings(arguments: Vec<String>, saved: &settings::DesktopSettings) -> Vec<String> {
+    if arguments.is_empty() {
+        saved.wsl_keyrings.clone()
+    } else {
+        arguments
+    }
 }
 
 fn main() {
@@ -235,6 +250,7 @@ fn main() {
         socket: args.socket,
         lease,
         secret_service,
+        wsl_keyrings: wsl_keyrings(args.wsl_keyrings, &saved),
     };
     let instance = instance::acquire(&config.root, !args.background && !args.keyring_activation)
         .unwrap_or_else(|error| {

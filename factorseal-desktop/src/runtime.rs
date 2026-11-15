@@ -69,6 +69,8 @@ pub(crate) struct RuntimeConfig {
     /// This Desktop serves `org.freedesktop.secrets` and needs the adapter
     /// grant from every worker it starts.
     pub(crate) secret_service: bool,
+    /// WSL distros whose keyring the WSL broker is granted at each unlock.
+    pub(crate) wsl_keyrings: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -217,7 +219,7 @@ impl DesktopRuntime {
         (
             Arc::new(Self {
                 next_lease: Mutex::new(config.lease),
-                wsl_keyrings: Mutex::new(Vec::new()),
+                wsl_keyrings: Mutex::new(config.wsl_keyrings.clone()),
                 config,
                 events,
                 lifeline: Mutex::new(None),
@@ -759,18 +761,7 @@ impl DesktopRuntime {
             executable: cli,
             exit_reported: false,
         };
-        let bootstrap = factorseal::desktop_worker::Bootstrap {
-            desktop_executable: desktop,
-            operation,
-            password: WireSecret::from_locked(password),
-            hosts_secret_service: self.config.secret_service,
-            sync_control: true,
-            wsl_keyrings: self
-                .wsl_keyrings
-                .lock()
-                .map(|distros| distros.clone())
-                .unwrap_or_default(),
-        };
+        let bootstrap = self.bootstrap(desktop, operation, password);
         let sent = factorseal::desktop_worker::send(
             worker
                 .child
@@ -782,6 +773,61 @@ impl DesktopRuntime {
         drop(bootstrap);
         sent.map_err(|error| worker.startup_error(&error))?;
         Ok(worker)
+    }
+
+    fn bootstrap(
+        &self,
+        desktop_executable: std::path::PathBuf,
+        operation: factorseal::desktop_worker::Operation,
+        password: LockedBytes,
+    ) -> factorseal::desktop_worker::Bootstrap {
+        factorseal::desktop_worker::Bootstrap {
+            desktop_executable,
+            operation,
+            password: WireSecret::from_locked(password),
+            hosts_secret_service: self.config.secret_service,
+            sync_control: true,
+            wsl_keyrings: self
+                .wsl_keyrings
+                .lock()
+                .map(|distros| distros.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Switch the WSL keyrings to `distros`: the next unlock grants them,
+    /// and an unsealed vault (`unsealed`) changes its grants at once.
+    pub(crate) fn set_wsl_keyrings(
+        &self,
+        unsealed: Option<&VaultMetadata>,
+        distros: Vec<String>,
+    ) -> Result<(), String> {
+        self.apply_wsl_keyrings(
+            distros,
+            unsealed.map(|metadata| {
+                move |action| {
+                    let request = VaultRequest::new(action).map_err(|error| error.to_string())?;
+                    self.request_live(metadata, &request)
+                }
+            }),
+        )
+    }
+
+    fn apply_wsl_keyrings(
+        &self,
+        distros: Vec<String>,
+        send: Option<impl FnOnce(VaultAction) -> Result<VaultResponseBody, String>>,
+    ) -> Result<(), String> {
+        if let Ok(mut next) = self.wsl_keyrings.lock() {
+            next.clone_from(&distros);
+        }
+        let Some(send) = send else {
+            return Ok(());
+        };
+        match send(VaultAction::SetWslKeyrings { distros })? {
+            VaultResponseBody::WslKeyringsSet => Ok(()),
+            _ => Err("unexpected answer to the WSL keyrings".to_owned()),
+        }
     }
 
     fn unlock_operation(
@@ -1409,6 +1455,66 @@ mod tests {
     }
 
     #[test]
+    fn a_wsl_keyring_switch_reaches_the_next_worker_and_an_unsealed_vault() {
+        let directory = tempfile::tempdir().unwrap();
+        let (runtime, _) = super::DesktopRuntime::new(super::RuntimeConfig {
+            root: directory.path().to_path_buf(),
+            socket: None,
+            lease: super::lease_policy(300, 28_800).unwrap(),
+            secret_service: false,
+            wsl_keyrings: vec!["Debian".to_owned()],
+        });
+        let bootstrap = || {
+            runtime.bootstrap(
+                "/desktop".into(),
+                factorseal::desktop_worker::Operation::Unlock {
+                    group: factorseal::UnlockGroup::new([factorseal::UnlockFactorKind::Password])
+                        .unwrap(),
+                    idle_seconds: 300,
+                    maximum_seconds: 28_800,
+                },
+                factorseal::security::LockedBytes::from_zeroizing(zeroize::Zeroizing::new(
+                    b"x".to_vec(),
+                ))
+                .unwrap(),
+            )
+        };
+        assert_eq!(bootstrap().wsl_keyrings, ["Debian"]);
+
+        // Sealed: only the next unlock learns of it.
+        runtime
+            .apply_wsl_keyrings(
+                vec!["NixOS".to_owned()],
+                None::<fn(factorseal::VaultAction) -> Result<VaultResponseBody, String>>,
+            )
+            .unwrap();
+        assert_eq!(bootstrap().wsl_keyrings, ["NixOS"]);
+
+        // Unsealed: the vault is told at once.
+        let mut sent = None;
+        runtime
+            .apply_wsl_keyrings(
+                vec!["NixOS".to_owned(), "Ubuntu".to_owned()],
+                Some(|action| {
+                    sent = Some(action);
+                    Ok(VaultResponseBody::WslKeyringsSet)
+                }),
+            )
+            .unwrap();
+        assert!(matches!(
+            sent,
+            Some(factorseal::VaultAction::SetWslKeyrings { ref distros })
+                if distros == &["NixOS", "Ubuntu"]
+        ));
+        assert_eq!(bootstrap().wsl_keyrings, ["NixOS", "Ubuntu"]);
+        assert!(
+            runtime
+                .apply_wsl_keyrings(Vec::new(), Some(|_| Err("sealed".to_owned())))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn lease_changes_preserve_the_captured_unlock_policy() {
         let directory = tempfile::tempdir().unwrap();
         let (runtime, _) = super::DesktopRuntime::new(super::RuntimeConfig {
@@ -1416,6 +1522,7 @@ mod tests {
             socket: None,
             lease: super::lease_policy(300, 28_800).unwrap(),
             secret_service: false,
+            wsl_keyrings: Vec::new(),
         });
         let group = factorseal::UnlockGroup::new([factorseal::UnlockFactorKind::Password]).unwrap();
         let captured = runtime.unlock_operation(group.clone()).unwrap();

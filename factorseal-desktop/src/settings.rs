@@ -24,6 +24,8 @@ pub(crate) struct DesktopSettings {
     pub(crate) generator: factorseal::personal::generator::Options,
     pub(crate) window: Option<WindowPlacement>,
     pub(crate) page: Option<Page>,
+    /// WSL distros whose programs may use this vault as their keyring.
+    pub(crate) wsl_keyrings: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -71,6 +73,7 @@ impl Default for DesktopSettings {
             generator: factorseal::personal::generator::Options::default(),
             window: None,
             page: None,
+            wsl_keyrings: Vec::new(),
         }
     }
 }
@@ -107,6 +110,14 @@ impl DesktopSettings {
         );
         crate::runtime::lease_policy(self.idle_seconds, self.maximum_seconds)
             .map_err(anyhow::Error::msg)?;
+        ensure!(
+            self.wsl_keyrings.len() <= 64
+                && self.wsl_keyrings.iter().enumerate().all(|(index, distro)| {
+                    factorseal::vault::wsl_relay::validate_distro(distro).is_ok()
+                        && !self.wsl_keyrings[..index].contains(distro)
+                }),
+            "WSL keyrings must name up to 64 distinct WSL distros"
+        );
         Ok(())
     }
 }
@@ -224,6 +235,7 @@ mod tests {
                 maximized: true,
             }),
             page: Some(Page::Category(factorseal::DocumentKind::SecretSpecProject)),
+            wsl_keyrings: vec!["NixOS".to_owned(), "Ubuntu-24.04".to_owned()],
         };
         save(&path.with_file_name("desktop.json"), &settings).unwrap();
         assert_eq!(load(&path).unwrap(), settings);
@@ -240,6 +252,21 @@ mod tests {
         };
         assert!(save(&path, &invalid).is_err());
         assert_eq!(load(&path).unwrap(), settings);
+        for wsl_keyrings in [
+            vec!["../x".to_owned()],
+            vec!["NixOS".to_owned(), "NixOS".to_owned()],
+        ] {
+            let invalid = DesktopSettings {
+                wsl_keyrings,
+                ..settings.clone()
+            };
+            assert!(save(&path, &invalid).is_err());
+        }
+        // A damaged list is dropped on load; the other settings stay.
+        std::fs::write(&path, r#"{"theme":"dracula","wsl_keyrings":["a/b"]}"#).unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.theme, Choice::Dracula);
+        assert_eq!(loaded.wsl_keyrings, Vec::<String>::new());
     }
 
     #[test]

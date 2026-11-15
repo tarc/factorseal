@@ -283,6 +283,7 @@ pub(crate) fn update(settings: crate::settings::DesktopSettings, cx: &mut App) -
     let preferences = cx.global::<Preferences>();
     let security_changed = preferences.settings.idle_seconds != settings.idle_seconds
         || preferences.settings.maximum_seconds != settings.maximum_seconds;
+    let wsl_keyrings_changed = preferences.settings.wsl_keyrings != settings.wsl_keyrings;
     resolve(
         settings.theme,
         &preferences.system_theme,
@@ -300,6 +301,9 @@ pub(crate) fn update(settings: crate::settings::DesktopSettings, cx: &mut App) -
                 .map_err(anyhow::Error::msg)?,
             cx,
         );
+    }
+    if wsl_keyrings_changed {
+        crate::app::set_wsl_keyrings(settings.wsl_keyrings.clone(), cx);
     }
     cx.global_mut::<Preferences>().settings = settings;
     apply_selected(cx)

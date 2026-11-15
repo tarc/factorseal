@@ -641,6 +641,7 @@ mod tests {
             generator,
             window: None,
             page: None,
+            wsl_keyrings: vec!["NixOS".into()],
         };
         assert_eq!(
             SettingsView::default_appearance(&settings),
@@ -650,6 +651,7 @@ mod tests {
                 idle_seconds: 60,
                 maximum_seconds: 900,
                 generator,
+                wsl_keyrings: vec!["NixOS".into()],
                 ..DesktopSettings::default()
             }
         );

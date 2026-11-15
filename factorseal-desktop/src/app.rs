@@ -129,6 +129,29 @@ pub(crate) fn set_next_lease(lease: crate::runtime::LeasePolicy, cx: &App) {
     }
 }
 
+/// Switch the WSL keyrings: at the next unlock, and at once while unsealed.
+pub(crate) fn set_wsl_keyrings(distros: Vec<String>, cx: &App) {
+    let Some(runtime) = cx
+        .try_global::<RuntimeGlobal>()
+        .map(|runtime| Arc::clone(&runtime.0))
+    else {
+        return;
+    };
+    let unsealed = cx
+        .try_global::<DesktopWindow>()
+        .and_then(|window| match &window.snapshot {
+            Snapshot::Unsealed { metadata, .. } => Some(metadata.clone()),
+            _ => None,
+        });
+    cx.background_executor()
+        .spawn(async move {
+            if let Err(error) = runtime.set_wsl_keyrings(unsealed.as_ref(), distros) {
+                eprintln!("could not switch the WSL keyrings: {error}");
+            }
+        })
+        .detach();
+}
+
 struct DesktopStatus {
     unsealed: bool,
     quitting: bool,
