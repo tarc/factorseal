@@ -429,6 +429,7 @@ impl VaultService {
                 action,
                 pending,
             } => {
+                require_keyring_action_bound(entry.as_ref(), operation, action.as_deref())?;
                 // Only a host holding the internal adapter namespace grant may
                 // delegate. Project grants never confer bridge authority.
                 let broker_deadline = super::grant::require_grant_until(
@@ -471,6 +472,15 @@ impl VaultService {
                 action,
                 pending,
             } => {
+                // The WSL host names the item of every check, so an action
+                // is always bound to one.
+                if action.is_some() && entry.is_none() {
+                    return Err(VaultError::Protocol(
+                        "a WSL keyring action needs the item it was checked for".to_owned(),
+                    )
+                    .into());
+                }
+                require_keyring_action_bound(entry.as_ref(), operation, action.as_deref())?;
                 // The distro and folder are the broker's rewrite of the
                 // request's context; the caller is declared by the WSL host.
                 let distro = application
@@ -707,6 +717,61 @@ fn permission_manager_deadline(
         },
         now,
     )
+}
+
+/// Binds the action a keyring access check carries to what was checked, so
+/// that an approval for one item never reaches another:
+/// - a `Get` reads the checked item, under a read check only, or the
+///   collection's index, which the adapter reads with every item (labels,
+///   attributes, and the index it rewrites with each write);
+/// - a `Mutate` comes only with a write or delete check: a write puts the
+///   checked item and the index, a delete deletes the checked item and puts
+///   the index, and either may check those two first.
+///
+/// Without an `entry`, only the legacy broad grant can authorize the check
+/// (approvals always name an item), and the action cannot be bound to an
+/// item; the operation still binds it. The WSL host always names the item.
+fn require_keyring_action_bound(
+    entry: Option<&crate::SecretAddress>,
+    operation: super::PermissionOperation,
+    action: Option<&VaultAction>,
+) -> VaultResult<()> {
+    use super::{PermissionOperation, VaultMutation};
+    let Some(action) = action else {
+        return Ok(());
+    };
+    let index = crate::SecretAddress::new(crate::vault::secret_service_data::INDEX_ITEM, None)?;
+    let is_index = |address: &super::WireSecretAddress| address.resolve().is_ok_and(|a| a == index);
+    let is_entry = |address: &super::WireSecretAddress| {
+        entry.is_none_or(|entry| address.resolve().is_ok_and(|a| a == *entry))
+    };
+    let bound = match (operation, action) {
+        (_, VaultAction::Get { address, .. }) if is_index(address) => true,
+        (PermissionOperation::Get, VaultAction::Get { address, .. }) => is_entry(address),
+        (PermissionOperation::Put, VaultAction::Mutate { mutations, .. }) => {
+            mutations.iter().all(|mutation| match mutation {
+                VaultMutation::Check { address, .. } | VaultMutation::Put { address, .. } => {
+                    is_entry(address) || is_index(address)
+                }
+                VaultMutation::Delete { .. } => false,
+            })
+        }
+        (PermissionOperation::Delete, VaultAction::Mutate { mutations, .. }) => {
+            mutations.iter().all(|mutation| match mutation {
+                VaultMutation::Check { address, .. } => is_entry(address) || is_index(address),
+                VaultMutation::Delete { address } => is_entry(address),
+                VaultMutation::Put { address, .. } => is_index(address),
+            })
+        }
+        _ => false,
+    };
+    if bound {
+        Ok(())
+    } else {
+        Err(VaultError::Protocol(
+            "a keyring action must stay on the item and operation it was checked for".to_owned(),
+        ))
+    }
 }
 
 /// What a keyring access asks besides its approval: an action to run once

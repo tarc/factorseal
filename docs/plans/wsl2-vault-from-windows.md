@@ -215,6 +215,21 @@ Notes for later: libsecret clients give up after D-Bus's 25 s while an
 approval waits (the request stays pending); the native headless agent has the
 same unnamed-`CreateItem` limitation as WSL had (not changed: out of scope).
 
+### Milestone 2: review fixes (2026-11-15)
+
+An independent review of milestone 2 (`wsl2-milestone2-review.md`, a copy
+kept in `.git/`, not in the repo) found no blocking issue, three important
+ones (I1–I3), four minor ones (M1–M4) and nits. One commit each; each passed
+the gate (fmt, workspace clippy, `test-with-dbus.sh cargo test --all-features
+--lib -- wsl protocol::wsl keyring secret_service`, `cargo test
+--all-features --bin factorseal -- relayed wsl grant_lifetime keyring`, and
+the tests of what it touched), and each test was seen failing without its
+fix, or under the mutation named.
+
+| Finding | What, and how it was verified |
+|---|---|
+| I1 | The vault binds a keyring check's action to its item and operation (`require_keyring_action_bound`, `service.rs`), for `WslKeyringAccess` and native `KeyringAccess`: a read check carries a `Get` of its item or of the index, a write check a `Mutate` putting its item and the index, a delete check one deleting its item and putting the index; a WSL action without an item is refused. `a_keyring_access_check_carries_only_an_action_on_its_own_item` (the review's scenario) failed first on all four cases: item B read (`value-b`), B written, A written on a read approval, and an unnamed action reaching the grant check. `keyring_writes_and_deletes_are_bound_to_their_check`: mutation "a delete check deletes any item" caught. Not the review's strict "a `Get` addresses exactly `entry`": the adapter reads the index under each check (`agent.item()`, the write loops), and without that exception three D-Bus tests fail (`session_bus_crud_…`, `imported_keyring_items_…`, `a_wsl_keyring_asks_…`). Native keeps unnamed actions: only a legacy broad grant authorizes them (`approvals.rs`, "A legacy bridge may still use an existing broad grant"), which the headless agent's unnamed `CreateItem` uses. |
+
 ## Milestone 2: the WSL keyring (planned)
 
 The design, its re-checked facts and the user's decisions of 2026-11-15

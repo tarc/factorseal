@@ -173,14 +173,19 @@ executables receive this authority when initialized or reauthorized.
 The Linux Secret Service collection asks per application and item: each
 search, read, write or delete needs a grant for the program behind the D-Bus
 call, which the vault resolves from the bus (executable path and digest) and
-binds to the item, operation and folder. Item labels and lookup attributes
-stay readable to the adapter that serves the collection. Its standard `plain`
+binds to the item, operation and folder. The vault also binds what the
+adapter does under that grant: a read reaches only the checked item, a write
+or delete only that item, and either one also the collection's index. Item
+labels and lookup attributes (the index) stay readable to the adapter that
+serves the collection. Its standard `plain`
 and legacy DH session algorithms are compatibility transports, not FIPS or
 post-quantum protocol claims.
 
 A WSL2 distro's keyring, served from the vault on Windows by
-`factorseal wsl-keyring`, asks the same way, but for a program the WSL side
-declares: the vault sees only the WSL broker. Such approvals are advisory.
+`factorseal wsl-keyring`, asks the same way, per program and item, and the
+vault binds each action to its item the same way, but for a program the WSL
+side declares: the vault sees only the WSL broker. Such approvals are
+advisory.
 They catch surprising access by honest programs and leave an audit trail,
 but any process in WSL can run the broker and declare any program, so the
 trust boundary for WSL is the whole of WSL (every distro, every Linux user,

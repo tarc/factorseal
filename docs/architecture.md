@@ -419,8 +419,13 @@ list. The broker gets no `Seal`, so `Lock` from WSL locks nothing.
 The vault cannot see the D-Bus caller in WSL, so the host resolves it there,
 as the vault resolves a native caller (uid, executable path, SHA-256 of the
 executable, folder), and declares it in `WslKeyringAccess`. The vault accepts
-that only from the holder of the distro's host grant, and only for actions in
-that distro's namespace. The approval's principal is the declared program
+that only from the holder of the distro's host grant, only for actions in
+that distro's namespace, and only for an action on the item checked: a check
+always names its item, a read check carries a read of that item or of the
+keyring's index, and a write or delete check carries a mutation of that item
+and the index. The same binding applies to native `KeyringAccess`, except
+that a native check without an item (honoured only by a broad grant left from
+older releases) binds the operation alone. The approval's principal is the declared program
 under a `wsl:<distro>:uid:<n>` user ID, so it never matches a
 transport-authenticated principal, and it carries the distro, so the grant
 lasts until the vault seals like other WSL grants. The popup names the
@@ -429,7 +434,7 @@ named before the write, so the approval is for that item. In relay mode the
 broker forwards, besides the SecretSpec provider's actions, only
 `WslKeyringAccess` for its distro's namespace and a read of that keyring's
 index (labels and attributes); item values travel only inside an access
-check for a declared caller.
+check for a declared caller, for the item that check names.
 
 While the vault is sealed, the collection reports locked; a client's unlock
 asks through a new broker, which brings Desktop forward, and the collection

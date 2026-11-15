@@ -4584,6 +4584,195 @@ fn wsl_keyring_access_asks_for_the_declared_program_until_the_seal() {
     assert_eq!(crossed.code, VaultResponseErrorCode::InvalidRequest);
 }
 
+/// An approval for one item covers that item only: the action an access
+/// check carries must read or write the item it was checked for (or the
+/// collection's index, which the host reads and rewrites with each item),
+/// and a read approval never carries a write.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_keyring_access_check_carries_only_an_action_on_its_own_item() {
+    const OTHER_ITEM: &str = "item/fedcba9876543210fedcba9876543210";
+    let (directory, service) = service(100, UnsealLeasePolicy::default());
+    let broker = caller();
+    grant_wsl_keyring_host(&service, &broker, "NixOS");
+    let namespace = crate::vault::wsl_relay::wsl_keyring_namespace("NixOS").unwrap();
+    let index = crate::vault::secret_service_data::INDEX_ITEM;
+    {
+        let state = service.state.lock_live(Instant::now()).unwrap();
+        for (item, value) in [
+            (WSL_ITEM, &b"value-a"[..]),
+            (OTHER_ITEM, b"value-b"),
+            (index, b"{\"version\":1,\"items\":[]}"),
+        ] {
+            state
+                .store()
+                .put_at(
+                    DocumentKind::LinuxSecretService,
+                    &namespace,
+                    &SecretAddress::new(item, None).unwrap(),
+                    value,
+                    None,
+                    &Provenance::caller(&broker, None),
+                    100,
+                )
+                .unwrap();
+        }
+    }
+    let manager = CallerIdentity::new(
+        CallerPlatform::Linux,
+        "uid:1000",
+        "dev.factorseal.cli",
+        [9; 32],
+        None,
+    )
+    .unwrap();
+    service.authorize_permission_manager(&manager, 101).unwrap();
+    let get = |item: &str| VaultAction::Get {
+        namespace: namespace.clone(),
+        address: WireSecretAddress::new(item, None),
+    };
+    let put = |item: &str| VaultAction::Mutate {
+        namespace: namespace.clone(),
+        mutations: vec![VaultMutation::Put {
+            address: WireSecretAddress::new(item, None),
+            value: WireSecret::new(b"written".to_vec()).unwrap(),
+            evict_at: None,
+        }],
+    };
+    let send = |entry: Option<&str>, action: VaultAction| {
+        let mut request =
+            wsl_keyring_request(Some("NixOS"), "/usr/bin/secret-tool", WSL_ITEM, None);
+        let VaultAction::WslKeyringAccess {
+            entry: requested,
+            action: carried,
+            ..
+        } = &mut request.action
+        else {
+            unreachable!()
+        };
+        *requested = entry.map(|item| SecretAddress::new(item, None).unwrap());
+        *carried = Some(Box::new(action));
+        service.handle(&broker, request, 102).result
+    };
+
+    // The person approves secret-tool reading item A only.
+    let asked = send(Some(WSL_ITEM), get(WSL_ITEM)).unwrap_err();
+    let id = asked.interaction.expect("an approval for item A").id;
+    approve_pending(&service, &manager, &directory, &id, 102);
+    let Ok(VaultResponseBody::Secret { value: Some(value) }) = send(Some(WSL_ITEM), get(WSL_ITEM))
+    else {
+        panic!("expected item A's value");
+    };
+    assert_eq!(value.expose(), b"value-a");
+    // The index the host reads with every item stays readable.
+    assert!(matches!(
+        send(Some(WSL_ITEM), get(index)),
+        Ok(VaultResponseBody::Secret { value: Some(_) })
+    ));
+
+    // A check for A never carries a read of B, a write, or an action
+    // without the item it was checked for.
+    let mut allowed = Vec::new();
+    for (entry, action, what) in [
+        (Some(WSL_ITEM), get(OTHER_ITEM), "read item B"),
+        (Some(WSL_ITEM), put(OTHER_ITEM), "write item B"),
+        (
+            Some(WSL_ITEM),
+            put(WSL_ITEM),
+            "write item A on a read approval",
+        ),
+        (None, get(OTHER_ITEM), "read item B without naming an item"),
+    ] {
+        let refused = send(entry, action);
+        if !matches!(&refused, Err(error) if error.code == VaultResponseErrorCode::InvalidRequest) {
+            allowed.push(format!(
+                "{what}: {}",
+                match &refused {
+                    Ok(VaultResponseBody::Secret { value }) => format!(
+                        "read {:?}",
+                        value
+                            .as_ref()
+                            .map(|value| String::from_utf8_lossy(value.expose()).into_owned())
+                    ),
+                    Ok(_) => "succeeded".to_owned(),
+                    Err(error) => format!("{:?}", error.code),
+                }
+            ));
+        }
+    }
+    assert!(allowed.is_empty(), "{allowed:#?}");
+    let state = service.state.lock_live(Instant::now()).unwrap();
+    for (item, value) in [(WSL_ITEM, &b"value-a"[..]), (OTHER_ITEM, b"value-b")] {
+        let stored = state
+            .store()
+            .get_at(
+                DocumentKind::LinuxSecretService,
+                &namespace,
+                &SecretAddress::new(item, None).unwrap(),
+                103,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.as_slice(), value, "{item} unchanged");
+    }
+}
+
+/// The writes and deletes the adapter sends stay bound to their check; an
+/// unnamed check (a legacy broad grant on native Linux) still binds the
+/// operation.
+#[test]
+fn keyring_writes_and_deletes_are_bound_to_their_check() {
+    use super::super::PermissionOperation::{Delete, Get, Put};
+    const OTHER_ITEM: &str = "item/fedcba9876543210fedcba9876543210";
+    let index = crate::vault::secret_service_data::INDEX_ITEM;
+    let entry = SecretAddress::new(WSL_ITEM, None).unwrap();
+    let mutate = |mutations: Vec<VaultMutation>| VaultAction::Mutate {
+        namespace: b"factorseal/secret-service/v1".to_vec(),
+        mutations,
+    };
+    let check = |item: &str| VaultMutation::Check {
+        address: WireSecretAddress::new(item, None),
+        expected_sha256: None,
+    };
+    let put = |item: &str| VaultMutation::Put {
+        address: WireSecretAddress::new(item, None),
+        value: WireSecret::new(b"v".to_vec()).unwrap(),
+        evict_at: None,
+    };
+    let delete = |item: &str| VaultMutation::Delete {
+        address: WireSecretAddress::new(item, None),
+    };
+    let bound = |entry: Option<&SecretAddress>, operation, action: VaultAction| {
+        super::require_keyring_action_bound(entry, operation, Some(&action)).is_ok()
+    };
+    // What `set_secret`/`create_or_replace_planned` and `delete_item` send.
+    assert!(bound(
+        Some(&entry),
+        Put,
+        mutate(vec![check(index), put(WSL_ITEM), put(index)])
+    ));
+    assert!(bound(
+        Some(&entry),
+        Delete,
+        mutate(vec![check(index), delete(WSL_ITEM), put(index)])
+    ));
+    // Anything else on those checks is refused.
+    for (operation, mutations) in [
+        (Put, vec![check(index), put(OTHER_ITEM), put(index)]),
+        (Put, vec![delete(WSL_ITEM)]),
+        (Delete, vec![delete(OTHER_ITEM), put(index)]),
+        (Delete, vec![put(WSL_ITEM)]),
+        (Delete, vec![delete(index)]),
+        (Get, vec![put(WSL_ITEM)]),
+    ] {
+        assert!(!bound(Some(&entry), operation, mutate(mutations)));
+    }
+    // Unnamed: any item for a write (the legacy broad grant decides), no
+    // write on a read check.
+    assert!(bound(None, Put, mutate(vec![put(OTHER_ITEM), put(index)])));
+    assert!(!bound(None, Get, mutate(vec![put(OTHER_ITEM)])));
+}
+
 fn wsl_broker(digest: u8) -> CallerIdentity {
     CallerIdentity::new(
         CallerPlatform::Windows,
