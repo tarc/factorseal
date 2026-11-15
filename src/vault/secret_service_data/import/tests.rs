@@ -8,10 +8,12 @@ fn attributes(pairs: &[(&str, &str)]) -> HashMap<String, String> {
 }
 
 /// As a locked gnome-keyring item shows `pairs`: each value as an MD5 under
-/// `gkr:compat:hashed:<name>`, and the placeholder `xdg:schema`.
+/// `gkr:compat:hashed:<name>`, and a plain `xdg:schema`, the generic one.
+/// gnome-keyring leaves the generic schema itself unhashed.
 fn hashed(pairs: &[(&str, &str)]) -> HashMap<String, String> {
     let mut hashed: HashMap<String, String> = pairs
         .iter()
+        .filter(|(name, value)| !(*name == "xdg:schema" && *value == GENERIC))
         .map(|(name, value)| {
             (
                 format!("gkr:compat:hashed:{name}"),
@@ -19,12 +21,11 @@ fn hashed(pairs: &[(&str, &str)]) -> HashMap<String, String> {
             )
         })
         .collect();
-    hashed.insert(
-        "xdg:schema".to_owned(),
-        "org.freedesktop.Secret.Generic".to_owned(),
-    );
+    hashed.insert("xdg:schema".to_owned(), GENERIC.to_owned());
     hashed
 }
+
+const GENERIC: &str = "org.freedesktop.Secret.Generic";
 
 fn item(
     collection: &str,
@@ -221,7 +222,11 @@ fn a_value_beside_hashed_attributes_is_not_imported() {
 
 #[test]
 fn inventory_and_export_agree_on_fingerprints() {
-    let gh = &[("service", "gh:github.com"), ("username", "octo")];
+    let gh = &[
+        ("service", "gh:github.com"),
+        ("username", "octo"),
+        ("xdg:schema", GENERIC),
+    ];
     let inventory = map_keyring_items(
         vec![locked("login", hashed(gh)), locked("login", hashed(PORT))],
         false,
@@ -301,4 +306,34 @@ fn an_item_at_the_size_limit_fits_in_one_restore_request() {
     .unwrap()
     .encode()
     .unwrap();
+}
+
+#[test]
+fn a_locked_generic_item_shows_its_schema_plainly() {
+    // gnome-keyring 50.0, seen in scripts/test-keyring-import.sh: an item
+    // stored with the generic schema (as secret-tool does) has no hashed
+    // xdg:schema when locked; the plain one is its real schema.
+    let plain = &[
+        ("service", "gh:github.com"),
+        ("username", "octo"),
+        ("xdg:schema", "org.freedesktop.Secret.Generic"),
+    ];
+    let locked = HashMap::from([
+        (
+            "gkr:compat:hashed:service".to_owned(),
+            "e84fbf1a5a27f8b9b1f84fcc621b14b1".to_owned(),
+        ),
+        (
+            "gkr:compat:hashed:username".to_owned(),
+            "39eafcc8caa450a7bd41a961c137bc2c".to_owned(),
+        ),
+        (
+            "xdg:schema".to_owned(),
+            "org.freedesktop.Secret.Generic".to_owned(),
+        ),
+    ]);
+    assert_eq!(
+        keyring_fingerprint(&locked),
+        keyring_fingerprint(&attributes(plain))
+    );
 }

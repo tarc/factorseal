@@ -84,12 +84,16 @@ Two targets:
     - `Attributes` gives each name with an MD5 of its value as
       `gkr:compat:hashed:<name>` (`md5("gh")` = `19b19ffc…`);
     - the label is empty and modified is 0.
-  - **The plain `xdg:schema` of a locked item is a placeholder.** It reads
-    `org.freedesktop.Secret.Generic` for every item. The real schema is only
-    in `gkr:compat:hashed:xdg:schema`: an item stored with schema `test.int`
-    showed the placeholder plainly and `md5("test.int")` = `7675a45f…`
-    hashed. (The first check used a generic item, where the two agree, which
-    is how the earlier "`xdg:schema` stays plain" got in.)
+  - **The plain `xdg:schema` of a locked item is a placeholder, except for
+    the generic schema.** It reads `org.freedesktop.Secret.Generic` for
+    every item. An item stored with schema `test.int` showed that
+    placeholder plainly and `md5("test.int")` = `7675a45f…` under
+    `gkr:compat:hashed:xdg:schema`. An item stored with the generic schema
+    (as `secret-tool store` does) has no hashed `xdg:schema` at all: its
+    plain one is the real value. (Corrected 2026-11-15 by
+    `scripts/test-keyring-import.sh`, step 7: the locked and unlocked
+    fingerprints of a `secret-tool` item disagreed until the plain
+    `xdg:schema` counted when no hashed one exists.)
   - **Integer attributes hash like text.** A libsecret `INTEGER` attribute
     `port=8080` reaches the daemon as the string `"8080"` (the Secret
     Service API only carries `a{ss}`) and is hashed as `md5("8080")` =
@@ -127,9 +131,12 @@ Both sides compute one fingerprint per item from its attributes, as a set
 of pairs (name, MD5 of the value):
 
 - **gnome-keyring, locked:** each `gkr:compat:hashed:<name>` gives
-  `(<name>, its hash)`. Every other attribute is ignored: on a locked item
-  the only plain one is the placeholder `xdg:schema`, whose real value is
-  in the hashed set.
+  `(<name>, its hash)`. The plain `xdg:schema` gives `(xdg:schema,
+  md5(value))` only when there is no `gkr:compat:hashed:xdg:schema` (the
+  generic schema, which gnome-keyring leaves unhashed); otherwise it is the
+  placeholder and is ignored. Every other attribute is ignored. A locked
+  item is recognized by its hashed names, not by `Locked`: a collection
+  locked again after an unlock shows plain attributes.
 - **gnome-keyring, unlocked, and the vault:** each attribute gives
   `(name, md5(value))`. Names starting with `gkr:compat:` are left out
   (gnome-keyring reserves them; this is defensive).

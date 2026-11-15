@@ -25,6 +25,8 @@ use super::IndexItem;
 const TAG: &[u8] = b"factorseal-keyring-fingerprint-v1\0";
 const HASHED_PREFIX: &str = "gkr:compat:hashed:";
 const RESERVED_PREFIX: &str = "gkr:compat:";
+const SCHEMA: &str = "xdg:schema";
+const HASHED_SCHEMA: &str = "gkr:compat:hashed:xdg:schema";
 
 /// The largest value an import carries. Its restore request holds the value
 /// base64-encoded twice (in the portable item, then on the wire), and must
@@ -33,15 +35,21 @@ pub const MAX_IMPORTED_VALUE_BYTES: usize = 256 * 1024;
 
 /// The pairs a fingerprint covers, or `None` when a hashed value is not an
 /// MD5. A locked gnome-keyring item lists its attributes hashed under
-/// `gkr:compat:hashed:<name>`, beside a placeholder `xdg:schema`; then only
-/// the hashed ones count. Otherwise every attribute counts except the names
-/// gnome-keyring reserves (`gkr:compat:*`).
+/// `gkr:compat:hashed:<name>`, beside a plain `xdg:schema`; then the hashed
+/// ones count, and the plain `xdg:schema` only when it has no hashed one
+/// (gnome-keyring leaves the generic schema unhashed, and shows the generic
+/// schema as a placeholder for every other). Otherwise every attribute
+/// counts except the names gnome-keyring reserves (`gkr:compat:*`).
 fn pairs<S: BuildHasher>(
     attributes: &HashMap<String, String, S>,
 ) -> Option<BTreeMap<&str, [u8; 16]>> {
     let hashed = attributes
         .keys()
         .any(|name| name.starts_with(HASHED_PREFIX));
+    // A locked item's plain xdg:schema is its real schema only when
+    // gnome-keyring did not hash it (the generic schema); otherwise it is
+    // a placeholder.
+    let hashed_schema = attributes.contains_key(HASHED_SCHEMA);
     let mut pairs = BTreeMap::new();
     for (name, value) in attributes {
         if hashed {
@@ -49,6 +57,8 @@ fn pairs<S: BuildHasher>(
                 let mut digest = [0_u8; 16];
                 hex::decode_to_slice(value, &mut digest).ok()?;
                 pairs.insert(name, digest);
+            } else if name == SCHEMA && !hashed_schema {
+                pairs.insert(name.as_str(), Md5::digest(value.as_bytes()).into());
             }
         } else if !name.starts_with(RESERVED_PREFIX) {
             pairs.insert(name.as_str(), Md5::digest(value.as_bytes()).into());
