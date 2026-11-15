@@ -5651,3 +5651,19 @@ fn keyring_fingerprints_page_by_item_id() {
     assert_eq!(after, all[1..]);
     assert_eq!(next, None);
 }
+
+#[test]
+fn a_keyring_fingerprint_cursor_must_be_a_lowercase_item_id() {
+    for cursor in ["A".repeat(32), "a".repeat(31), "g".repeat(32)] {
+        assert!(
+            VaultRequest::new(VaultAction::ListKeyringFingerprints {
+                distro: None,
+                cursor: Some(cursor.clone()),
+            })
+            .unwrap()
+            .validate_fields()
+            .is_err(),
+            "{cursor}"
+        );
+    }
+}

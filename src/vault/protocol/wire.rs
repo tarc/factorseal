@@ -1009,7 +1009,10 @@ impl VaultAction {
                     super::wsl::validate_distro(distro)?;
                 }
                 if cursor.as_ref().is_some_and(|cursor| {
-                    cursor.len() != 32 || !cursor.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    cursor.len() != 32
+                        || !cursor
+                            .bytes()
+                            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
                 }) {
                     return Err(VaultError::Protocol(
                         "invalid keyring fingerprint cursor".to_owned(),
