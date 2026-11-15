@@ -77,6 +77,10 @@
             inherit pkgs;
             module = self.nixosModules.default;
           };
+          nixos-module-wsl = import ./nix/tests/factorseal-wsl-eval.nix {
+            inherit pkgs;
+            module = self.nixosModules.default;
+          };
         };
     };
 }

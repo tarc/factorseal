@@ -33,6 +33,19 @@ let
     '';
     meta = cfg.desktopPackage.meta;
   };
+  wsl = cfg.mode == "wsl";
+  # The keyring of a WSL distro, served from the vault on Windows. D-Bus
+  # activation starts the user service, so one instance serves the session.
+  wslActivation = pkgs.writeTextFile {
+    name = "factorseal-wsl-keyring-activation";
+    destination = "/share/dbus-1/services/org.freedesktop.secrets.service";
+    text = ''
+      [D-BUS Service]
+      Name=org.freedesktop.secrets
+      Exec=${cfg.package}/bin/factorseal wsl-keyring
+      SystemdService=factorseal-wsl-keyring.service
+    '';
+  };
 in
 {
   options.services.factorseal = {
@@ -42,6 +55,7 @@ in
       type = lib.types.enum [
         "agent"
         "desktop"
+        "wsl"
       ];
       default = "agent";
       description = ''
@@ -49,6 +63,11 @@ in
         systemd user service; desktop mode starts the graphical application
         from the user's graphical session. The two modes are mutually
         exclusive because they own the same vault, endpoint, and D-Bus names.
+        The wsl mode is for a WSL2 distro whose vault is FactorSeal Desktop
+        on Windows: a D-Bus-activated user service runs
+        `factorseal wsl-keyring`, which serves this distro's keyring from the
+        Windows vault. It needs `factorseal wsl-setup` once, and the distro
+        switched on in Desktop (Settings, WSL keyrings); it uses no TPM here.
       '';
     };
 
@@ -103,32 +122,33 @@ in
         message = "services.factorseal.idleSeconds must not exceed maximumSeconds";
       }
       {
-        assertion = config.security.tpm2.enable;
+        assertion = wsl || config.security.tpm2.enable;
         message = "services.factorseal requires security.tpm2.enable";
       }
       {
-        assertion = config.security.polkit.enable;
+        assertion = wsl || config.security.polkit.enable;
         message = "services.factorseal requires security.polkit.enable for logind delay inhibitors";
       }
       {
-        assertion = tpmGroup != null || cfg.users == [ ];
+        assertion = wsl || tpmGroup != null || cfg.users == [ ];
         message = "services.factorseal.users requires security.tpm2.tssGroup to name a group";
       }
       {
         assertion = !config.services.gnome.gnome-keyring.enable;
         message = ''
-          services.factorseal provides org.freedesktop.secrets in both agent
-          and desktop modes; disable services.gnome.gnome-keyring (use
+          services.factorseal provides org.freedesktop.secrets in every
+          mode; disable services.gnome.gnome-keyring (use
           lib.mkForce false when a desktop module enables it) so only one
           Secret Service provider runs
         '';
       }
     ];
 
-    security.tpm2.enable = lib.mkDefault true;
-    security.polkit.enable = lib.mkDefault true;
+    security.tpm2.enable = lib.mkIf (!wsl) (lib.mkDefault true);
+    security.polkit.enable = lib.mkIf (!wsl) (lib.mkDefault true);
     environment.systemPackages = [ cfg.package ] ++ lib.optional (cfg.mode == "desktop") desktopPackage;
-    services.dbus.packages = lib.optional (cfg.mode == "desktop") desktopPackage;
+    services.dbus.packages =
+      lib.optional (cfg.mode == "desktop") desktopPackage ++ lib.optional wsl wslActivation;
 
     environment.variables = lib.mkIf (cfg.mode == "desktop") {
       FACTORSEAL_DESKTOP_EXECUTABLE = "${desktopPackage}/bin/factorseal-desktop";
@@ -138,7 +158,7 @@ in
       FACTORSEAL_MAXIMUM_SECONDS = toString cfg.maximumSeconds;
     };
 
-    users.groups = lib.mkIf (tpmGroup != null) {
+    users.groups = lib.mkIf (!wsl && tpmGroup != null) {
       "${tpmGroup}".members = cfg.users;
     };
 
@@ -205,6 +225,26 @@ in
         Restart = "on-failure";
         RestartSec = 2;
         Slice = "app.slice";
+      };
+    };
+
+    # Started by D-Bus activation of org.freedesktop.secrets. Interop with
+    # Windows works from a user service, so it can run the WSL broker.
+    systemd.user.services.factorseal-wsl-keyring = lib.mkIf wsl {
+      description = "Factorseal keyring of this WSL distro, from the vault on Windows";
+      documentation = [ "https://github.com/domenkozar/factorseal" ];
+      wants = [ "dbus.socket" ];
+      after = [ "dbus.socket" ];
+      environment.DBUS_SESSION_BUS_ADDRESS = "unix:path=%t/bus";
+      serviceConfig = {
+        Type = "dbus";
+        BusName = "org.freedesktop.secrets";
+        ExecStart = "${cfg.package}/bin/factorseal wsl-keyring";
+        Restart = "on-failure";
+        RestartSec = 2;
+        UMask = "0077";
+        LimitCORE = 0;
+        NoNewPrivileges = true;
       };
     };
   };
