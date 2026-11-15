@@ -30,9 +30,32 @@ const FRAME_END: &[u8] = b"FACTORSEAL-FRAME end";
 #[cfg(windows)]
 const MAX_STDOUT_BYTES: u64 = 464 * 1024 * 1024;
 
-/// The most standard error kept: only its lines for a message are used.
-#[cfg(windows)]
-const MAX_STDERR_BYTES: u64 = 64 * 1024;
+/// The most standard error kept, from its end: only its lines for a
+/// message are used, and the CLI's error comes last.
+#[cfg(any(windows, test))]
+const MAX_STDERR_BYTES: usize = 64 * 1024;
+
+/// The last `cap` bytes of `pipe`, read to its end: a login shell's output
+/// comes before the CLI's error, which a message needs.
+#[cfg_attr(not(windows), allow(dead_code))] // The Windows runner and tests.
+fn read_tail(mut pipe: impl std::io::Read, cap: usize) -> Vec<u8> {
+    let mut kept = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    loop {
+        match pipe.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => kept.extend_from_slice(&chunk[..read]),
+        }
+        // Trimmed now and then, not on every read, to stay linear.
+        if kept.len() > 2 * cap {
+            kept.drain(..kept.len() - cap);
+        }
+    }
+    if kept.len() > cap {
+        kept.drain(..kept.len() - cap);
+    }
+    kept
+}
 
 /// The first `cap` bytes of `pipe`, reading the rest to its end and
 /// dropping it, so a child writing more is not blocked on a full pipe
@@ -604,23 +627,14 @@ impl Wsl for SystemWsl {
                 let _ = pipe.write_all(&input);
             })
         });
-        let reader = |pipe: Option<Box<dyn std::io::Read + Send>>, cap: u64| {
-            std::thread::spawn(move || pipe.map(|pipe| read_capped(pipe, cap)).unwrap_or_default())
-        };
-        let stdout = reader(
-            child
-                .stdout
-                .take()
-                .map(|pipe| Box::new(pipe) as Box<dyn std::io::Read + Send>),
-            MAX_STDOUT_BYTES,
-        );
-        let stderr = reader(
-            child
-                .stderr
-                .take()
-                .map(|pipe| Box::new(pipe) as Box<dyn std::io::Read + Send>),
-            MAX_STDERR_BYTES,
-        );
+        let stdout = child
+            .stdout
+            .take()
+            .map(|pipe| std::thread::spawn(move || read_capped(pipe, MAX_STDOUT_BYTES)));
+        let stderr = child
+            .stderr
+            .take()
+            .map(|pipe| std::thread::spawn(move || read_tail(pipe, MAX_STDERR_BYTES)));
         let started = std::time::Instant::now();
         let outcome = loop {
             match child.try_wait() {
@@ -643,8 +657,12 @@ impl Wsl for SystemWsl {
         if let Some(writer) = writer {
             let _ = writer.join();
         }
-        let stdout = stdout.join().unwrap_or_default();
-        let stderr = stderr.join().unwrap_or_default();
+        let stdout = stdout
+            .and_then(|reader| reader.join().ok())
+            .unwrap_or_default();
+        let stderr = stderr
+            .and_then(|reader| reader.join().ok())
+            .unwrap_or_default();
         Ok(RunOutput {
             code: outcome?,
             stdout,
@@ -758,6 +776,40 @@ mod tests {
                 started.elapsed()
             );
         }
+    }
+
+    /// Past the stderr cap, the CLI's error, which comes last, is still
+    /// what the row shows.
+    #[test]
+    fn stderr_keeps_its_end_for_the_message() {
+        let mut noise = String::new();
+        for line in 0..3000 {
+            use std::fmt::Write as _;
+            let _ = writeln!(
+                noise,
+                "warning: profile line {line} of a verbose login shell"
+            );
+        }
+        noise.push_str("factorseal: no Secret Service on the session bus\n");
+        assert!(noise.len() > 2 * MAX_STDERR_BYTES);
+        let mut pipe = std::io::Cursor::new(noise.clone().into_bytes());
+        let stderr = read_tail(&mut pipe, MAX_STDERR_BYTES);
+        assert_eq!(pipe.position(), noise.len() as u64, "read to the end");
+        assert!(stderr.len() <= MAX_STDERR_BYTES);
+        assert!(noise.as_bytes().ends_with(&stderr));
+        let row = failure(
+            "NixOS",
+            &RunOutput {
+                code: Some(1),
+                stdout: Vec::new(),
+                stderr,
+            },
+        );
+        assert!(row.starts_with("No Secret Service runs on NixOS"), "{row}");
+        assert_eq!(
+            read_tail(std::io::Cursor::new(b"short".to_vec()), 64),
+            b"short"
+        );
     }
 
     #[test]
