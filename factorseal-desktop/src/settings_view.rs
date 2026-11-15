@@ -783,19 +783,18 @@ impl SettingsView {
                 )
             })
             .await;
-            cx.update(|cx| {
-                if result.is_ok() {
-                    crate::app::refresh_vault(cx);
-                }
-            });
+            // A failed restore may have added items before it stopped.
+            if result.as_ref().is_ok() || result.as_ref().is_err_and(|failure| failure.restored) {
+                cx.update(crate::app::refresh_vault);
+            }
             let _ = view.update(cx, |view, cx| {
                 if !view.keyring_run_current(&distro, &cancel) {
                     return;
                 }
                 let state = match result {
                     Ok(report) => KeyringMove::Moved(report),
-                    Err(_) if cancel.load(Ordering::SeqCst) => KeyringMove::Checked(check),
-                    Err(error) => KeyringMove::Failed(error),
+                    Err(failure) if failure.cancelled => KeyringMove::Checked(check),
+                    Err(failure) => KeyringMove::Failed(failure.message),
                 };
                 view.keyring_moves.insert(distro, state);
                 cx.notify();

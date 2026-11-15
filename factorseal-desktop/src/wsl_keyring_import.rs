@@ -429,19 +429,28 @@ fn check_entries(archive: &VaultArchive, distro: &str) -> Result<(), String> {
     }
 }
 
-/// Export `distro`'s gnome-keyring, unlocking it, and restore the archive
-/// through `restore`, which returns how many items it added and kept.
-pub(crate) fn move_items(
+/// Why a move ended without a report.
+#[derive(Debug)]
+pub(crate) struct MoveFailure {
+    pub(crate) message: String,
+    /// Cancelled before anything was restored: nothing changed.
+    pub(crate) cancelled: bool,
+    /// The restore ran and failed, possibly after adding some items.
+    pub(crate) restored: bool,
+}
+
+/// Export `distro`'s gnome-keyring, unlocking it, and decrypt and check
+/// the archive.
+fn export(
     wsl: &dyn Wsl,
     distro: &str,
     prompt_collections: usize,
-    restore: impl FnOnce(VaultArchive) -> Result<(usize, usize), String>,
     cancel: &AtomicBool,
-) -> Result<MoveReport, String> {
+) -> Result<(Record, VaultArchive), String> {
     let passphrase = one_time_passphrase()?;
     let mut stdin = Zeroizing::new(passphrase.as_bytes().to_vec());
     stdin.push(b'\n');
-    let record = record(
+    let mut record = record(
         wsl,
         distro,
         EXPORT_SCRIPT,
@@ -450,7 +459,6 @@ pub(crate) fn move_items(
         move_limit(prompt_collections),
         cancel,
     )?;
-    let mut record = record;
     let encrypted = record
         .archive
         .take()
@@ -463,10 +471,34 @@ pub(crate) fn move_items(
     let archive = factorseal::decrypt_vault_archive(&encrypted, passphrase.as_bytes())
         .map_err(|error| format!("{distro} sent an unreadable archive: {error}"))?;
     check_entries(&archive, distro)?;
+    Ok((record, archive))
+}
+
+/// Export `distro`'s gnome-keyring, unlocking it, and restore the archive
+/// through `restore`, which returns how many items it added and kept. A
+/// Cancel stops the move up to the restore, not the restore itself.
+pub(crate) fn move_items(
+    wsl: &dyn Wsl,
+    distro: &str,
+    prompt_collections: usize,
+    restore: impl FnOnce(VaultArchive) -> Result<(usize, usize), String>,
+    cancel: &AtomicBool,
+) -> Result<MoveReport, MoveFailure> {
+    let before_restore = |message| MoveFailure {
+        message,
+        cancelled: cancel.load(Ordering::SeqCst),
+        restored: false,
+    };
+    let (record, archive) =
+        export(wsl, distro, prompt_collections, cancel).map_err(before_restore)?;
     if cancel.load(Ordering::SeqCst) {
-        return Err("Cancelled.".to_owned());
+        return Err(before_restore("Cancelled.".to_owned()));
     }
-    let (added, kept) = restore(archive)?;
+    let (added, kept) = restore(archive).map_err(|message| MoveFailure {
+        message,
+        cancelled: false,
+        restored: true,
+    })?;
     Ok(MoveReport {
         added,
         kept,
@@ -1159,7 +1191,8 @@ mod tests {
                 |_| panic!("nothing is restored"),
                 &AtomicBool::new(false),
             )
-            .unwrap_err();
+            .unwrap_err()
+            .message;
             assert!(error.contains("outside its keyring"), "{error}");
         }
     }
@@ -1179,7 +1212,47 @@ mod tests {
             &AtomicBool::new(false),
         )
         .unwrap_err();
-        assert!(error.contains("wsl:Debian"), "{error}");
+        assert!(error.message.contains("wsl:Debian"), "{error:?}");
+        assert!(!error.cancelled && !error.restored);
+    }
+
+    #[test]
+    fn a_failed_restore_is_reported_even_after_a_late_cancel() {
+        let wsl = ExportingWsl {
+            inner: FakeWsl::new(vec![Ok(RunOutput::default())]),
+            entries: RefCell::new(Some(keyring_entries(&nixos_keyring(), 2))),
+            target: "wsl:NixOS",
+        };
+        let cancel = AtomicBool::new(false);
+        let error = move_items(
+            &wsl,
+            "NixOS",
+            1,
+            |_| {
+                // Cancel pressed while the restore runs, which then fails.
+                cancel.store(true, Ordering::SeqCst);
+                Err("Import interrupted after 1 confirmed items".to_owned())
+            },
+            &cancel,
+        )
+        .unwrap_err();
+        assert!(error.restored, "the vault must be read again");
+        assert!(!error.cancelled, "the error must be shown");
+        assert!(error.message.contains("after 1 confirmed items"));
+    }
+
+    #[test]
+    fn a_cancel_before_the_restore_changes_nothing() {
+        let wsl = FakeWsl::new(vec![Err(RunError::Cancelled)]);
+        let error = move_items(
+            &wsl,
+            "NixOS",
+            1,
+            |_| panic!("nothing is restored"),
+            &AtomicBool::new(true),
+        )
+        .unwrap_err();
+        assert!(error.cancelled && !error.restored, "{error:?}");
     }
 
     #[test]
