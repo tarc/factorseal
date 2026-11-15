@@ -334,9 +334,12 @@ name. These project labels are caller-provided; they are not a verified project
 identity. Unlocking and grant approval stay in one popup, reusing the secure
 password entry. The signed grant binds the authenticated executable, project,
 folder, and operation, either for one hour or until revoked (requests relayed
-from WSL2 last until the vault seals; see [WSL2 broker](#wsl2-broker)). Keyring requests
-use the nearest `secretspec.toml` ancestor of the OS-reported working directory
-(or that directory itself); SecretSpec IPC supplies its canonical project folder. Grants appear in Access
+from WSL2 last until the vault seals; see [WSL2 broker](#wsl2-broker)). A keyring
+grant binds the folder only for a SecretSpec item (`secretspec/…` service),
+using the nearest `secretspec.toml` ancestor of the OS-reported working
+directory (or that directory itself); any other keyring item (a `gh` token, a
+git credential, an editor's keytar entry) is bound to the program and item
+wherever the program runs. SecretSpec IPC supplies its canonical project folder. Grants appear in Access
 Grants and are checked again for each secret operation. SecretSpec IPC uses the
 same approval flow, with separate grants for its provider-cache scope.
 Desktop writes open a masked, editable secret-entry dialog and authorize only

@@ -173,7 +173,8 @@ executables receive this authority when initialized or reauthorized.
 The Linux Secret Service collection asks per application and item: each
 search, read, write or delete needs a grant for the program behind the D-Bus
 call, which the vault resolves from the bus (executable path and digest) and
-binds to the item, operation and folder. The vault also binds what the
+binds to the item and operation, and, for a SecretSpec item, to the folder
+(any other item is the program's wherever it runs). The vault also binds what the
 adapter does under that grant: a read reaches only the checked item, a write
 or delete only that item, and either one also the collection's index. Item
 labels and lookup attributes (the index) stay readable to the adapter that

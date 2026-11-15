@@ -2128,7 +2128,8 @@ mod tests {
                 panic!("expected a grant for one item, got {:?}", asked.target);
             };
             assert_eq!(address.as_local(), Some((secret_item(&id).as_str(), None)));
-            assert_eq!(base_dir.as_deref(), Some("/home/me/project"));
+            // Not a SecretSpec item: the approval is not bound to the folder.
+            assert_eq!(base_dir.as_deref(), None);
 
             // The item is in the distro's keyring, not the native one.
             let namespace = crate::vault::wsl_relay::wsl_keyring_namespace("NixOS").unwrap();

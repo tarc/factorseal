@@ -107,6 +107,11 @@ impl ApprovalCandidate {
         operation: PermissionOperation,
     ) -> Self {
         let (project, profile) = crate::vault::secret_service_data::access_project(service);
+        // A SecretSpec item belongs to its project's folder. Any other item
+        // (gh, a git credential helper, an editor's keytar) belongs to the
+        // program wherever it runs, so its approval is not bound to the
+        // folder it happened to run in.
+        let base_dir = project.starts_with("secretspec/").then_some(base_dir);
         let permission = match operation {
             PermissionOperation::Get => GrantPermission::Get,
             PermissionOperation::Put => GrantPermission::Put,
@@ -118,7 +123,7 @@ impl ApprovalCandidate {
             application: VaultApplicationContext {
                 project: Some(project.clone()),
                 profile,
-                base_dir: Some(base_dir),
+                base_dir,
                 reason: Some(format!("System keyring: {service}")),
                 requested_permission_duration_seconds: None,
                 declared_launch_chain: Vec::new(),

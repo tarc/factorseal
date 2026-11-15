@@ -1093,8 +1093,14 @@ const CHOICE_CHANGED: &str = "The requests changed. Choose how long to allow acc
 fn grant_scope_note(grants: &[factorseal::Permission]) -> &'static str {
     if grants.iter().any(is_secretspec_request) {
         "Applies only to the listed entries, folder, and operation, for any program that runs SecretSpec in that folder. Manage access on each secret."
-    } else {
+    } else if grants
+        .iter()
+        .any(|grant| grant.application.base_dir.is_some())
+    {
         "Applies only to the listed entries, app, folder, and operation. Manage access on each secret."
+    } else {
+        // A keyring item other than SecretSpec's is not bound to a folder.
+        "Applies only to the listed entries, app, and operation, wherever the app runs. Manage access on each secret."
     }
 }
 
@@ -1910,7 +1916,17 @@ mod tests {
             requester_label(&[&grant]).as_deref(),
             Some(path("factorseal.exe").as_str())
         );
-        assert!(grant_scope_note(std::slice::from_ref(&grant)).contains("entries, app, folder"));
+        // Not bound to a folder (a keyring item other than SecretSpec's)...
+        assert!(
+            grant_scope_note(std::slice::from_ref(&grant))
+                .contains("entries, app, and operation, wherever the app runs")
+        );
+        // ...or bound to one.
+        let mut in_folder = grant.clone();
+        in_folder.application.base_dir = Some("/home/me/demo".to_owned());
+        assert!(
+            grant_scope_note(std::slice::from_ref(&in_folder)).contains("entries, app, folder")
+        );
 
         // A WSL keyring request names a program WSL declared, not one the
         // vault saw; the WSL broker of a SecretSpec request is still named

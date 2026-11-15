@@ -201,9 +201,11 @@ can keep their secrets in the Windows vault instead of gnome-keyring:
 
 Each program asks in Desktop's popup the first time it reads or writes an
 item, named as WSL declares it ("from WSL, unverified"), and its access lasts
-until the vault seals. An approval is also bound to the program's folder:
-its working directory, or the nearest folder above it holding a
-`secretspec.toml`. The same program run from another folder asks again.
+until the vault seals. An approval for a SecretSpec item is also bound to
+the program's folder (its working directory, or the nearest folder above it
+holding a `secretspec.toml`): run from another folder, it asks again. Other
+items (a `gh` token, a git credential) are approved for the program wherever
+it runs.
 A program's `Lock` call does not seal the Windows
 vault. While the vault is sealed the keyring reports locked; unlocking brings
 Desktop forward. Items already in the distro's gnome-keyring are not moved:

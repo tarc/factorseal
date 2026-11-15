@@ -4808,6 +4808,83 @@ fn keyring_writes_and_deletes_are_bound_to_their_check() {
     assert!(!bound(None, Get, mutate(vec![put(OTHER_ITEM)])));
 }
 
+/// A keyring approval is bound to the program's folder only for a
+/// SecretSpec item; any other item (here `gh`'s token) is the program's
+/// wherever it runs.
+#[test]
+fn only_secretspec_keyring_approvals_are_bound_to_the_folder() {
+    let (directory, service) = service(100, UnsealLeasePolicy::default());
+    let broker = caller();
+    grant_wsl_keyring_host(&service, &broker, "NixOS");
+    let manager = CallerIdentity::new(
+        CallerPlatform::Linux,
+        "uid:1000",
+        "dev.factorseal.cli",
+        [9; 32],
+        None,
+    )
+    .unwrap();
+    service.authorize_permission_manager(&manager, 101).unwrap();
+    let ask = |keyring_service: &str, folder: &str| {
+        let application = VaultApplicationContext::new(
+            None,
+            None,
+            Some(format!("{}{folder}", if cfg!(windows) { "C:" } else { "" })),
+            None,
+        )
+        .unwrap()
+        .with_declared_wsl_origin(Some("NixOS".to_owned()))
+        .unwrap();
+        let request = VaultRequest::new_with_application(
+            VaultAction::WslKeyringAccess {
+                caller: crate::vault::DeclaredKeyringCaller {
+                    uid: 1000,
+                    executable: "/usr/bin/tool".to_owned(),
+                    executable_digest: [3; 32],
+                },
+                entry: Some(SecretAddress::new(WSL_ITEM, None).unwrap()),
+                service: keyring_service.to_owned(),
+                operation: PermissionOperation::Get,
+                action: None,
+                pending: None,
+            },
+            application,
+        )
+        .unwrap();
+        service_handle(&service, &broker, request)
+    };
+    for (keyring_service, bound) in [
+        ("service/gh", false),
+        ("service/secretspec/demo/default/TOKEN", true),
+    ] {
+        let id = ask(keyring_service, "/home/me/a")
+            .unwrap_err()
+            .interaction
+            .expect("an approval")
+            .id;
+        approve_pending(&service, &manager, &directory, &id, 102);
+        assert!(
+            ask(keyring_service, "/home/me/a").is_ok(),
+            "{keyring_service}"
+        );
+        let elsewhere = ask(keyring_service, "/home/me/b");
+        assert_eq!(
+            elsewhere.is_err(),
+            bound,
+            "{keyring_service} from another folder: {:?}",
+            elsewhere.err()
+        );
+    }
+}
+
+fn service_handle(
+    service: &VaultService,
+    caller: &CallerIdentity,
+    request: VaultRequest,
+) -> Result<VaultResponseBody, VaultResponseError> {
+    service.handle(caller, request, 102).result
+}
+
 fn wsl_broker(digest: u8) -> CallerIdentity {
     CallerIdentity::new(
         CallerPlatform::Windows,
