@@ -219,11 +219,14 @@ for the M4 baseline, three times after; the last on the build with the
 folder rule), `check.sh secretspec-wsl` PASS, the three-key check above, and
 the I3 refusal in Settings. Full Linux suites on the final tree: CLI 86
 passed; lib 506 passed, 8 failed, 5 ignored. The 8 are outside these
-fixes: 7 isolation tests need the helper binaries (`factorseal-parser`,
-`-network`), which were not built here ("No such file or directory"), and
-`vault::linux::tests::native_transport_round_trips_and_seals` ("could not read
-frame length: unexpected end of file") fails the same way at f6103f0, before
-these fixes (checked in a scratch worktree). Desktop 190 passed (1 ignored).
+fixes: they need the helper binaries (`factorseal-parser`, `-network`), which
+a `--lib` run does not build. 7 isolation tests say so ("No such file or
+directory"); `vault::linux::tests::native_transport_round_trips_and_seals`
+fails with "could not read frame length: unexpected end of file", because
+the server drops the connection when the parser helper is missing.
+2026-11-15: after `cargo build --all-features --bin factorseal-parser --bin
+factorseal-network`, all 8 pass (the documented `--all-targets` run builds
+them). Desktop 190 passed (1 ignored).
 
 M4 measured (2026-11-15, native release build of this branch, test vault,
 debug Linux CLI; `check.sh keyring`, "lookup again"): before M4 (c3d9ff6's
@@ -419,6 +422,9 @@ the user saw it.
   password field: unlock with `drive.ps1 -Action unlock-popup`, deny leftovers.
 - Popup titles are "Secret access · FactorSeal" / "Browser access ·
   FactorSeal" (the scripts match the name before " · ").
+- Linux `--lib` test runs: build the helpers first (`cargo build
+  --all-features --bin factorseal-parser --bin factorseal-network`), or the
+  isolation tests and `native_transport_round_trips_and_seals` fail.
 - Linux test run: `libsecret_store_seal_lookup` needs
   `FACTORSEAL_TEST_SECRET_TOOL` set to nix libsecret's `secret-tool` (no
   `/usr/bin` here) and times out on most runs on main too; timing tests fail
