@@ -46,6 +46,8 @@ const MAX_APPLICATION_BASE_DIR_BYTES: usize = 32 * 1024;
 const MAX_NAMESPACE_BYTES: usize = 4 * 1024;
 const MAX_MUTATIONS_PER_REQUEST: usize = 64;
 const MAX_PERMISSION_ID_BYTES: usize = 128;
+/// Most WSL distros one `SetWslKeyrings` lists.
+const MAX_WSL_KEYRINGS: usize = 64;
 #[cfg(feature = "vault-store")]
 const CALLER_FINGERPRINT_DOMAIN: &[u8] = b"factorseal/caller-identity/v1\0";
 
@@ -698,6 +700,13 @@ pub enum VaultAction {
         pending: Option<String>,
     },
 
+    /// Make the WSL broker the keyring host of exactly these distros, until
+    /// the vault seals. Permission managers (Desktop) only, when a distro's
+    /// switch moves; the worker sets the list at each unlock.
+    SetWslKeyrings {
+        distros: Vec<String>,
+    },
+
     Status,
     /// List value-free entry metadata across user-facing vault documents.
     /// The service permits this only to the permission manager.
@@ -946,6 +955,21 @@ impl VaultAction {
                     action.as_deref(),
                     |namespace| super::wsl::wsl_keyring_distro(namespace).is_some(),
                 )
+            }
+            Self::SetWslKeyrings { distros } => {
+                if distros.len() > MAX_WSL_KEYRINGS {
+                    return Err(VaultError::Protocol("too many WSL keyrings".to_owned()));
+                }
+                let mut seen = std::collections::HashSet::new();
+                for distro in distros {
+                    super::wsl::validate_distro(distro)?;
+                    if !seen.insert(distro) {
+                        return Err(VaultError::Protocol(
+                            "a WSL keyring is listed twice".to_owned(),
+                        ));
+                    }
+                }
+                Ok(())
             }
             Self::Status | Self::ListPermissions | Self::ExportRevision => Ok(()),
             Self::ListPermissionsPage { cursor, .. } => validate_permission_id(cursor),
@@ -1242,6 +1266,8 @@ pub enum VaultResponseBody {
     },
     Stored,
     Mutated,
+    /// `SetWslKeyrings` applied.
+    WslKeyringsSet,
     Deleted {
         existed: bool,
     },

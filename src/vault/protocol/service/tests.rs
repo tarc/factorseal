@@ -4583,3 +4583,190 @@ fn wsl_keyring_access_asks_for_the_declared_program_until_the_seal() {
     let crossed = read("/usr/bin/secret-tool", &other).result.unwrap_err();
     assert_eq!(crossed.code, VaultResponseErrorCode::InvalidRequest);
 }
+
+fn wsl_broker(digest: u8) -> CallerIdentity {
+    CallerIdentity::new(
+        CallerPlatform::Windows,
+        "S-1-5-21-1000",
+        r"C:\Users\me\AppData\Local\Programs\FactorSeal\factorseal-wsl-broker.exe",
+        [digest; 32],
+        None,
+    )
+    .unwrap()
+}
+
+/// Whether `broker` gets as far as an approval for a NixOS-or-other keyring
+/// access, which only a holder of that distro's host grant does.
+fn reaches_wsl_keyring(service: &VaultService, broker: &CallerIdentity, distro: &str) -> bool {
+    reaches_wsl_keyring_at(service, broker, distro, 101)
+}
+
+fn reaches_wsl_keyring_at(
+    service: &VaultService,
+    broker: &CallerIdentity,
+    distro: &str,
+    now: u64,
+) -> bool {
+    service
+        .handle(
+            broker,
+            wsl_keyring_request(Some(distro), "/usr/bin/secret-tool", WSL_ITEM, None),
+            now,
+        )
+        .result
+        .unwrap_err()
+        .interaction
+        .is_some()
+}
+
+#[test]
+fn wsl_keyring_hosts_follow_the_list_and_the_broker_build() {
+    let (_directory, service) = service(100, UnsealLeasePolicy::default());
+    let old = wsl_broker(1);
+    let distros = |names: &[&str]| {
+        names
+            .iter()
+            .map(|&name| name.to_owned())
+            .collect::<Vec<_>>()
+    };
+
+    service
+        .set_wsl_keyring_hosts(Some(old.clone()), &distros(&["NixOS", "Debian"]), 100)
+        .unwrap();
+    assert!(reaches_wsl_keyring(&service, &old, "NixOS"));
+    assert!(reaches_wsl_keyring(&service, &old, "Debian"));
+    assert!(!reaches_wsl_keyring(&service, &old, "Ubuntu"));
+
+    // The grant ends with the unseal lease.
+    let namespace = crate::vault::wsl_relay::wsl_keyring_namespace("NixOS").unwrap();
+    let (deadline, absolute_deadline) = {
+        let state = service.state.lock_live(Instant::now()).unwrap();
+        let deadline = super::super::grant::require_grant_until(
+            state.store(),
+            &old,
+            GrantRequirement {
+                scope: DocumentKind::LinuxSecretService,
+                namespace: Some(&namespace),
+                address: None,
+                project: None,
+                base_dir: None,
+                permission: GrantPermission::Put,
+            },
+            100,
+        )
+        .unwrap();
+        (deadline, state.lease_deadlines().1)
+    };
+    assert_eq!(deadline, Some(absolute_deadline));
+
+    // Switching Debian off removes its grant only.
+    service
+        .set_wsl_keyring_hosts(Some(old.clone()), &distros(&["NixOS"]), 100)
+        .unwrap();
+    assert!(reaches_wsl_keyring(&service, &old, "NixOS"));
+    assert!(!reaches_wsl_keyring(&service, &old, "Debian"));
+
+    // A new broker build takes over; the old one keeps nothing.
+    let new = wsl_broker(2);
+    service
+        .set_wsl_keyring_hosts(Some(new.clone()), &distros(&["NixOS"]), 100)
+        .unwrap();
+    assert!(reaches_wsl_keyring(&service, &new, "NixOS"));
+    assert!(!reaches_wsl_keyring(&service, &old, "NixOS"));
+
+    // No broker installed: nothing is left.
+    service
+        .set_wsl_keyring_hosts(None, &distros(&["NixOS"]), 100)
+        .unwrap();
+    assert!(!reaches_wsl_keyring(&service, &new, "NixOS"));
+}
+
+#[test]
+fn only_a_permission_manager_switches_wsl_keyrings() {
+    let (_directory, service) = service(100, UnsealLeasePolicy::default());
+    let broker = wsl_broker(1);
+    let manager = CallerIdentity::new(
+        CallerPlatform::Windows,
+        "S-1-5-21-1000",
+        r"C:\FactorSeal\factorseal-desktop.exe",
+        [9; 32],
+        None,
+    )
+    .unwrap();
+    service.authorize_permission_manager(&manager, 100).unwrap();
+    let switch = |caller: &CallerIdentity, distros: &[&str]| {
+        service
+            .handle(
+                caller,
+                VaultRequest::new(VaultAction::SetWslKeyrings {
+                    distros: distros.iter().map(|&name| name.to_owned()).collect(),
+                })
+                .unwrap(),
+                100,
+            )
+            .result
+    };
+
+    // Before the worker registered a broker there is nothing to grant.
+    assert_eq!(
+        switch(&manager, &["NixOS"]).unwrap_err().code,
+        VaultResponseErrorCode::InvalidRequest
+    );
+    assert!(matches!(
+        switch(&manager, &[]),
+        Ok(VaultResponseBody::WslKeyringsSet)
+    ));
+
+    service
+        .set_wsl_keyring_hosts(Some(broker.clone()), &[], 100)
+        .unwrap();
+    assert!(!reaches_wsl_keyring(&service, &broker, "NixOS"));
+    // Not a manager: refused, even the broker itself.
+    for caller in [&broker, &caller()] {
+        assert_eq!(
+            switch(caller, &["NixOS"]).unwrap_err().code,
+            VaultResponseErrorCode::AuthorizationRequired
+        );
+    }
+    assert!(!reaches_wsl_keyring(&service, &broker, "NixOS"));
+
+    assert!(matches!(
+        switch(&manager, &["NixOS"]),
+        Ok(VaultResponseBody::WslKeyringsSet)
+    ));
+    assert!(reaches_wsl_keyring(&service, &broker, "NixOS"));
+    assert!(matches!(
+        switch(&manager, &[]),
+        Ok(VaultResponseBody::WslKeyringsSet)
+    ));
+    assert!(!reaches_wsl_keyring(&service, &broker, "NixOS"));
+
+    // A malformed list never reaches the store.
+    for distros in [&["NixOS", "NixOS"][..], &["../x"]] {
+        assert_eq!(
+            switch(&manager, distros).unwrap_err().code,
+            VaultResponseErrorCode::InvalidRequest
+        );
+    }
+}
+
+#[test]
+fn an_unlock_removes_wsl_keyring_hosts_left_from_a_session_sealed_early() {
+    // Real time: opening the store evicts by the real clock.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let (directory, service) = service(now, UnsealLeasePolicy::default());
+    let broker = wsl_broker(1);
+    service
+        .set_wsl_keyring_hosts(Some(broker.clone()), &["NixOS".to_owned()], now)
+        .unwrap();
+    // Sealed long before the grant's deadline, then NixOS switched off.
+    let service = reopen_after_seal(&directory, service, now + 1);
+    assert!(reaches_wsl_keyring_at(&service, &broker, "NixOS", now + 1));
+    service
+        .set_wsl_keyring_hosts(Some(broker.clone()), &[], now + 1)
+        .unwrap();
+    assert!(!reaches_wsl_keyring_at(&service, &broker, "NixOS", now + 1));
+}

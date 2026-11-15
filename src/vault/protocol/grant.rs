@@ -399,6 +399,128 @@ fn exclusive_holder_address(target_digest: [u8; 32]) -> VaultResult<SecretAddres
     )
 }
 
+/// What the WSL broker may do in the keyring namespace of a distro switched
+/// on in Desktop: read and write items, never seal the vault.
+pub(super) const WSL_KEYRING_HOST_PERMISSIONS: [GrantPermission; 3] = [
+    GrantPermission::Get,
+    GrantPermission::Put,
+    GrantPermission::Delete,
+];
+const WSL_KEYRING_HOSTS_VERSION: u8 = 1;
+
+/// Which broker holds which distro's keyring grant, so that switching a
+/// distro off, or a new broker build, removes exactly the grants it ends.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WslKeyringHosts {
+    version: u8,
+    hosts: Vec<WslKeyringHost>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WslKeyringHost {
+    caller_fingerprint: [u8; 32],
+    distro: String,
+}
+
+fn wsl_keyring_hosts_address() -> VaultResult<SecretAddress> {
+    SecretAddress::new("wsl-keyring-hosts", None)
+}
+
+/// Make `broker` the keyring host of exactly `distros`, until `expires_at`
+/// (the unseal lease's absolute deadline). Grants of distros not listed, and
+/// of any other broker, are removed in the same generation. `None` removes
+/// them all. An unreadable record is treated as empty: what it listed
+/// still expires at its own session's deadline.
+pub(super) fn store_wsl_keyring_hosts(
+    store: &VaultStore,
+    broker: Option<&CallerIdentity>,
+    distros: &[String],
+    expires_at: u64,
+    now: u64,
+) -> VaultResult<()> {
+    let wanted: Vec<WslKeyringHost> = match broker {
+        Some(broker) => {
+            broker.validate()?;
+            let caller_fingerprint = broker.fingerprint();
+            distros
+                .iter()
+                .map(|distro| {
+                    super::wsl::validate_distro(distro).map(|()| WslKeyringHost {
+                        caller_fingerprint,
+                        distro: distro.clone(),
+                    })
+                })
+                .collect::<VaultResult<_>>()?
+        }
+        None => Vec::new(),
+    };
+    let address = wsl_keyring_hosts_address()?;
+    let previous = store
+        .get_at(
+            DocumentKind::Authorization,
+            GRANT_DOCUMENT_NAMESPACE,
+            &address,
+            now,
+        )?
+        .and_then(|bytes| serde_json::from_slice::<WslKeyringHosts>(&bytes).ok())
+        .filter(|record| record.version == WSL_KEYRING_HOSTS_VERSION)
+        .unwrap_or_default();
+    let mut operations = Vec::new();
+    for host in previous.hosts.iter().filter(|host| !wanted.contains(host)) {
+        let namespace = super::wsl::wsl_keyring_namespace(&host.distro)?;
+        let target_digest = grant_target_digest(&GrantTarget::Namespace {
+            scope: DocumentKind::LinuxSecretService,
+            namespace: &namespace,
+        });
+        for permission in WSL_KEYRING_HOST_PERMISSIONS {
+            operations.push(DocumentOperation::Delete {
+                address: grant_address(host.caller_fingerprint, target_digest, permission)?,
+            });
+        }
+    }
+    if let Some(broker) = broker {
+        for host in &wanted {
+            let namespace = super::wsl::wsl_keyring_namespace(&host.distro)?;
+            for grant in prepare_grant(
+                broker,
+                GrantTarget::Namespace {
+                    scope: DocumentKind::LinuxSecretService,
+                    namespace: &namespace,
+                },
+                WSL_KEYRING_HOST_PERMISSIONS,
+                Some(expires_at),
+                now,
+            )? {
+                operations.push(DocumentOperation::Put {
+                    address: grant.address,
+                    value: grant.value,
+                    evict_at: grant.expires_at,
+                });
+            }
+        }
+    }
+    let record = WslKeyringHosts {
+        version: WSL_KEYRING_HOSTS_VERSION,
+        hosts: wanted,
+    };
+    operations.push(DocumentOperation::Put {
+        address,
+        value: Zeroizing::new(
+            serde_json::to_vec(&record).map_err(|error| VaultError::Protocol(error.to_string()))?,
+        ),
+        evict_at: None,
+    });
+    store.mutate(
+        DocumentKind::Authorization,
+        GRANT_DOCUMENT_NAMESPACE,
+        operations,
+        &Provenance::service(ServiceReason::GrantStorage),
+        now,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn promote_permission(
     store: &VaultStore,

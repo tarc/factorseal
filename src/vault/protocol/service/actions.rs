@@ -136,6 +136,7 @@ pub(super) fn execute_action(
         | VaultAction::WriteCacheFromDialog { .. }
         | VaultAction::KeyringAccess { .. }
         | VaultAction::WslKeyringAccess { .. }
+        | VaultAction::SetWslKeyrings { .. }
         | VaultAction::ListPermissions
         | VaultAction::ListPermissionsPage { .. }
         | VaultAction::WaitPermissions { .. }

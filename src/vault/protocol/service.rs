@@ -64,6 +64,9 @@ impl From<VaultError> for RequestFailure {
 #[cfg(feature = "vault-store")]
 pub struct VaultService {
     state: ServiceState,
+    /// The WSL broker build beside this vault's CLI, identified by the
+    /// desktop worker at the unlock; `SetWslKeyrings` grants it.
+    wsl_keyring_host: std::sync::Mutex<Option<CallerIdentity>>,
     #[cfg(feature = "browser")]
     browser: std::sync::Mutex<browser::BrowserState>,
 }
@@ -91,6 +94,7 @@ impl VaultService {
     pub(crate) fn new(store: VaultStore, now: u64, policy: UnsealLeasePolicy) -> VaultResult<Self> {
         Ok(Self {
             state: ServiceState::new(store, now, policy)?,
+            wsl_keyring_host: std::sync::Mutex::new(None),
             #[cfg(feature = "browser")]
             browser: std::sync::Mutex::new(browser::BrowserState::default()),
         })
@@ -529,6 +533,29 @@ impl VaultService {
                     clock,
                     valid_until,
                 );
+            }
+            VaultAction::SetWslKeyrings { distros } => {
+                require_live_manager(&state, caller, clock, valid_until)?;
+                let broker = self
+                    .wsl_keyring_host
+                    .lock()
+                    .map_err(|_| VaultError::WorkerUnavailable)?
+                    .clone();
+                if broker.is_none() && !distros.is_empty() {
+                    return Err(VaultError::Protocol(
+                        "no WSL broker is installed beside FactorSeal".to_owned(),
+                    )
+                    .into());
+                }
+                let (_, absolute_deadline) = state.lease_deadlines();
+                super::grant::store_wsl_keyring_hosts(
+                    state.store(),
+                    broker.as_ref(),
+                    &distros,
+                    absolute_deadline,
+                    now,
+                )?;
+                return Ok(VaultResponseBody::WslKeyringsSet);
             }
             VaultAction::ListPermissions | VaultAction::ListPermissionsPage { .. } => {
                 require_live_manager(&state, caller, clock, valid_until)?;

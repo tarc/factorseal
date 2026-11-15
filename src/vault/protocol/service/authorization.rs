@@ -6,7 +6,9 @@ use crate::vault::{DocumentKind, VaultResult};
 
 #[cfg(all(feature = "secret-service-host", target_os = "linux"))]
 use super::super::grant::store_exclusive_grant;
-use super::super::grant::{GrantTarget, PreparedGrant, prepare_grant, store_prepared_grants};
+use super::super::grant::{
+    GrantTarget, PreparedGrant, prepare_grant, store_prepared_grants, store_wsl_keyring_hosts,
+};
 use super::super::{CallerIdentity, GrantPermission, WireSecretAddress};
 use super::VaultService;
 use super::approvals::PERMISSION_CONTROL_NAMESPACE;
@@ -156,6 +158,33 @@ impl VaultService {
             expires_at,
             now,
         )
+    }
+
+    /// Record `broker` (the WSL broker beside this vault's CLI, or `None`
+    /// when there is none) and make it the keyring host of exactly
+    /// `distros` until the unseal lease's absolute deadline, removing every
+    /// other WSL keyring host grant. The desktop worker calls this at each
+    /// unlock; Desktop changes the list later with `SetWslKeyrings`.
+    pub fn set_wsl_keyring_hosts(
+        &self,
+        broker: Option<CallerIdentity>,
+        distros: &[String],
+        now: u64,
+    ) -> VaultResult<()> {
+        let mut state = self.state.lock_live(Instant::now())?;
+        let (_, absolute_deadline) = state.lease_deadlines();
+        store_wsl_keyring_hosts(
+            state.store(),
+            broker.as_ref(),
+            distros,
+            absolute_deadline,
+            now,
+        )?;
+        *self
+            .wsl_keyring_host
+            .lock()
+            .map_err(|_| crate::vault::VaultError::WorkerUnavailable)? = broker;
+        state.touch(now, Instant::now())
     }
 
     /// Make the current build of the built-in Linux Secret Service adapter the
