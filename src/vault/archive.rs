@@ -84,7 +84,7 @@ impl VaultArchive {
         for entry in &self.entries {
             entry.metadata.validate_transfer()?;
             if entry.metadata.document_kind == super::DocumentKind::LinuxSecretService {
-                if entry.metadata.partition != super::secret_service_data::NAMESPACE
+                if !super::secret_service_data::is_keyring_partition(&entry.metadata.partition)
                     || entry.evict_at.is_some()
                 {
                     return Err(VaultError::InvalidData(
@@ -568,6 +568,48 @@ mod tests {
         legacy.entries.pop();
         let encrypted = encrypt_archive(&legacy, b"legacy").unwrap();
         assert!(decrypt_vault_archive(&encrypted, b"legacy").is_err());
+    }
+
+    #[test]
+    fn archives_keep_wsl_keyrings_but_no_other_keyring_partition() {
+        use crate::vault::secret_service_data::{IndexItem, PortableItem};
+        let item = IndexItem {
+            id: "0123456789abcdef0123456789abcdef".into(),
+            label: "gh token".into(),
+            attributes: [("service".into(), "gh:github.com".into())].into(),
+            content_type: "text/plain".into(),
+            created: 1,
+            modified: 2,
+        };
+        let archive = |partition: &[u8]| {
+            VaultArchive::new(
+                42,
+                vec![VaultArchiveEntry {
+                    metadata: VaultEntryMetadata {
+                        access_project: None,
+                        display_name: None,
+                        display_type: None,
+                        display_username: None,
+                        display_website: None,
+                        updated_at: None,
+                        favorite: false,
+                        document_kind: DocumentKind::LinuxSecretService,
+                        partition: partition.to_vec(),
+                        address: item.address().unwrap(),
+                    },
+                    value: PortableItem::new(item.clone(), WireSecret::new(b"x".to_vec()).unwrap())
+                        .encode()
+                        .unwrap(),
+                    evict_at: None,
+                }],
+            )
+        };
+        let wsl = crate::vault::wsl_relay::wsl_keyring_namespace("NixOS").unwrap();
+        let encrypted = encrypt_archive(&archive(&wsl), b"wsl").unwrap();
+        let restored = decrypt_vault_archive(&encrypted, b"wsl").unwrap();
+        assert_eq!(restored.entries[0].metadata.partition, wsl);
+        let encrypted = encrypt_archive(&archive(b"factorseal/other/v1"), b"wsl").unwrap();
+        assert!(decrypt_vault_archive(&encrypted, b"wsl").is_err());
     }
 
     struct ExportClient {

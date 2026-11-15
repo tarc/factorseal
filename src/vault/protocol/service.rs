@@ -277,7 +277,7 @@ impl VaultService {
                 clock.check(valid_until.get())?;
                 state.touch(now, monotonic_now)?;
                 let value = if entry.document_kind == DocumentKind::LinuxSecretService {
-                    let index = secret_service_index(state.store(), now)?;
+                    let index = secret_service_index(state.store(), &entry.partition, now)?;
                     let item = index
                         .items
                         .into_iter()
@@ -880,14 +880,16 @@ fn permission_page(
     })
 }
 
+/// The item index of the Secret Service collection in `partition`.
 fn secret_service_index(
     store: &VaultStore,
+    partition: &[u8],
     now: u64,
 ) -> VaultResult<crate::vault::secret_service_data::Index> {
-    use crate::vault::secret_service_data::{INDEX_ITEM, Index, NAMESPACE};
+    use crate::vault::secret_service_data::{INDEX_ITEM, Index};
     let bytes = store.get_at(
         DocumentKind::LinuxSecretService,
-        NAMESPACE,
+        partition,
         &crate::vault::SecretAddress::new(INDEX_ITEM, None)?,
         now,
     )?;
@@ -904,15 +906,16 @@ fn import_secret_service_item(
     provenance: &Provenance,
     now: u64,
 ) -> VaultResult<super::VaultEntryImportStatus> {
-    use crate::vault::secret_service_data::{INDEX_ITEM, NAMESPACE, PortableItem};
+    use crate::vault::secret_service_data::{INDEX_ITEM, PortableItem, is_keyring_partition};
     use crate::vault::{DocumentOperation, SecretAddress};
-    if entry.partition != NAMESPACE || evict_at.is_some() {
+    let partition = entry.partition.as_slice();
+    if !is_keyring_partition(partition) || evict_at.is_some() {
         return Err(VaultError::Protocol(
             "unsupported portable keyring partition or expiry".to_owned(),
         ));
     }
     let portable = PortableItem::decode(value.expose(), &entry.address)?;
-    let mut index = secret_service_index(store, now)?;
+    let mut index = secret_service_index(store, partition, now)?;
     let existing = index
         .items
         .iter()
@@ -930,7 +933,7 @@ fn import_secret_service_item(
     // An imported index must remain writable through the bounded native
     // adapter's normal mutation path.
     VaultRequest::new(VaultAction::Mutate {
-        namespace: NAMESPACE.to_vec(),
+        namespace: partition.to_vec(),
         mutations: vec![
             super::VaultMutation::Put {
                 address: super::WireSecretAddress::new(
@@ -954,7 +957,7 @@ fn import_secret_service_item(
     .validate()?;
     store.mutate(
         DocumentKind::LinuxSecretService,
-        NAMESPACE,
+        partition,
         vec![
             DocumentOperation::Put {
                 address: entry.address.clone(),

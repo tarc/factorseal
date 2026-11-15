@@ -7,6 +7,14 @@ use std::collections::{HashMap, HashSet};
 pub(crate) const NAMESPACE: &[u8] = b"factorseal/secret-service/v1";
 pub(crate) const INDEX_ITEM: &str = "secret-service-index";
 
+/// Whether `partition` holds a Secret Service collection: the native
+/// adapter's, or a WSL distro's
+/// ([`wsl_keyring_namespace`](crate::vault::wsl_relay::wsl_keyring_namespace)).
+/// Each has its own index of the items in it.
+pub(crate) fn is_keyring_partition(partition: &[u8]) -> bool {
+    partition == NAMESPACE || crate::vault::wsl_relay::wsl_keyring_distro(partition).is_some()
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Index {

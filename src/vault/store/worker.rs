@@ -1008,7 +1008,7 @@ impl StoreWorker {
             let partition = document.partition().to_vec();
             let mut keyring_items = std::collections::HashMap::new();
             if document_kind == DocumentKind::LinuxSecretService
-                && partition == crate::vault::secret_service_data::NAMESPACE
+                && crate::vault::secret_service_data::is_keyring_partition(&partition)
             {
                 use crate::vault::secret_service_data::{
                     INDEX_ITEM, Index, access_project, service_target,

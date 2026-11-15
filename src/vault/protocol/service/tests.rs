@@ -4770,3 +4770,86 @@ fn an_unlock_removes_wsl_keyring_hosts_left_from_a_session_sealed_early() {
         .unwrap();
     assert!(!reaches_wsl_keyring_at(&service, &broker, "NixOS", now + 1));
 }
+
+#[test]
+fn wsl_keyring_items_are_listed_backed_up_and_restored() {
+    use crate::vault::secret_service_data::{IndexItem, PortableItem};
+    let (_directory, service) = service(100, UnsealLeasePolicy::default());
+    let manager = caller();
+    service.authorize_permission_manager(&manager, 100).unwrap();
+    let item = IndexItem {
+        id: "0123456789abcdef0123456789abcdef".into(),
+        label: "gh token".into(),
+        attributes: [("service".into(), "gh:github.com".into())].into(),
+        content_type: "text/plain".into(),
+        created: 1,
+        modified: 2,
+    };
+    let entry = VaultEntryMetadata {
+        access_project: None,
+        display_name: None,
+        display_type: None,
+        display_username: None,
+        display_website: None,
+        updated_at: None,
+        favorite: false,
+        document_kind: DocumentKind::LinuxSecretService,
+        partition: crate::vault::wsl_relay::wsl_keyring_namespace("NixOS").unwrap(),
+        address: item.address().unwrap(),
+    };
+    let imported = service.handle(
+        &manager,
+        VaultRequest::new(VaultAction::ImportVaultEntry {
+            entry: entry.clone(),
+            value: PortableItem::new(item.clone(), WireSecret::new(b"gho_x".to_vec()).unwrap())
+                .encode()
+                .unwrap(),
+            evict_at: None,
+            replace_existing: false,
+        })
+        .unwrap(),
+        101,
+    );
+    assert!(
+        matches!(
+            imported.result,
+            Ok(VaultResponseBody::VaultEntryImported {
+                status: VaultEntryImportStatus::Added
+            })
+        ),
+        "{:?}",
+        imported.result
+    );
+
+    let listed = service.handle(
+        &manager,
+        VaultRequest::new(VaultAction::ListVaultEntries {
+            cursor: None,
+            limit: 8,
+        })
+        .unwrap(),
+        102,
+    );
+    let VaultResponseBody::VaultEntries { entries, .. } = listed.result.unwrap() else {
+        panic!("expected the inventory");
+    };
+    // The item, labelled from its distro's index; the index itself is hidden.
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].partition, entry.partition);
+    assert_eq!(entries[0].display_name.as_deref(), Some("gh token"));
+
+    let exported = service.handle(
+        &manager,
+        VaultRequest::new(VaultAction::ExportVaultEntry {
+            entry: entries[0].clone(),
+        })
+        .unwrap(),
+        103,
+    );
+    let Ok(VaultResponseBody::VaultEntrySecret { value, .. }) = exported.result else {
+        panic!("expected the exported item, got {:?}", exported.result);
+    };
+    let portable = PortableItem::decode(value.expose(), &entry.address).unwrap();
+    assert_eq!(portable.item, item);
+    assert_eq!(portable.value.expose(), b"gho_x");
+}
