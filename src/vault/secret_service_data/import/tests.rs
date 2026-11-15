@@ -352,11 +352,13 @@ fn an_export_falls_back_to_an_older_readable_duplicate() {
     );
     assert_eq!(labels(&export), ["oldest"]);
     assert_eq!(export.portable[0].1.as_slice(), b"old");
+    // The newer items left behind say why, so the report shows that an
+    // older value moved instead of theirs.
     assert_eq!(
         reasons(&export),
         [
-            ("newest", KeyringSkipReason::Duplicate),
-            ("older", KeyringSkipReason::Duplicate)
+            ("newest", KeyringSkipReason::Unreadable),
+            ("older", KeyringSkipReason::TooLarge)
         ]
     );
     // Without a readable one, each says why.

@@ -296,8 +296,17 @@ pub fn map_keyring_items(items: Vec<KeyringSourceItem>, with_values: bool) -> Ke
             continue;
         };
         let mut item = group.remove(chosen);
-        for other in &group {
-            skip(&mut import, other, KeyringSkipReason::Duplicate);
+        // Newest first: those before the chosen one are newer but failed
+        // the value rules, and say why; those after are older duplicates.
+        for (position, other) in group.iter().enumerate() {
+            let reason = if position < chosen {
+                value_rules(other)
+                    .err()
+                    .unwrap_or(KeyringSkipReason::Duplicate)
+            } else {
+                KeyringSkipReason::Duplicate
+            };
+            skip(&mut import, other, reason);
         }
         if with_values {
             // Checked by the value rules.
