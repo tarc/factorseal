@@ -24,10 +24,27 @@ use zeroize::Zeroizing;
 const FRAME_START: &[u8] = b"FACTORSEAL-FRAME v1 ";
 const FRAME_END: &[u8] = b"FACTORSEAL-FRAME end";
 
-/// The most `wsl.exe` output read: an archive of at most 256 MiB, base64
-/// twice over (the archive in the record, the record in the frame).
+/// The most standard output kept: the largest frame, an archive of at most
+/// 256 MiB base64 twice over (in the record, then the record in the frame,
+/// ≈455 MiB), with room for the record's lists.
 #[cfg(windows)]
-const MAX_OUTPUT_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_STDOUT_BYTES: u64 = 464 * 1024 * 1024;
+
+/// The most standard error kept: only its lines for a message are used.
+#[cfg(windows)]
+const MAX_STDERR_BYTES: u64 = 64 * 1024;
+
+/// The first `cap` bytes of `pipe`, reading the rest to its end and
+/// dropping it, so a child writing more is not blocked on a full pipe
+/// until the time limit kills it.
+#[cfg_attr(not(windows), allow(dead_code))] // The Windows runner and tests.
+fn read_capped(mut pipe: impl std::io::Read, cap: u64) -> Vec<u8> {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    let _ = (&mut pipe).take(cap).read_to_end(&mut bytes);
+    let _ = std::io::copy(&mut pipe, &mut std::io::sink());
+    bytes
+}
 
 /// How long an inventory may take: WSL may have to start the distro, and
 /// no prompt is involved.
@@ -265,6 +282,8 @@ fn record(
     let Some((found, content)) = unframe(&output.stdout) else {
         return Err(failure(distro, &output));
     };
+    // The frame's content is all that is needed from here on.
+    drop(output);
     if found != kind {
         return Err(format!(
             "{distro} answered with a {found} instead of an {kind}."
@@ -422,9 +441,10 @@ pub(crate) fn move_items(
         move_limit(prompt_collections),
         cancel,
     )?;
+    let mut record = record;
     let encrypted = record
         .archive
-        .as_deref()
+        .take()
         .ok_or_else(|| format!("{distro} sent no archive."))
         .and_then(|archive| {
             STANDARD
@@ -504,7 +524,7 @@ impl Wsl for SystemWsl {
         limit: Duration,
         cancel: &AtomicBool,
     ) -> Result<RunOutput, RunError> {
-        use std::io::{Read as _, Write as _};
+        use std::io::Write as _;
         use std::os::windows::process::CommandExt as _;
         use std::process::{Command, Stdio};
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -532,26 +552,22 @@ impl Wsl for SystemWsl {
                 let _ = pipe.write_all(&input);
             })
         });
-        let reader = |pipe: Option<Box<dyn std::io::Read + Send>>| {
-            std::thread::spawn(move || {
-                let mut bytes = Vec::new();
-                if let Some(pipe) = pipe {
-                    let _ = pipe.take(MAX_OUTPUT_BYTES).read_to_end(&mut bytes);
-                }
-                bytes
-            })
+        let reader = |pipe: Option<Box<dyn std::io::Read + Send>>, cap: u64| {
+            std::thread::spawn(move || pipe.map(|pipe| read_capped(pipe, cap)).unwrap_or_default())
         };
         let stdout = reader(
             child
                 .stdout
                 .take()
                 .map(|pipe| Box::new(pipe) as Box<dyn std::io::Read + Send>),
+            MAX_STDOUT_BYTES,
         );
         let stderr = reader(
             child
                 .stderr
                 .take()
                 .map(|pipe| Box::new(pipe) as Box<dyn std::io::Read + Send>),
+            MAX_STDERR_BYTES,
         );
         let started = std::time::Instant::now();
         let outcome = loop {
@@ -688,6 +704,18 @@ mod tests {
                 started.elapsed()
             );
         }
+    }
+
+    #[test]
+    fn output_past_the_cap_is_read_to_the_end_and_dropped() {
+        let mut pipe = std::io::Cursor::new(vec![7_u8; 10]);
+        assert_eq!(read_capped(&mut pipe, 4), [7, 7, 7, 7]);
+        assert_eq!(
+            pipe.position(),
+            10,
+            "drained, so the child is never blocked"
+        );
+        assert_eq!(read_capped(std::io::Cursor::new(b"ab".to_vec()), 4), b"ab");
     }
 
     #[test]
