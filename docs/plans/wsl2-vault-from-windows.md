@@ -1,7 +1,10 @@
 # Plan: the Windows vault for WSL2 (SecretSpec and the keyring)
 
-Status, 2026-11-14: milestone 1 (SecretSpec in WSL) is done on
-`feature/wsl2-keyring` (backed up on the fork as `wip/wsl2-keyring`, no PR).
+Status, 2026-11-15: milestone 1 (SecretSpec in WSL) is done on
+`feature/wsl2-keyring` (backed up on the fork as `wip/wsl2-keyring` at
+3ecbb9a, no PR), and the fixes from its independent review are committed
+on top (see "Review fixes" below), except the Desktop popup fix (finding 1),
+which waits uncommitted for the user to see it in the native build.
 Milestone 2 (the WSL keyring) is planned below and not started. This branch
 sits on `stack/7-browser-windows`, the top of the WSL2 PR stack (#42 → #43 →
 #44 → #46 → #47, index #40); rebase it with `git rebase --onto` when the stack
@@ -87,7 +90,72 @@ under its own approval, a seal removes the WSL grant.
 Using it: install this branch's Windows build (`build-windows.sh release
 --broker`, copy the six exes incl. `factorseal-wsl-broker.exe` beside
 `factorseal.exe`), build the Linux `factorseal` in WSL, run
-`factorseal wsl-setup` once.
+`factorseal wsl-setup` once (`--windows-root <Windows path>` targets a vault
+other than the default one).
+
+### Review fixes (2026-11-15)
+
+An independent review of milestone 1 (`wsl2-milestone1-review.md`, kept in a
+session scratchpad, not in the repo) found one blocking issue, eleven others
+and six test gaps. Every fix below has a test that was seen failing without
+it (or, for coverage-only tests and the relay move, failing under a
+mutation of the code it guards), and each commit passed fmt, workspace
+clippy, `test-with-dbus.sh cargo test --all-features --lib -- wsl
+protocol::wsl` and `cargo test --all-features --bin factorseal -- relayed wsl
+grant_lifetime`.
+
+Decisions the user took:
+
+- **Unreadable permission registry at unseal** (finding 3): the vault opens,
+  records an `IntegrityFailure` security event, and leftover WSL grants run
+  to their absolute deadline (option b). Not the per-unseal id in the grant
+  (a storage format change).
+- **Windows vault sealed** (deviation 2): `secretspec` in WSL waits for the
+  unlock (polling `Status` through the broker) until shortly before its
+  deadline, then retries once.
+- **`wsl-setup` for another vault** (deviation 3): yes, named
+  `--windows-root` because the global `--root` already names the Linux
+  vault; `check.sh secretspec-wsl` now runs `wsl-setup` itself.
+
+| Commit | Finding | What, and how it was verified |
+|---|---|---|
+| *(uncommitted)* | 1, blocking | Desktop popup: `approval_lifetime(grants, choice)` refuses a carried-over choice that no longer fits ("Until the vault seals" for mixed or native requests, a native duration for all-WSL ones, "This write only" for non-writes) with "The requests changed. Choose how long to allow access."; `grant()` uses it. Assertions in `secretspec_requests_name_…`; Linux and Windows Desktop tests (184, 169); live on the test vault (scratch `mixed-popup.sh`): a WSL read waiting with "Until the vault seals" selected, then a native `provider-probe.ps1` read joins, Allow is refused and both stay pending, "1 hour" then grants the native read for an hour and the WSL read for min(1 h, unseal deadline). |
+| 5834211 | 2 + deviation 2 | The relayed provider no longer calls the Linux `UnlockForIpc`/`FinishIpcAccess`; it waits for the Windows unseal and retries once. Test under the private bus with a fake Linux host counting calls (was 4, now 0) and a vault sealed for two requests, then left sealed. Live: started while the test vault was sealed, `secretspec get` waited, the unlock came at 10 s, the retried request was approved and the same command finished at 15 s; left sealed, a check gives up at ~29 s with "interaction required". |
+| aa612c7 | 5 | `wsl_relay::serve` (the relay loop, with an `on_sealed` callback that runs once) replaces the broker's own loop; Linux tests with a recording client: other actions and bad frames never reach the vault and keep the frame's id, the distro tag, the error mapping, Desktop brought forward once. Mutations (allowlist skipped, callback never run) fail them. |
+| f06b741 | 4 | `check.sh secretspec-wsl` cleanup trap: kills each background run's process tree (`timeout` gives secretspec its own process group) and denies the run's pending requests; step 6 asserts the denied read fails. Live: SIGINT to the check's process group during step 1 (2 secretspec and a broker running): the check exited within a second, no process and no pending request left, no popup open. |
+| 2dede31 | 6 | `write_private` keeps an existing directory's mode, refuses one others can write to, makes only a directory it creates 0700. Unit test. |
+| 0ca0e88 | 7 | The WSL claim forwards `XDG_CONFIG_HOME`. Unit test. |
+| 48becfd | 8 | `cmd.exe /u` and UTF-16LE decoding for `%LOCALAPPDATA%`. Unit test with `C:\Users\João\…`; real `wsl-setup` run against the installed Desktop (output to a scratch config). |
+| aac4805 | 11 | `Relay::drop` comment says it kills, then reaps. |
+| e9c0ae5 | 3 | `ServiceState::new` records the sweep failure and opens. `wsl_sweep_does_not_block_unseal_on_an_unreadable_registry` (registry rewritten as version 2 between seal and unseal; the leftover WSL grant still works). |
+| 0f7dd6f | deviation 3, test gap | `wsl-setup --windows-root`; `windows_config` tested against a fake `factorseal.exe` (pipe for the default and another root, refusal of `../x`). Live: run against the test vault's root. |
+| 8353064 | 9, 10, deviation 6 | Docs: the allowlist narrows what honest clients trigger and is not a boundary; the stored expiry is the absolute deadline, a seal ends it earlier; `wsl.json` wins over `FACTORSEAL_ROOT`, not `FACTORSEAL_SOCKET`; WSL waits for the unlock. |
+| 3c7c41a, 40b097e | test gap | Single-use WSL grant: expires at min(single-use window, absolute deadline) and is swept unspent. 40b097e removed a once-in-~180-runs flake (the request clock can stamp the approval a second late). |
+| 1d15f4d | test gap | Provider client selection (`FactorsealProvider::select` with a loader): WSL setup without socket → relayed, socket wins and never reads `wsl.json`, damaged `wsl.json` → `WslSetup` error. |
+| 332f468 | test gap | `BrokerVaultClient`: a broker that dies after reading gets the resend; a reply with another id is an error and that broker is dropped. |
+| 9a806cb | test gap | `check.sh secretspec-wsl` step 3 asserts no new pending request. |
+| e4bcffd | test gap | `build-windows.sh check` runs `cargo test --lib --features vault-client -- protocol::wsl` natively (9 passed, including the Windows-only relayed-decode test). |
+| dee173a | new, from the live runs | `check.sh` puts the broker and CLI in `target\wsl-check`: beside `factorseal-desktop.exe` (as 0f7dd6f first had it), the broker answered the idle-sealed test vault by starting that Desktop **without `--root`**, on the user's own vault (it stayed sealed; the stray Desktop was stopped). |
+
+Live on the test vault with the release build of this branch: `check.sh
+secretspec-wsl` PASS twice (through `wsl-setup --windows-root`; second read
+without a popup in 479 and 612 ms), plus the finding 1, finding 4 and
+deviation 2 runs above.
+
+Finding 12 (the broker client's lock held through each 5 s
+`WaitPermission`), measured only: a three-key `secretspec check` in WSL with
+no approvals had all three requests pending within ~0.7 s of each other
+(vault `created` +1/+2/+1 s), so the popup lists every key at once. Approved,
+the same check takes 1.1–1.4 s. Left unanswered, three keys end at 33.9 s
+with "deadline exceeded", where one key ends at 30.0 s with "interaction
+required": the keys' waits queue on the shared broker, so the provider
+misses its answer-by time. A broker per in-flight request would fix that;
+not built, pending the user's call.
+
+Not changed: deviation 4 (`--remove` leaves the claim) and 5 (the CLI
+accepts longer WSL durations, clamped) were acceptable in the review.
+`single_use_write_permission_allows_exactly_one_write` (native, older)
+asserts the same exact approval time that made 3c7c41a flaky.
 
 ## Milestone 2: the WSL keyring (planned)
 
@@ -184,8 +252,12 @@ copies" (~1142) though a plain set never expires. Fix: Projects points to
 - Windows checks: `scripts/windows-desktop-check/` (README, `windows-desktop-check`
   skill). Release builds refuse while any FactorSeal process runs: ask the user,
   then seal their vault with the installed `factorseal.exe seal` and stop
-  Desktop (the tray menu no longer takes `SendKeys` keystrokes). Restart it
-  with the Startup shortcut afterwards.
+  Desktop (the tray menu no longer takes `SendKeys` keystrokes, and a plain
+  `taskkill` only hides it: once sealed, `taskkill /F`). Stop the browser
+  host too. Restart Desktop with the Startup shortcut afterwards.
+- On `Sealed` the broker starts the `factorseal-desktop.exe` beside it
+  without `--root`: never put a broker for the test vault next to a Desktop
+  (`check.sh` uses `target\wsl-check`).
 - The test vault seals after ~5 idle minutes; a request left pending then keeps
   a popup with "Unlock to continue" open, which covers the main window's
   password field: unlock with `drive.ps1 -Action unlock-popup`, deny leftovers.
