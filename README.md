@@ -52,7 +52,9 @@ Biometric unlock uses Touch ID on macOS or Windows Hello on Windows.
 ### Desktop
 
 Install Desktop and its required CLI companion using the
-[development packaging instructions](packaging/README.md), then launch:
+[development packaging instructions](packaging/README.md) (on Windows, the
+release's `factorseal-setup.exe`: see
+[Installing on Windows](docs/usage.md#installing-on-windows)), then launch:
 
 ```console
 $ factorseal desktop

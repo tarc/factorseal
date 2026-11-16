@@ -84,6 +84,72 @@ task template placeholders with the current SID and extracted directory; its
 optional `-Root` parameter provides an isolated installed-service acceptance
 vault. It refuses to replace an existing task unless `-Replace` is explicit.
 
+## Windows installer
+
+`factorseal-setup.exe` installs FactorSeal for the current Windows user, in
+`%LOCALAPPDATA%\Programs\FactorSeal`, without administrator rights. It is
+built once and never changes per release: a release is a folder holding the
+executables, the installer and a `factorseal-release.json` that lists every
+file with its SHA-256 and the install steps, from the installer's fixed
+vocabulary (copy the files, shortcuts, set up WSL, start Desktop, and what
+uninstall removes). The installer refuses a release whose files don't match,
+and a release that needs a newer installer. Distribute the release folder
+whole; the installer installs the manifest beside it. Its dialogs, updates and
+uninstall are described in [Installing on Windows](../docs/usage.md#installing-on-windows);
+the design is in [docs/plans/windows-installer.md](../docs/plans/windows-installer.md).
+
+The installer and the release's executables are not signed. Windows
+SmartScreen shows "Windows protected your PC" for an unrecognized program:
+choose **More info**, check that the file is the one you built or received,
+then **Run anyway**. Since the installer is the same file for every release,
+that warning concerns one unchanging file.
+
+### Building a release for the installer
+
+From WSL2, with the Windows copy described in
+[scripts/windows-desktop-check](../scripts/windows-desktop-check/README.md):
+
+```console
+$ scripts/windows-desktop-check/build-windows.sh setup
+$ scripts/windows-desktop-check/build-windows.sh dist
+```
+
+`setup` builds the installer and stores it in the Windows copy as
+`dist\setup\factorseal-setup-<setup version>.exe`, with its SHA-256 in
+`dist\setup\SHA256SUMS`. Run it only when the installer changed, after raising
+its version in `packaging/windows/setup/Cargo.toml`: a stored version is never
+rebuilt (`--replace` overrides that, for an installer that never left the
+build machine). `dist` builds the executables with
+`build-windows-release.ps1` and writes `dist\factorseal-<version>\`, where the
+version is the workspace's plus `+g<commit>` (and `.dirty` with uncommitted
+changes): the executables, the licenses, the stored installer copied byte for
+byte, and the manifest. It refuses a Desktop built with the test-only
+`wsl-test-hooks` feature, and before finishing installs the release with its
+own installer into a test folder and uninstalls it again. Build releases from
+a clean commit.
+
+### Unattended use
+
+`factorseal-setup.exe --quiet` takes every choice on the command line and
+reports through its exit code and a log file (`--log`, by default
+`%TEMP%\factorseal-setup.log`); `factorseal-setup.exe --help` lists the options
+and exit codes. For example:
+
+```powershell
+$release = (Resolve-Path 'dist\factorseal-0.1.0+g1234567890').Path
+$run = Start-Process -Wait -PassThru "$release\factorseal-setup.exe" `
+  -ArgumentList '--quiet', '--manifest', "`"$release\factorseal-release.json`"", '--no-wsl'
+$run.ExitCode
+```
+
+Pass absolute paths, quoted: `Start-Process` resolves relative ones against
+the process's own folder, which can differ from PowerShell's location.
+
+A release that sets up WSL needs `--wsl <distro>` (repeated) or `--no-wsl`;
+`--uninstall` removes the install (`--also-delete` also deletes the settings
+folder). The installer is a Windows program, so PowerShell waits for it and
+reports its exit code only through `Start-Process -Wait -PassThru`.
+
 ## Microsoft Store MSIX
 
 Reserve the Factorseal product in Partner Center before making a submission.

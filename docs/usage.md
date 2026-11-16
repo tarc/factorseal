@@ -15,6 +15,37 @@ attacks. Native biometric enforcement still inherits the cryptographic and
 certification properties of Secure Enclave or Windows Hello, so Factorseal does
 not claim that those complete platform paths are post-quantum certified.
 
+## Installing on Windows
+
+Run `factorseal-setup.exe` from a FactorSeal release folder (see
+[Windows installer](../packaging/README.md#windows-installer) for building
+one, and for the SmartScreen warning). It installs FactorSeal for your Windows
+user in `%LOCALAPPDATA%\Programs\FactorSeal`, with no administrator rights:
+
+1. The first page says what happens: a new install, an update from the
+   installed version, or taking over a FactorSeal you extracted from the ZIP
+   into that folder (its `UNINSTALL.txt` goes and its shortcuts are replaced
+   by the installer's). Desktop gets a Start menu shortcut; turn on the
+   options you want, such as starting FactorSeal when you sign in, or a
+   desktop shortcut. A shortcut the installed version has is kept.
+2. If the release sets up WSL, the next page lists your WSL distros. Turn on
+   the ones whose programs should use this vault (see the two WSL sections
+   below); the installer runs `factorseal wsl-setup` in each, and a distro
+   without the Linux `factorseal` gets instructions instead. Setting up a
+   distro starts it, so nothing is checked before you choose.
+3. If FactorSeal is running, the installer stops it, or asks you to quit it
+   from its tray icon (a version before the installer can't be told to quit).
+   The vault stays sealed until you unlock it again.
+4. The last page offers to open FactorSeal, on the WSL keyrings page.
+
+To update, run the new release's `factorseal-setup.exe` the same way: it
+replaces the installed files and keeps your choices. To uninstall, use
+**Settings → Apps → Installed apps → FactorSeal → Uninstall**: it removes
+FactorSeal, its shortcuts and its WSL setup in the distros you keep ticked,
+and deletes its settings folder only if you ask. **Your vault is always
+kept**; installing FactorSeal again opens it, and `factorseal.exe destroy`
+removes it for good.
+
 ## Quick start
 
 Factorseal requires a supported platform enclave: TPM 2.0 on Linux and Windows,
@@ -149,7 +180,8 @@ $ factorseal seal
 
 With FactorSeal Desktop installed on Windows, the Linux `secretspec` inside a
 WSL2 distro can use the Windows vault. Install the Linux `factorseal` in the
-distro and run, once:
+distro; then the [installer](#installing-on-windows)'s WSL page sets the distro
+up, or run, once:
 
 ```console
 $ factorseal wsl-setup
@@ -182,9 +214,10 @@ can keep their secrets in the Windows vault instead of gnome-keyring:
 1. In FactorSeal Desktop on Windows, open Settings, WSL keyrings, and switch
    the distro on. Desktop lists the distros registered for your Windows user;
    the WSL broker must be installed beside `factorseal.exe`.
-2. In the distro, run `factorseal wsl-setup` once (see above), stop
-   gnome-keyring or any other keyring service, and run
-   `factorseal wsl-keyring`. On NixOS, the module does it for you:
+2. In the distro, run `factorseal wsl-setup` once, unless the installer's
+   WSL page set the distro up (see above), stop gnome-keyring or any other
+   keyring service, and run `factorseal wsl-keyring`. On NixOS, the module
+   does it for you:
 
    ```nix
    services.factorseal = {
