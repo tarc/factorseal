@@ -1,8 +1,9 @@
 # Plan: a small Windows installer (`factorseal-setup.exe`)
 
-Status, 2026-11-16: steps 1–8 done (Desktop `--quit` and `--open`, the
+Status, 2026-11-16: steps 1–9 done (Desktop `--quit` and `--open`, the
 manifest crate, the install engine, shortcuts, registry and start,
-stopping the installed version, the `wsl` step, uninstall);
+stopping the installed version, the `wsl` step, uninstall, the release
+build);
 review folded in (see "Review record" at the end). Branch: `feature/wsl2-keyring`. It hands off to
 Desktop's gnome-keyring check and move, planned in
 [gnome-keyring-import.md](gnome-keyring-import.md).
@@ -777,6 +778,61 @@ in the native build.
    - The check asserts that copying, not reproducibility: two `dist` runs
      give an installer equal to the stored file. Making MSVC builds
      reproducible (`/Brepro`, path remapping) is not attempted.
+
+   As implemented (2026-11-16; `packaging/build-windows-release.ps1`, the
+   `setup` and `dist` modes of `build-windows.sh`):
+   - **`setup`** builds `factorseal-setup` natively and stores it in the
+     Windows copy as `dist\setup\factorseal-setup-<version>.exe`, its
+     SHA-256 appended to `dist\setup\SHA256SUMS` (`sha256sum` format). A
+     stored version is refused unless `--replace` says otherwise: an
+     installer changes only with its version. The mirror's robocopy
+     `/MIR` would have deleted the copy's `dist\` on every run, since the
+     repository has none; it is now excluded like `target`.
+   - **`dist`** needs a stored installer for the setup crate's version. The
+     release version is the workspace's plus `+g<10-digit commit>`, and
+     `.dirty` (with a warning) when tracked files have uncommitted changes;
+     the Windows copy has no `.git`, so the WSL side passes it in. The
+     PowerShell script (a sibling of the ZIP's `build-windows.ps1`) checks
+     the stored installer against `SHA256SUMS`, builds the CLI with the
+     features of `build-windows.sh` (the SecretSpec provider included),
+     Desktop without features and the WSL broker natively (as the ZIP
+     does, not `--broker`'s cross-compile), refuses a Desktop whose
+     executable holds `FACTORSEAL_TEST_KEYRING_EXPORTER` (the
+     `wsl-test-hooks` feature's only trace), writes
+     `dist\factorseal-<version>\` afresh with the six executables, the
+     three licenses and `README.md`, copies the stored installer as
+     `factorseal-setup.exe` and checks the copy, and writes the manifest:
+     the sketch above, with `stop` `factorseal-desktop.exe --quit` and
+     `also_stop` the browser host and broker; a Start menu shortcut,
+     optional Startup (`--background`) and desktop ones; `wsl`; `start`
+     on the WSL keyrings page, quietly in the tray; `registry_cleanup` the
+     four browsers' native-messaging keys Desktop registers;
+     `ask_to_delete` `%APPDATA%\Factorseal` (Desktop's preferences and
+     native-messaging manifests; the vault is in `%LOCALAPPDATA%`); and a
+     `keep_note` saying where the vault stays and how to destroy it. The
+     JSON is written without a byte order mark, which PowerShell 5.1's
+     `UTF8` encoding adds and serde refuses.
+   - Then the WSL side checks that the release's installer is the stored
+     file, and runs that installer on its release: installed into
+     `target\dist-check` under a test registry key with test shortcut and
+     AppData folders (`--no-start --no-wsl`), then uninstalled by the
+     installed copy; both must succeed and the folder must be gone.
+   - Under PowerShell 5.1 with `2>&1` (as `build-windows.sh` runs
+     commands) and `$ErrorActionPreference = 'Stop'`, cargo's progress on
+     standard error became a terminating error on the first build; the
+     script runs cargo with errors continuing, its lines passed on as
+     text, judged by the exit code.
+   - `packaging/README.md` names the release builder and the provider
+     difference from the ZIP; the check scripts' README the two modes.
+   - Checked natively: `setup` stored `factorseal-setup-0.1.0.exe`
+     (`b1cfad07…`) and refused a second run; `dist` from the uncommitted
+     tree wrote `factorseal-0.1.0+gb0e7825b7f.dirty`, and after the commit
+     `factorseal-0.1.0+ge1e565ca6a`; both installed (12 files) and
+     uninstalled in the test folder, and both installers are the stored
+     file byte for byte. The release's `factorseal.exe provider --help`
+     works. The script's own test-hooks check, run on its own, refused
+     Desktop's test build made with `--test-hooks` and accepted the
+     release Desktop. `shellcheck` is clean.
 10. **Task dialog UI**: the four pages and the uninstall page. Then the
     user tries it natively (install into a test folder, update to a second
     build with the same installer, uninstall) before it is committed.
