@@ -1,8 +1,8 @@
 # Plan: a small Windows installer (`factorseal-setup.exe`)
 
-Status, 2026-11-16: steps 1–7 done (Desktop `--quit` and `--open`, the
+Status, 2026-11-16: steps 1–8 done (Desktop `--quit` and `--open`, the
 manifest crate, the install engine, shortcuts, registry and start,
-stopping the installed version, the `wsl` step);
+stopping the installed version, the `wsl` step, uninstall);
 review folded in (see "Review record" at the end). Branch: `feature/wsl2-keyring`. It hands off to
 Desktop's gnome-keyring check and move, planned in
 [gnome-keyring-import.md](gnome-keyring-import.md).
@@ -678,6 +678,87 @@ in the native build.
    consent; the confinement of `registry_cleanup` and `ask_to_delete`; the
    vault untouched. Native tests under the test registry root and a
    temporary folder (with a fake WSL runner).
+
+   As implemented (2026-11-16; `uninstall.rs`, `--quiet --uninstall`):
+   - **Order**: the install is stopped the way its record says
+     (`StopPlan::for_uninstall`: the recorded command, checked against its
+     hash, and only the recorded `also_stop`; exit 7 and nothing changed
+     when something keeps running); the setup is removed from the chosen
+     recorded distros (`wsl::remove`, the fixed removal line); then the
+     release's files. A file that can't be removed stops there, with the
+     record, the shortcuts, the registry and the Installed apps entry
+     untouched, so running the uninstall again finishes it (exit 5).
+     Then the shortcuts, the recorded registry values, the
+     `registry_cleanup` keys, the Installed apps key, the installed setup
+     and `install.json`, the release's empty folders, and the install
+     folder only when nothing the installer didn't put there is left in it
+     (else it is kept and what it holds is named). Then the
+     `ask_to_delete` folders, only with consent, and the `keep_note`.
+   - **The record is checked as a manifest**: it sits in the user's
+     folder, so each entry is checked before anything is deleted, and one
+     outside the rules is left and named: release paths
+     (`check_release_path`), shortcuts (`.lnk` files below the Start menu
+     or desktop folder, no `..`, compared ignoring case), registry keys
+     (the allowed prefixes, also for the recorded values), `ask_to_delete`
+     (FactorSeal's folders, never the vault, expanded from `%APPDATA%` or
+     `%LOCALAPPDATA%`), and `keep_note` (500 characters). The same
+     shortcut check now applies to updates, which removed whatever path the
+     record listed as a shortcut; a path outside the folders is neither
+     removed nor kept in the record.
+   - **Consent under `--quiet`**: `--wsl DISTRO` (each a recorded distro)
+     or `--no-wsl`, required when the record lists distros; a distro not
+     chosen is named with the command that undoes its setup.
+     `--also-delete` deletes the `ask_to_delete` folders; without it they
+     are named and kept. No record: exit 9 (a hand-made install is told to
+     follow its `UNINSTALL.txt`). Exit 8 when only a distro's removal
+     failed. The hidden `--appdata-root` maps the two folder variables for
+     tests.
+   - **Self-deletion**: run from the install folder (as Installed apps
+     runs `--uninstall`), the installer continues from a copy in the
+     temporary folder (step 4's relaunch, now passing `--uninstall`,
+     `--also-delete` and the WSL choice), which removes the folder with
+     the installed copy in it. The copy then hands its own deletion to
+     `%SystemRoot%\System32\cmd.exe` (`ping -n 3 127.0.0.1 >nul & del
+     /f /q "<copy>"`, no window), unless its path holds `"` or `%`, which
+     `cmd.exe` would read as more than a path; that copy is left for the
+     next run's cleanup of old copies. Until step 10, the Installed apps
+     entry's `--uninstall` without `--quiet` only says that the dialogs
+     aren't built yet.
+   - Tests: 6 unit tests for the uninstall (with a fake WSL: everything
+     recorded removed and the vault kept; folders and distros kept without
+     consent; a tampered record's entries all left; a failed distro
+     removal reported with the command to run; a file that can't be
+     removed, through a read-only folder on Unix or a handle without
+     delete sharing on Windows, stopping before anything else; the folder
+     variables), the uninstall stop plan, 2 for the shortcut check (one an
+     update with a tampered record). Binary: install then uninstall with a
+     shortcut, a registry value, `registry_cleanup`, `ask_to_delete` and
+     `keep_note`, first refused with exit 7 while the CLI runs from the
+     folder, then done, the vault kept, the test registry values gone
+     (checked on Windows), a second uninstall exit 9; (Unix) the distro
+     choice through the WSL stand-in; (Windows) the uninstall run from the
+     install folder, whose relaunched copy is gone afterwards. 74 unit and
+     7 binary tests on Linux; natively 70 (+1 ignored) and 8. The steps
+     tests' fixture listed no shortcut folders, unlike the installer; it
+     now lists the Start menu and desktop. Mutations caught (17 on Linux):
+     each of the five checks of the record skipped, the listed folders
+     deleted without consent, a file that can't be removed ignored, a
+     folder with unknown files removed, unchosen distros removed, the note
+     unchecked, the removal running the wrong line, an update removing an
+     unchecked shortcut, `..` accepted in a shortcut path, the distro
+     choice not required, an unrecorded distro accepted, the uninstall
+     not stopping, the uninstall plan ignoring the record; natively, the
+     copy not deleting itself.
+   - Live, natively, on the test vault (test registry, shortcut and
+     AppData roots): a release whose stop command is
+     `factorseal-desktop.exe --root <test vault> --quit` installed with a
+     Start menu shortcut, its Desktop started; the installed
+     `factorseal-setup.exe --uninstall --also-delete`, run from inside the
+     install folder, continued from a copy in the test temporary folder,
+     stopped Desktop through the recorded command, removed the folder, the
+     shortcut, the registry values and the settings folder, kept the test
+     vault, showed the note, and its copy was gone 5.4 s after the start.
+     The user's own Desktop and browser host ran on throughout.
 9. **The build writes the release**: a new mode, `build-windows.sh dist`,
    leaving `release` as it is for its current callers.
    - It puts the artifacts and `factorseal-release.json` in
