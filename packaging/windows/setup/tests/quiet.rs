@@ -34,6 +34,29 @@ fn release(root: &Path, version: &str, requires_setup: u32) -> PathBuf {
     path
 }
 
+/// A test registry key per sandbox, under one parent the tests remove.
+fn registry_root(sandbox: &Path) -> String {
+    let name = sandbox.file_name().unwrap().to_string_lossy().into_owned();
+    format!(r"HKCU\Software\FactorSeal-setup-test\{name}")
+}
+
+/// Removes a sandbox's test registry key when dropped (Windows).
+#[cfg_attr(not(windows), allow(dead_code))] // Nothing to remove elsewhere.
+struct RegistryCleanup(PathBuf);
+
+impl Drop for RegistryCleanup {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        {
+            use factorseal_setup::registry::{Registry as _, Root, SystemRegistry};
+            let _ = SystemRegistry {
+                root: Root::CurrentUser,
+            }
+            .delete_key(&registry_root(&self.0));
+        }
+    }
+}
+
 struct Run {
     code: Option<i32>,
     log: String,
@@ -51,8 +74,14 @@ fn setup_in(
     extra: &[&str],
     cwd: &Path,
 ) -> Run {
+    // Never the user's shortcut folders or registry keys.
+    let sandbox = log.parent().unwrap();
     let status = Command::new(program)
         .current_dir(cwd)
+        .arg("--shortcut-root")
+        .arg(sandbox.join("shortcuts"))
+        .arg("--registry-root")
+        .arg(registry_root(sandbox))
         .arg("--quiet")
         .arg("--manifest")
         .arg(manifest)
@@ -85,6 +114,7 @@ fn quiet_installs_and_reports_through_exit_codes_and_the_log() {
     let root = tempfile::tempdir().unwrap();
     let install_dir = root.path().join("Programs").join("FactorSeal");
     let log = root.path().join("setup.log");
+    let _cleanup = RegistryCleanup(root.path().to_owned());
     let manifest = release(root.path(), "1.0.0", 1);
 
     let run = setup(Path::new(SETUP), &manifest, &install_dir, &log, &[]);
@@ -120,6 +150,7 @@ fn a_hand_made_install_is_updated_only_with_adopt() {
     std::fs::create_dir_all(&install_dir).unwrap();
     std::fs::write(install_dir.join("factorseal-desktop.exe"), b"by hand").unwrap();
     let log = root.path().join("setup.log");
+    let _cleanup = RegistryCleanup(root.path().to_owned());
     let manifest = release(root.path(), "1.0.0", 1);
 
     let run = setup(Path::new(SETUP), &manifest, &install_dir, &log, &[]);
@@ -151,6 +182,7 @@ fn an_update_run_from_inside_the_install_folder_succeeds_through_the_relaunch() 
     let temp = root.path().join("temp");
     std::fs::create_dir_all(&temp).unwrap();
     let log = temp.join("setup.log");
+    let _cleanup = RegistryCleanup(temp.clone());
     let first = release(root.path(), "1.0.0", 1);
     assert_eq!(
         setup(Path::new(SETUP), &first, &install_dir, &log, &[]).code,

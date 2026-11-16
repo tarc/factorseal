@@ -8,7 +8,9 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use factorseal_setup::engine::{self, InstallError, Options};
-use factorseal_setup::manifest::{ManifestError, Release};
+use factorseal_setup::manifest::{ManifestError, Place, Release};
+use factorseal_setup::registry::Registry;
+use factorseal_setup::steps::{self, Launch, Places, StepOptions};
 
 /// Exit codes of `--quiet`; the log says more.
 mod exit {
@@ -24,6 +26,7 @@ mod exit {
 const RELAUNCH_PREFIX: &str = "factorseal-setup-";
 
 #[derive(Debug, Parser)]
+#[allow(clippy::struct_excessive_bools)] // Command-line flags.
 #[command(
     name = "factorseal-setup",
     version,
@@ -56,9 +59,32 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     log: Option<PathBuf>,
 
+    /// Also put the shortcut in this optional place (repeat for more). A
+    /// place the previous install had a shortcut in is kept anyway.
+    #[arg(long = "optional-place", value_enum, value_name = "PLACE")]
+    optional_places: Vec<Place>,
+
+    /// Don't start FactorSeal at the end.
+    #[arg(long)]
+    no_start: bool,
+
     /// Set on the copy that continues from the temporary folder.
     #[arg(long, hide = true)]
     relaunched: bool,
+
+    /// For tests: write registry keys under this HKCU key instead.
+    #[arg(long, hide = true, value_name = "KEY")]
+    registry_root: Option<String>,
+
+    /// For tests: the working directory of shortcuts and of the launch,
+    /// instead of the user's profile.
+    #[arg(long, hide = true, value_name = "DIR")]
+    working_dir: Option<PathBuf>,
+
+    /// For tests: shortcut folders under this folder (start-menu,
+    /// start-menu\Startup, desktop) instead of the user's.
+    #[arg(long, hide = true, value_name = "DIR")]
+    shortcut_root: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -116,37 +142,144 @@ fn run(args: &Args, log: &mut Log) -> u8 {
             };
         }
     };
+    install(args, log, &release, &install_dir, setup_exe)
+}
+
+/// Install a verified release: the files, shortcuts and registry values
+/// (rolled back together on failure), then the Installed apps entry and
+/// the launch.
+fn install(
+    args: &Args,
+    log: &mut Log,
+    release: &Release,
+    install_dir: &Path,
+    setup_exe: PathBuf,
+) -> u8 {
+    let Some(places) = places(args.shortcut_root.as_deref()) else {
+        log.line("result: failed: cannot find the Start menu and Desktop folders");
+        return exit::INSTALL_FAILED;
+    };
     let options = Options {
-        install_dir: install_dir.clone(),
+        install_dir: install_dir.to_owned(),
         setup_exe,
         setup_version: env!("CARGO_PKG_VERSION").to_owned(),
         adopt: args.adopt,
-        shortcut_dirs: shortcut_dirs(),
+        shortcut_dirs: vec![places.start_menu.clone(), places.desktop.clone()],
     };
-    let committed = engine::install_files(&release, &options).and_then(engine::Pending::commit);
-    match committed {
-        Ok(left) => {
-            if let Some(old) = left {
-                log.line(&format!(
-                    "could not remove {} yet; the next run removes it",
-                    old.display()
-                ));
-            }
-            log.line(&format!(
-                "result: installed {} in {}",
-                release.manifest.version,
-                install_dir.display()
-            ));
-            exit::INSTALLED
-        }
+    let step_options = StepOptions {
+        places,
+        optional_places: args.optional_places.clone(),
+        launch: if args.no_start {
+            Launch::None
+        } else {
+            Launch::Quiet
+        },
+        working_dir: args
+            .working_dir
+            .as_deref()
+            .map_or_else(working_dir, absolute),
+    };
+    let registry = registry(args.registry_root.as_deref());
+    let mut pending = match engine::install_files(release, &options) {
+        Ok(pending) => pending,
         Err(error) => {
             log.line(&format!("result: failed: {error}"));
-            match error {
+            return match error {
                 InstallError::NeedsAdoption(_) => exit::NEEDS_ADOPTION,
                 _ => exit::INSTALL_FAILED,
+            };
+        }
+    };
+    let made = steps::make_shortcuts(release, &mut pending, &step_options)
+        .map_err(|error| format!("cannot make a shortcut: {error}"))
+        .and_then(|()| {
+            steps::write_registry(release, &mut pending, registry.as_ref())
+                .map_err(|error| format!("cannot write the registry: {error}"))
+        });
+    if let Err(error) = made {
+        let rolled_back = pending.rollback(registry.as_ref());
+        log.line(&format!(
+            "result: failed: {error}; {}",
+            match rolled_back {
+                Ok(()) => "the previous install is back".to_owned(),
+                Err(rollback) => format!("restoring the previous install failed too: {rollback}"),
             }
+        ));
+        return exit::INSTALL_FAILED;
+    }
+    match pending.commit(registry.as_ref()) {
+        Ok(Some(old)) => log.line(&format!(
+            "could not remove {} yet (a program runs from it); a later run removes it",
+            old.display()
+        )),
+        Ok(None) => {}
+        Err(error) => {
+            log.line(&format!("result: failed: {error}"));
+            return exit::INSTALL_FAILED;
         }
     }
+    // Installed from here on; what follows only warns.
+    if let Err(error) = steps::register_installed_app(release, install_dir, registry.as_ref()) {
+        log.line(&format!("could not register in Installed apps: {error}"));
+    }
+    match steps::start(release, install_dir, &step_options) {
+        Ok(true) => log.line("started FactorSeal"),
+        Ok(false) => {}
+        Err(error) => log.line(&format!("could not start FactorSeal: {error}")),
+    }
+    log.line(&format!(
+        "result: installed {} in {}",
+        release.manifest.version,
+        install_dir.display()
+    ));
+    exit::INSTALLED
+}
+
+/// The registry: the user's (or a test key) on Windows; elsewhere, where
+/// the installer only runs in tests, one in memory.
+fn registry(root: Option<&str>) -> Box<dyn Registry> {
+    #[cfg(windows)]
+    {
+        use factorseal_setup::registry::{Root, SystemRegistry};
+        Box::new(SystemRegistry {
+            root: root.map_or(Root::CurrentUser, |root| Root::Test(root.to_owned())),
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = root;
+        Box::new(factorseal_setup::registry::MemoryRegistry::default())
+    }
+}
+
+/// Where shortcuts go: the user's folders, or test folders under `root`.
+fn places(root: Option<&Path>) -> Option<Places> {
+    if let Some(root) = root {
+        let start_menu = root.join("start-menu");
+        return Some(Places {
+            startup: start_menu.join("Startup"),
+            start_menu,
+            desktop: root.join("desktop"),
+        });
+    }
+    let start_menu = directories::BaseDirs::new()?
+        .data_dir()
+        .join("Microsoft")
+        .join("Windows")
+        .join("Start Menu")
+        .join("Programs");
+    let desktop = directories::UserDirs::new()?.desktop_dir()?.to_owned();
+    Some(Places {
+        startup: start_menu.join("Startup"),
+        start_menu,
+        desktop,
+    })
+}
+
+/// The working directory of shortcuts and of the launch: the user's
+/// profile, never the install folder.
+fn working_dir() -> PathBuf {
+    directories::BaseDirs::new().map_or_else(std::env::temp_dir, |dirs| dirs.home_dir().to_owned())
 }
 
 /// Continue from a copy in the temporary folder, with the same options,
@@ -179,6 +312,23 @@ fn relaunch(
         .arg(&log.path);
     if args.adopt {
         command.arg("--adopt");
+    }
+    if args.no_start {
+        command.arg("--no-start");
+    }
+    for place in &args.optional_places {
+        if let Some(value) = clap::ValueEnum::to_possible_value(place) {
+            command.arg("--optional-place").arg(value.get_name());
+        }
+    }
+    if let Some(root) = &args.registry_root {
+        command.arg("--registry-root").arg(root);
+    }
+    if let Some(root) = &args.shortcut_root {
+        command.arg("--shortcut-root").arg(absolute(root));
+    }
+    if let Some(dir) = &args.working_dir {
+        command.arg("--working-dir").arg(absolute(dir));
     }
     match command.spawn() {
         Ok(_) => {
@@ -236,27 +386,6 @@ fn absolute(path: &Path) -> PathBuf {
 fn default_install_dir() -> Option<PathBuf> {
     directories::BaseDirs::new()
         .map(|dirs| dirs.data_local_dir().join("Programs").join("FactorSeal"))
-}
-
-/// The Start menu (Startup included, below it) and the Desktop, where a
-/// hand-made install's shortcuts are.
-fn shortcut_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Some(base) = directories::BaseDirs::new() {
-        dirs.push(
-            base.data_dir()
-                .join("Microsoft")
-                .join("Windows")
-                .join("Start Menu")
-                .join("Programs"),
-        );
-    }
-    if let Some(desktop) =
-        directories::UserDirs::new().and_then(|dirs| dirs.desktop_dir().map(Path::to_owned))
-    {
-        dirs.push(desktop);
-    }
-    dirs
 }
 
 /// Appends timestamped lines to the log, and to standard error.

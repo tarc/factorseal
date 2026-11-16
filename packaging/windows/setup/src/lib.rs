@@ -6,10 +6,16 @@
 //!
 //! - [`manifest`] reads and verifies a release;
 //! - [`engine`] stages it beside the install folder and swaps it in;
-//! - [`record`] is `install.json`, what updates and uninstall undo from.
+//! - [`record`] is `install.json`, what updates and uninstall undo from;
+//! - [`steps`] runs the `shortcut`, `registry` and `start` steps and
+//!   registers the install in Installed apps, through [`shortcut`] (shell
+//!   links written directly) and [`registry`].
 
 pub mod engine;
 pub mod manifest;
 pub mod record;
+pub mod registry;
+pub mod shortcut;
+pub mod steps;
 
 pub use manifest::{Manifest, ManifestError, Release, ReleaseFile, SCHEMA, SETUP_CAPABILITY, Step};

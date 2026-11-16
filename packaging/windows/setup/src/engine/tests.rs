@@ -4,6 +4,7 @@ use serde_json::json;
 
 use super::*;
 use crate::manifest::MANIFEST_FILE;
+use crate::registry::MemoryRegistry;
 
 const SETUP_V1: &[u8] = b"setup 0.1.0";
 const SETUP_V2: &[u8] = b"setup 0.2.0";
@@ -125,7 +126,7 @@ fn a_fresh_install_copies_the_release_the_installer_and_the_record() {
     let release = v1(&world.releases());
     let pending = install_files(&release, &world.options("0.1.0")).unwrap();
     assert_eq!(pending.install_dir(), world.install_dir());
-    assert_eq!(pending.commit().unwrap(), None);
+    assert_eq!(pending.commit(&MemoryRegistry::default()).unwrap(), None);
 
     assert_eq!(world.installed("factorseal.exe").unwrap(), b"cli 1");
     assert_eq!(world.installed("licenses/LICENSE.txt").unwrap(), b"license");
@@ -144,7 +145,7 @@ fn an_update_replaces_the_files_and_drops_what_the_new_release_lacks() {
     let world = World::new();
     install_files(&v1(&world.releases()), &world.options("0.1.0"))
         .unwrap()
-        .commit()
+        .commit(&MemoryRegistry::default())
         .unwrap();
     let mut record = world.record();
     record.distros = vec!["NixOS".to_owned()];
@@ -152,7 +153,7 @@ fn an_update_replaces_the_files_and_drops_what_the_new_release_lacks() {
 
     install_files(&v2(&world.releases()), &world.options("0.1.0"))
         .unwrap()
-        .commit()
+        .commit(&MemoryRegistry::default())
         .unwrap();
     assert_eq!(world.installed("factorseal.exe").unwrap(), b"cli 2");
     assert_eq!(
@@ -172,13 +173,13 @@ fn the_installed_installer_is_replaced_only_by_a_newer_one() {
     let world = World::new();
     install_files(&v1(&world.releases()), &world.options("0.2.0"))
         .unwrap()
-        .commit()
+        .commit(&MemoryRegistry::default())
         .unwrap();
     assert_eq!(world.installed(SETUP_EXE).unwrap(), SETUP_V2);
     // An older installer installs a release but keeps the newer copy.
     install_files(&v2(&world.releases()), &world.options("0.1.0"))
         .unwrap()
-        .commit()
+        .commit(&MemoryRegistry::default())
         .unwrap();
     assert_eq!(world.installed(SETUP_EXE).unwrap(), SETUP_V2);
     assert_eq!(world.record().setup_version, "0.2.0");
@@ -186,11 +187,11 @@ fn the_installed_installer_is_replaced_only_by_a_newer_one() {
     let world = World::new();
     install_files(&v1(&world.releases()), &world.options("0.1.0"))
         .unwrap()
-        .commit()
+        .commit(&MemoryRegistry::default())
         .unwrap();
     install_files(&v2(&world.releases()), &world.options("0.2.0"))
         .unwrap()
-        .commit()
+        .commit(&MemoryRegistry::default())
         .unwrap();
     assert_eq!(world.installed(SETUP_EXE).unwrap(), SETUP_V2);
     assert_eq!(world.record().setup_version, "0.2.0");
@@ -201,7 +202,7 @@ fn a_file_changed_after_verification_aborts_and_leaves_the_install() {
     let world = World::new();
     install_files(&v1(&world.releases()), &world.options("0.1.0"))
         .unwrap()
-        .commit()
+        .commit(&MemoryRegistry::default())
         .unwrap();
     let release = v2(&world.releases());
     // Between Release::open and the copy.
@@ -221,7 +222,7 @@ fn a_failed_swap_puts_the_old_install_back() {
         let world = World::new();
         install_files(&v1(&world.releases()), &world.options("0.1.0"))
             .unwrap()
-            .commit()
+            .commit(&MemoryRegistry::default())
             .unwrap();
         let calls = Cell::new(0);
         let rename = |from: &Path, to: &Path| {
@@ -247,11 +248,11 @@ fn a_rollback_restores_the_previous_install() {
     let world = World::new();
     install_files(&v1(&world.releases()), &world.options("0.1.0"))
         .unwrap()
-        .commit()
+        .commit(&MemoryRegistry::default())
         .unwrap();
     let pending = install_files(&v2(&world.releases()), &world.options("0.1.0")).unwrap();
     assert_eq!(world.installed("factorseal.exe").unwrap(), b"cli 2");
-    pending.rollback().unwrap();
+    pending.rollback(&MemoryRegistry::default()).unwrap();
     assert_eq!(world.installed("factorseal.exe").unwrap(), b"cli 1");
     assert_eq!(world.record().version, "1.0.0");
     world.assert_no_leftovers();
@@ -260,7 +261,7 @@ fn a_rollback_restores_the_previous_install() {
     let world = World::new();
     install_files(&v1(&world.releases()), &world.options("0.1.0"))
         .unwrap()
-        .rollback()
+        .rollback(&MemoryRegistry::default())
         .unwrap();
     assert!(!world.install_dir().exists());
 }
@@ -270,7 +271,7 @@ fn an_interrupted_run_is_recovered() {
     let world = World::new();
     install_files(&v1(&world.releases()), &world.options("0.1.0"))
         .unwrap()
-        .commit()
+        .commit(&MemoryRegistry::default())
         .unwrap();
     let (staging, old) = siblings(&world.install_dir());
     // Stopped between the renames: the install folder is aside.
@@ -296,7 +297,7 @@ fn an_update_whose_release_drops_a_shortcut_still_removes_the_old_one() {
         std::fs::write(shortcut, b"lnk").unwrap();
         pending.made_shortcut(shortcut.clone());
     }
-    pending.commit().unwrap();
+    pending.commit(&MemoryRegistry::default()).unwrap();
     assert_eq!(world.record().shortcuts, [kept.clone(), dropped.clone()]);
 
     // The new release makes only one of them again.
@@ -305,14 +306,14 @@ fn an_update_whose_release_drops_a_shortcut_still_removes_the_old_one() {
     assert!(dropped.exists());
     assert_eq!(pending.record().shortcuts.len(), 2);
     pending.made_shortcut(kept.clone());
-    pending.commit().unwrap();
+    pending.commit(&MemoryRegistry::default()).unwrap();
     assert!(kept.exists());
     assert!(!dropped.exists());
     assert_eq!(world.record().shortcuts, std::slice::from_ref(&kept));
 
     // A rolled-back update touches no shortcut.
     let pending = install_files(&v1(&world.releases()), &world.options("0.1.0")).unwrap();
-    pending.rollback().unwrap();
+    pending.rollback(&MemoryRegistry::default()).unwrap();
     assert!(kept.exists());
 }
 
@@ -360,7 +361,7 @@ fn a_hand_made_install_needs_consent_and_its_shortcuts_are_adopted() {
     let mut expected = vec![start.clone(), startup.clone(), ascii.clone()];
     expected.sort();
     assert_eq!(adopted, expected);
-    pending.commit().unwrap();
+    pending.commit(&MemoryRegistry::default()).unwrap();
     // Not made again by this release (it has no shortcut step), so gone;
     // the unrelated one stays, and so does nothing of the hand-made folder.
     assert!(!start.exists() && !startup.exists() && !ascii.exists());
@@ -417,7 +418,7 @@ fn an_old_folder_that_cant_be_removed_is_moved_aside_and_removed_later() {
     let world = World::new();
     install_files(&v1(&world.releases()), &world.options("0.1.0"))
         .unwrap()
-        .commit()
+        .commit(&MemoryRegistry::default())
         .unwrap();
     let pending = install_files(&v2(&world.releases()), &world.options("0.1.0")).unwrap();
     // Its contents can't be removed, as a running program's file on Windows.
@@ -425,7 +426,7 @@ fn an_old_folder_that_cant_be_removed_is_moved_aside_and_removed_later() {
     let locked = old.join("licenses");
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
     let left = pending
-        .commit()
+        .commit(&MemoryRegistry::default())
         .unwrap()
         .expect("the old folder was removed");
     assert!(left.starts_with(world.install_dir().parent().unwrap()));
@@ -444,7 +445,7 @@ fn an_old_folder_that_cant_be_removed_is_moved_aside_and_removed_later() {
     .unwrap();
     install_files(&v1(&world.releases()), &world.options("0.1.0"))
         .unwrap()
-        .commit()
+        .commit(&MemoryRegistry::default())
         .unwrap();
     assert_eq!(stuck_folders(&world), Vec::<PathBuf>::new());
     world.assert_no_leftovers();
@@ -459,7 +460,7 @@ fn a_working_directory_in_the_install_folder_stops_the_update_cleanly() {
     let world = World::new();
     install_files(&v1(&world.releases()), &world.options("0.1.0"))
         .unwrap()
-        .commit()
+        .commit(&MemoryRegistry::default())
         .unwrap();
     let mut child = std::process::Command::new("cmd.exe")
         .args(["/c", "ping", "-n", "30", "127.0.0.1"])
@@ -486,7 +487,7 @@ fn a_program_running_from_the_install_folder_only_delays_removing_the_old_one() 
     let world = World::new();
     install_files(&v1(&world.releases()), &world.options("0.1.0"))
         .unwrap()
-        .commit()
+        .commit(&MemoryRegistry::default())
         .unwrap();
     let system = std::env::var_os("SystemRoot").unwrap();
     let running = world.install_dir().join("running.exe");
@@ -501,8 +502,8 @@ fn a_program_running_from_the_install_folder_only_delays_removing_the_old_one() 
         .stdout(std::process::Stdio::null())
         .spawn()
         .unwrap();
-    let committed =
-        install_files(&v2(&world.releases()), &world.options("0.1.0")).and_then(Pending::commit);
+    let committed = install_files(&v2(&world.releases()), &world.options("0.1.0"))
+        .and_then(|pending| pending.commit(&MemoryRegistry::default()));
     let _ = child.kill();
     let _ = child.wait();
     let left = committed
@@ -514,7 +515,7 @@ fn a_program_running_from_the_install_folder_only_delays_removing_the_old_one() 
 
     install_files(&v1(&world.releases()), &world.options("0.1.0"))
         .unwrap()
-        .commit()
+        .commit(&MemoryRegistry::default())
         .unwrap();
     assert_eq!(stuck_folders(&world), Vec::<PathBuf>::new());
     world.assert_no_leftovers();

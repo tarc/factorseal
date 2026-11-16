@@ -57,6 +57,10 @@ const REGISTRY_PREFIXES: [&str; 5] = [
     r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\FactorSeal",
 ];
 
+/// The Installed apps entry.
+pub const UNINSTALL_KEY: &str =
+    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\FactorSeal";
+
 /// The folders `ask_to_delete` paths must lie in.
 const DELETABLE_ROOTS: [&str; 2] = [r"%APPDATA%\Factorseal", r"%LOCALAPPDATA%\Factorseal"];
 
@@ -146,7 +150,7 @@ pub struct Shortcut {
     pub startup_args: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum Place {
     StartMenu,

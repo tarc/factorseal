@@ -33,7 +33,10 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest as _, Sha256};
 
 use crate::manifest::{Release, SETUP_EXE, sha256_hex, to_hex};
-use crate::record::{DESKTOP_EXE, Existing, InstallRecord, RECORD_FORMAT, RecordedFile, is_newer};
+use crate::record::{
+    DESKTOP_EXE, Existing, InstallRecord, RECORD_FORMAT, RecordedFile, RecordedValue, is_newer,
+};
+use crate::registry::Registry;
 
 /// How far below a shortcut folder adoption looks for shortcuts.
 const SHORTCUT_DEPTH: usize = 2;
@@ -178,8 +181,12 @@ pub struct Pending {
     old: Option<PathBuf>,
     /// The shortcuts the previous record listed (or adoption found).
     old_shortcuts: Vec<PathBuf>,
-    /// Shortcuts this install made (step 5 of the plan adds them).
+    /// Shortcuts this install made.
     made_shortcuts: Vec<PathBuf>,
+    /// The registry values the previous record listed.
+    old_values: Vec<RecordedValue>,
+    /// Registry values this install wrote.
+    written_values: Vec<RecordedValue>,
     record: InstallRecord,
 }
 
@@ -199,11 +206,30 @@ impl Pending {
         self.made_shortcuts.push(path);
     }
 
+    /// Whether the previous install had a shortcut at `path`.
+    #[must_use]
+    pub fn had_shortcut(&self, path: &Path) -> bool {
+        self.old_shortcuts.iter().any(|old| old == path)
+    }
+
+    /// Record a registry value this install wrote, so the commit keeps it.
+    pub fn wrote_value(&mut self, value: RecordedValue) {
+        self.written_values.push(value);
+    }
+
     /// Finish: remove the old shortcuts this install didn't make again,
     /// record what is installed now, and remove the old folder. Returns
     /// where the old folder is if it couldn't be removed (a program still
     /// runs from it); a later run removes it.
-    pub fn commit(mut self) -> Result<Option<PathBuf>, InstallError> {
+    pub fn commit(mut self, registry: &dyn Registry) -> Result<Option<PathBuf>, InstallError> {
+        for value in &self.old_values {
+            if !self.written_values.contains(value) {
+                registry
+                    .delete_value(&value.key, &value.name)
+                    .map_err(io("remove a registry value under", Path::new(&value.key)))?;
+            }
+        }
+        self.record.registry.clone_from(&self.written_values);
         let made: HashSet<_> = self.made_shortcuts.iter().collect();
         for shortcut in &self.old_shortcuts {
             if made.contains(shortcut) {
@@ -233,9 +259,21 @@ impl Pending {
         }))
     }
 
-    /// Undo the swap: the previous install comes back as it was, shortcuts
-    /// included (none were touched).
-    pub fn rollback(self) -> Result<(), InstallError> {
+    /// Undo the swap: the previous install comes back as it was. Shortcuts
+    /// and registry values this install added go; the previous ones were
+    /// never removed (a shortcut made again at the same path stays, and
+    /// points at the same install folder).
+    pub fn rollback(self, registry: &dyn Registry) -> Result<(), InstallError> {
+        for shortcut in &self.made_shortcuts {
+            if !self.old_shortcuts.contains(shortcut) {
+                let _ = std::fs::remove_file(shortcut);
+            }
+        }
+        for value in &self.written_values {
+            if !self.old_values.contains(value) {
+                let _ = registry.delete_value(&value.key, &value.name);
+            }
+        }
         retrying(|| std::fs::remove_dir_all(&self.install_dir))
             .map_err(io("remove", &self.install_dir))?;
         if let Some(old) = &self.old {
@@ -342,6 +380,8 @@ fn install_files_with(
         old: set_aside,
         old_shortcuts,
         made_shortcuts: Vec::new(),
+        old_values: record.registry.clone(),
+        written_values: Vec::new(),
         record,
     })
 }
@@ -452,7 +492,7 @@ pub fn find_shortcuts(target: &Path, dirs: &[PathBuf]) -> Vec<PathBuf> {
 
 /// Whether `bytes` hold `path` (already lowercase) as UTF-16LE at either
 /// alignment, or as ASCII when it is ASCII.
-fn holds_path(bytes: &[u8], path: &str) -> bool {
+pub(crate) fn holds_path(bytes: &[u8], path: &str) -> bool {
     let wide: Vec<u16> = path.encode_utf16().collect();
     let lower = |unit: u16| match u8::try_from(unit) {
         Ok(byte) => u16::from(byte.to_ascii_lowercase()),
