@@ -36,6 +36,13 @@ pub const MANIFEST_FILE: &str = "factorseal-release.json";
 /// The product a manifest must describe.
 pub const PRODUCT: &str = "FactorSeal";
 
+/// The installer's own name in the install folder. A release never lists
+/// it: the installer copies itself there (step 4 of the plan).
+pub const SETUP_EXE: &str = "factorseal-setup.exe";
+
+/// The installer's record in the install folder; never a release file.
+pub const RECORD_FILE: &str = "install.json";
+
 /// Larger manifests are refused before parsing.
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 
@@ -287,6 +294,15 @@ impl Manifest {
             // case only.
             if !seen.insert(file.path.to_ascii_lowercase()) {
                 return Err(invalid(format!("{} is listed twice", file.path)));
+            }
+            if [SETUP_EXE, RECORD_FILE]
+                .iter()
+                .any(|own| file.path.eq_ignore_ascii_case(own))
+            {
+                return Err(invalid(format!(
+                    "{} is the installer's own file, not a release file",
+                    file.path
+                )));
             }
         }
         Ok(())
@@ -582,15 +598,18 @@ pub fn sha256_hex(mut reader: impl std::io::Read) -> std::io::Result<(String, u6
         hasher.update(&buffer[..read]);
         len += read as u64;
     }
-    let digest = hasher.finalize();
-    let hex = digest
+    Ok((to_hex(&hasher.finalize()), len))
+}
+
+/// Bytes as lowercase hex.
+pub(crate) fn to_hex(bytes: &[u8]) -> String {
+    bytes
         .iter()
-        .fold(String::with_capacity(64), |mut hex, byte| {
+        .fold(String::with_capacity(bytes.len() * 2), |mut hex, byte| {
             use std::fmt::Write as _;
             let _ = write!(hex, "{byte:02x}");
             hex
-        });
-    Ok((hex, len))
+        })
 }
 
 fn verify_file(dir: &Path, entry: &FileEntry) -> Result<ReleaseFile, ManifestError> {

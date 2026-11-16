@@ -255,6 +255,12 @@ fn files_are_listed_once_with_a_hash() {
     let mut none = manifest();
     none["files"] = json!([]);
     assert!(refusal(&none).contains("no files"));
+
+    for own in ["factorseal-setup.exe", "Install.json"] {
+        let mut bad = manifest();
+        bad["files"][2]["path"] = json!(own);
+        assert!(refusal(&bad).contains("installer's own"), "{own}");
+    }
 }
 
 #[test]

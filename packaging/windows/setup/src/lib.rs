@@ -4,9 +4,12 @@
 //! `factorseal-release.json` that lists them with their hashes and the
 //! install steps, from the installer's fixed vocabulary.
 //!
-//! This crate so far reads and verifies that manifest ([`manifest`]),
-//! which is plain Rust and tested on every platform.
+//! - [`manifest`] reads and verifies a release;
+//! - [`engine`] stages it beside the install folder and swaps it in;
+//! - [`record`] is `install.json`, what updates and uninstall undo from.
 
+pub mod engine;
 pub mod manifest;
+pub mod record;
 
 pub use manifest::{Manifest, ManifestError, Release, ReleaseFile, SCHEMA, SETUP_CAPABILITY, Step};
