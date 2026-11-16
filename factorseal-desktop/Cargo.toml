@@ -11,6 +11,12 @@ publish = false
 [features]
 # macOS 26 integration under development; ordinary builds keep file transfer.
 apple-credential-exchange = []
+# Test builds only: Settings → WSL keyrings runs the program named by
+# FACTORSEAL_TEST_KEYRING_EXPORTER in WSL in place of `factorseal`, for the
+# live check against a throwaway gnome-keyring
+# (`scripts/windows-desktop-check/check.sh keyring-import`). Never in the
+# default features, the ZIP or an installer release.
+wsl-test-hooks = []
 
 [dependencies]
 anyhow = "1.0"

@@ -56,6 +56,23 @@
 #       Needs the Linux CLI (FACTORSEAL_LINUX_CLI, default
 #       target/debug/factorseal); builds libsecret from the flake's nixpkgs
 #       unless FACTORSEAL_SECRET_TOOL names a secret-tool.
+#   check.sh keyring --imported
+#       After `keyring-import`'s move: the same keyring host, and secret-tool
+#       finds two of the moved items, each asked in the popup and granted.
+#   check.sh keyring-import
+#       Live check of Settings, WSL keyrings (docs/plans/gnome-keyring-import.md,
+#       step 8) on the test vault. Seeds a throwaway gnome-keyring in
+#       /tmp/fsk-import (a password-protected login collection with three
+#       items tagged with this run, and a Wi-Fi item a move skips), writes an
+#       exporter there that runs the Linux CLI on a private D-Bus session
+#       where only that gnome-keyring and gcr's prompter can start (never the
+#       person's own bus or gnome-keyring), runs its inventory once through
+#       wsl.exe, and restarts the test Desktop with
+#       FACTORSEAL_TEST_KEYRING_EXPORTER naming it. Needs a Desktop built with
+#       `build-windows.sh --test-hooks`, the broker, and the Linux CLI. Then
+#       waits while the person runs Check and Move in the test Desktop (Move's
+#       gcr prompt asks for the throwaway password it prints), and ends with
+#       `keyring --imported`.
 #
 # --test-vault targets the throwaway vault in %LOCALAPPDATA%\FactorSeal-check
 # and the Desktop running on it instead of the default vault. Needs the native
@@ -65,8 +82,8 @@
 set -euo pipefail
 
 case ${1:-} in
-    popup | grant | test-desktop | write-once | secretspec-wsl | keyring) ;;
-    *) sed -n '2,64p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+    popup | grant | test-desktop | write-once | secretspec-wsl | keyring | keyring-import) ;;
+    *) sed -n '2,81p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
 
 repo=$(cd "$(dirname "$0")/../.." && pwd)
@@ -107,6 +124,7 @@ steal=no
 seal=no
 then=
 via=popup
+imported=no
 while [ $# -gt 0 ]; do
     case $1 in
         --key) key=$2; key_given=yes; shift 2 ;;
@@ -117,6 +135,7 @@ while [ $# -gt 0 ]; do
         --seal) seal=yes; shift ;;
         --then) then=$2; shift 2 ;;
         --via) via=$2; shift 2 ;;
+        --imported) imported=yes; shift ;;
         *) die "unknown option $1" ;;
     esac
 done
@@ -130,7 +149,12 @@ case $via in
     popup | cli) ;;
     *) die "--via takes popup or cli" ;;
 esac
-case $command in test-desktop | write-once | secretspec-wsl | keyring) test_vault=yes ;; esac
+case $command in test-desktop | write-once | secretspec-wsl | keyring | keyring-import) test_vault=yes ;; esac
+[ "$imported" = no ] || [ "$command" = keyring ] || die "--imported is for keyring"
+# keyring-import's throwaway gnome-keyring and exporter. Short: the
+# exporter's path is pasted into Desktop's script, and gnome-keyring's
+# control socket path must stay under the 108-byte socket limit.
+import_base=/tmp/fsk-import
 
 root_args=()
 [ "$test_vault" = yes ] && root_args=(--root "$test_root")
@@ -217,6 +241,178 @@ fi
 [ "$command" = write-once ] || [ -x "$broker" ] ||
     die "no broker at $broker; build it with: $here/build-windows.sh --broker"
 
+if [ "$command" = keyring-import ]; then
+    grep -qaF FACTORSEAL_TEST_KEYRING_EXPORTER "$desktop" ||
+        die "the Desktop at $desktop has no test hook; build it with: $here/build-windows.sh --broker --test-hooks"
+    linux_cli=${FACTORSEAL_LINUX_CLI:-$repo/target/debug/factorseal}
+    [ -x "$linux_cli" ] || die "no Linux CLI at $linux_cli; build it with: cargo build --all-features --bin factorseal"
+    linux_cli=$(readlink -f "$linux_cli")
+    rev=$(sed -n '/"nixpkgs": {/,/}/s/.*"rev": "\([0-9a-f]*\)".*/\1/p' "$repo/flake.lock" | head -1)
+    [ -n "$rev" ] || die "no nixpkgs revision in flake.lock"
+    # From the flake's own nixpkgs; --no-link leaves no GC root.
+    nixpkgs() {
+        nix build --no-link --print-out-paths --impure --expr \
+            "let p = (builtins.getFlake \"github:NixOS/nixpkgs/$rev\").legacyPackages.x86_64-linux; in $1" |
+            tail -1
+    }
+    gnome_keyring=$(nixpkgs p.gnome-keyring)/bin/gnome-keyring-daemon
+    libsecret=$(nixpkgs p.libsecret.out)
+    python=$(nixpkgs 'p.python3.withPackages (ps: [ ps.pygobject3 ])')/bin/python3
+    # gcr 3 still ships the prompter gnome-keyring asks for its password.
+    gcr=$(nixpkgs p.gcr_3)
+    dbus_run_session=$(command -v dbus-run-session) || die "no dbus-run-session"
+    for program in "$gnome_keyring" "$libsecret/bin/secret-tool" "$python" "$gcr/libexec/gcr-prompter"; do
+        [ -x "$program" ] || die "could not build $program"
+    done
+    password=keyring-import-password
+    run=$(date +%H%M%S)
+
+    rm -rf "$import_base"
+    mkdir -p "$import_base/services"
+    mkdir -m 700 "$import_base/run" "$import_base/data"
+    echo "$run" >"$import_base/run-id"
+
+    # 1. Seed, on a bus of its own: the password on stdin creates the login
+    # keyring and unlocks it. Three items tagged with this run, so the test
+    # vault lacks them whatever earlier runs moved, and a Wi-Fi item, which
+    # a move skips.
+    HOME=$import_base XDG_DATA_HOME=$import_base/data XDG_RUNTIME_DIR=$import_base/run \
+        GI_TYPELIB_PATH=$libsecret/lib/girepository-1.0 GNOME_KEYRING=$gnome_keyring \
+        SECRET_TOOL=$libsecret/bin/secret-tool PYTHON=$python PASSWORD=$password RUN=$run \
+        "$dbus_run_session" --config-file "$repo/tests/fixtures/dbus-session.conf" -- bash -c '
+set -euo pipefail
+printf "%s" "$PASSWORD" | "$GNOME_KEYRING" --unlock --components=secrets --daemonize >/dev/null
+for _ in $(seq 50); do
+    dbus-send --session --print-reply --dest=org.freedesktop.DBus / \
+        org.freedesktop.DBus.NameHasOwner string:org.freedesktop.secrets 2>/dev/null |
+        grep -q "boolean true" && break
+    sleep 0.1
+done
+printf "gho_import_check_%s" "$RUN" | "$SECRET_TOOL" store --label "GitHub CLI (import check)" \
+    service "import-check-$RUN" username octo
+printf "wifi-check-psk" | "$SECRET_TOOL" store --label "Wi-Fi (import check)" \
+    connection-uuid 1b4e28ba-2fa1-11d2-883f-0016d3cca427 setting-name 802-11-wireless-security setting-key psk
+"$PYTHON" -I - <<"PY"
+import os
+import gi
+gi.require_version("Secret", "1")
+from gi.repository import Secret
+run = os.environ["RUN"]
+schema = Secret.Schema.new("test.int", Secret.SchemaFlags.NONE, {
+    "port": Secret.SchemaAttributeType.INTEGER,
+    "host": Secret.SchemaAttributeType.STRING,
+})
+assert Secret.password_store_sync(schema, {"port": "8080", "host": f"import-{run}.example.org"},
+    Secret.COLLECTION_DEFAULT, "Port (import check)", f"port_import_check_{run}", None)
+# No schema at all, as go-keyring (gh) and python-keyring store items.
+service = Secret.Service.get_sync(Secret.ServiceFlags.LOAD_COLLECTIONS, None)
+collection = Secret.Collection.for_alias_sync(service, "default", Secret.CollectionFlags.NONE, None)
+Secret.Item.create_sync(collection, None, {"service": f"import-schemaless-{run}", "username": "octo"},
+    "Schema-less (import check)", Secret.Value.new(f"schemaless_import_check_{run}", -1, "text/plain"),
+    Secret.ItemCreateFlags.NONE, None)
+PY
+' || die "could not seed the throwaway gnome-keyring"
+    [ -s "$import_base/data/keyrings/login.keyring" ] || die "the throwaway gnome-keyring wrote no login keyring"
+    echo "seeded:        $import_base, run $run: 3 items and a Wi-Fi item"
+
+    # 2. The exporter: the Linux CLI on a private bus where gnome-keyring is
+    # only D-Bus-activatable, as on a distro WSL has just started. An
+    # activated service gets the bus daemon's environment, not this one, so
+    # its Exec names the throwaway directories; without them it would open
+    # the person's own ~/.local/share/keyrings. gcr's prompter keeps the
+    # environment wsl.exe gave the login shell, with WSLg's display.
+    cat >"$import_base/services/org.freedesktop.secrets.service" <<SERVICE
+[D-BUS Service]
+Name=org.freedesktop.secrets
+Exec=$(command -v env) HOME=$import_base XDG_DATA_HOME=$import_base/data XDG_RUNTIME_DIR=$import_base/run $gnome_keyring --start --foreground --components=secrets
+SERVICE
+    sed "s|</busconfig>|  <servicedir>$import_base/services</servicedir>\n  <servicedir>$gcr/share/dbus-1/services</servicedir>\n</busconfig>|" \
+        "$repo/tests/fixtures/dbus-session.conf" >"$import_base/bus.conf"
+    cat >"$import_base/exporter" <<EXPORTER
+#!/bin/sh
+# Written by check.sh keyring-import. Desktop's test hook runs this in place
+# of factorseal: the Linux CLI on a private D-Bus session where only the
+# throwaway gnome-keyring in $import_base and gcr's prompter can start.
+echo "start \$*" >>$import_base/exporter.log
+$dbus_run_session --config-file $import_base/bus.conf -- $linux_cli "\$@"
+code=\$?
+echo "exit \$code \$*" >>$import_base/exporter.log
+exit \$code
+EXPORTER
+    chmod +x "$import_base/exporter"
+
+    # 3. Its inventory once through wsl.exe, as Desktop runs it: the
+    # gnome-keyring starts locked, so labels are hidden and nothing prompts.
+    wsl.exe -d "$distro" --exec sh -lc "exec $import_base/exporter export-secret-service --inventory --wsl-distro \$1" \
+        sh "$distro" </dev/null >"$import_base/inventory.json" 2>"$import_base/inventory.err" ||
+        die "the exporter's inventory failed: $(tail -5 "$import_base/inventory.err")"
+    "$python" -I - "$import_base/inventory.json" <<'PY' || die "unexpected inventory: $(cat "$import_base/inventory.json")"
+import json, sys
+inventory = json.load(open(sys.argv[1]))
+items = inventory["items"]
+assert len(items) == 3, items
+assert all(item["locked"] and "label" not in item for item in items), items
+assert len(inventory["skipped"]) == 1, inventory["skipped"]
+assert inventory["locked_collections"] == ["login"], inventory
+PY
+    : >"$import_base/exporter.log"
+    echo "exporter:      inventory through wsl.exe: 3 items, locked; the Wi-Fi item skipped"
+
+    # 4. The test Desktop, started again with the exporter. Only the test
+    # Desktop: the person's own is never stopped.
+    pid=$(desktop_pid)
+    if [ -n "$pid" ]; then
+        echo "desktop:       restarting the test Desktop with the test exporter"
+        factorseal seal >/dev/null || true
+        taskkill.exe /F /PID "$pid" >/dev/null
+        for _ in $(seq 50); do
+            [ -z "$(desktop_pid)" ] && break
+            sleep 0.2
+        done
+    fi
+    # WSLENV's /w passes the variable from WSL to Windows only (/u is the
+    # other way). Without it, Desktop would run the distro's own factorseal
+    # against the person's gnome-keyring, so check that it gets through.
+    export FACTORSEAL_TEST_KEYRING_EXPORTER=$import_base/exporter
+    export WSLENV="${WSLENV:+${WSLENV%:}:}FACTORSEAL_TEST_KEYRING_EXPORTER/w"
+    passed=$(cd /mnt/c && cmd.exe /c 'echo %FACTORSEAL_TEST_KEYRING_EXPORTER%' </dev/null | tr -d '\r')
+    [ "$passed" = "$FACTORSEAL_TEST_KEYRING_EXPORTER" ] ||
+        die "FACTORSEAL_TEST_KEYRING_EXPORTER does not reach Windows programs (got $passed)"
+    "$0" test-desktop | sed 's/^/test-desktop:  /'
+    unset FACTORSEAL_TEST_KEYRING_EXPORTER
+
+    cat <<EOF
+
+In the test Desktop (its vault is $test_root), Settings, WSL keyrings, $distro:
+  1. Check gnome-keyring. Expected: 3 items, 3 not in FactorSeal, the Wi-Fi
+     item skipped, and moving asks for gnome-keyring's password.
+  2. Move 3 items. gnome-keyring's prompt (gcr, in WSLg) asks to unlock the
+     login keyring: type   $password
+     Expected: 3 added, the Wi-Fi item skipped.
+Waiting up to 30 minutes for the exporter to run both.
+
+EOF
+    # 5. Follow the exporter's log until an export succeeds.
+    shown=0
+    for _ in $(seq 1800); do
+        lines=$(wc -l <"$import_base/exporter.log")
+        if [ "$lines" -gt "$shown" ]; then
+            sed -n "$((shown + 1)),${lines}p" "$import_base/exporter.log" | sed 's/^/exporter:      /'
+            shown=$lines
+        fi
+        if grep -q '^exit 0 .*--passphrase-stdin' "$import_base/exporter.log"; then
+            grep -q '^exit 0 .*--inventory' "$import_base/exporter.log" ||
+                die "the export ran without a successful Check before it"
+            echo "moved:         the export succeeded; Desktop restores what it sent"
+            echo "next:          $0 keyring --imported"
+            echo "PASS"
+            exit 0
+        fi
+        sleep 1
+    done
+    die "no successful export within 30 minutes"
+fi
+
 if [ "$command" = keyring ] && [ -z "${FACTORSEAL_CHECK_PRIVATE_BUS:-}" ]; then
     # The worker grants WSL keyrings only to the broker beside its CLI, and
     # finds it when the vault unlocks. With the vault's root in wsl.json the
@@ -243,7 +439,9 @@ if [ "$command" = keyring ] && [ -z "${FACTORSEAL_CHECK_PRIVATE_BUS:-}" ]; then
     fi
     "$0" test-desktop | sed 's/^/test-desktop:  /'
     # Everything else runs on a D-Bus session of its own.
-    exec dbus-run-session -- env FACTORSEAL_CHECK_PRIVATE_BUS=1 "$0" keyring "$@"
+    keyring_args=()
+    [ "$imported" = yes ] && keyring_args=(--imported)
+    exec dbus-run-session -- env FACTORSEAL_CHECK_PRIVATE_BUS=1 "$0" keyring "${keyring_args[@]}"
 fi
 require_unsealed
 pipe="\\\\.\\pipe\\factorseal-$installation"
@@ -797,6 +995,30 @@ keyring)
         result=$(powershell drive.ps1 -Action grant -DesktopPid "$pid" -PasswordFile "$test_password" || true)
         grep -q '^popup_closed=True' <<<"$result" || die "the driver could not grant: $result"
     }
+
+    # After keyring-import's move: two of the moved items, each asked in
+    # the popup (they carry no grants) and found.
+    if [ "$imported" = yes ]; then
+        run=$(cat "$import_base/run-id" 2>/dev/null) ||
+            die "no keyring-import run in $import_base; run: $0 keyring-import"
+        for item in "import-check-$run gho_import_check_$run" \
+            "import-schemaless-$run schemaless_import_check_$run"; do
+            service=${item%% *}
+            expected=${item#* }
+            tool "$secret_tool" lookup service "$service" username octo >"$base/imported.out" &
+            looker=$!
+            id=$(pending_request)
+            [ -n "$id" ] || die "the lookup of $service did not reach the vault: $(cat "$base/imported.out") $(cat "$base/host.log")"
+            grant_popup
+            wait "$looker" || die "the lookup of $service failed: $(cat "$base/imported.out")"
+            [ "$(cat "$base/imported.out")" = "$expected" ] ||
+                die "the lookup of $service returned: $(cat "$base/imported.out")"
+            echo "imported:      $service asked ($id), granted, value matches"
+        done
+        rm -rf "$import_base"
+        echo "PASS"
+        exit 0
+    fi
 
     # 1. A store asks for this program and this item.
     printf '%s' wsl-keyring-value | tool "$secret_tool" store --label "WSL keyring check" \

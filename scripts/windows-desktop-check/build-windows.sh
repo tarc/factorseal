@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
 # Builds and checks FactorSeal natively on Windows, driven from WSL2.
 #
-#   build-windows.sh [release] [--broker]
+#   build-windows.sh [release] [--broker] [--test-hooks]
 #       Mirror this checkout to the Windows copy, then build release binaries
 #       there: Desktop, and the CLI with its helpers and SecretSpec provider.
-#       Refuses to start while Desktop or the CLI runs, since Windows locks
-#       their executables.
-#   build-windows.sh check [--broker]
+#       Refuses to start while a Desktop or CLI built in the copy runs, since
+#       Windows locks their executables; an installed one elsewhere can run.
+#   build-windows.sh check [--broker] [--test-hooks]
 #       Mirror, then run clippy, Desktop's tests and the WSL relay's tests
 #       natively. Leaves the release executables alone, so it can run while
 #       Desktop is open.
 #   --broker also cross-compiles the WSL broker on the WSL side.
+#   --test-hooks builds Desktop with the `wsl-test-hooks` feature (and, with
+#       check, also runs its tests with it), for `check.sh keyring-import`.
+#       Never for a Desktop anyone uses: such a Desktop runs any program
+#       FACTORSEAL_TEST_KEYRING_EXPORTER names in WSL and restores its output.
 #
 # Desktop cannot be cross-compiled (its renderer needs Windows' shader
 # compiler), so the Windows copy is built in place through interop. The copy
@@ -20,11 +24,13 @@ set -euo pipefail
 
 mode=release
 broker=no
+desktop_features=
 for argument in "$@"; do
     case $argument in
         release | check) mode=$argument ;;
         --broker) broker=yes ;;
-        *) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+        --test-hooks) desktop_features=' --features wsl-test-hooks' ;;
+        *) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
     esac
 done
 
@@ -49,10 +55,16 @@ windows() {
 }
 
 if [ "$mode" = release ]; then
+    # Only executables in the copy's target\ are locked against the build;
+    # an installed FactorSeal elsewhere can keep running. A process whose
+    # path is hidden (elevated, seen from here) counts as in the way.
     running=$(powershell.exe -NoProfile -Command \
-        "Get-Process factorseal, factorseal-desktop, factorseal-browser -ErrorAction SilentlyContinue | ForEach-Object { \"\$(\$_.Name) (pid \$(\$_.Id))\" }" |
+        "\$target = '$(wslpath -w "$windows_tree")\\target\\'
+        Get-Process factorseal, factorseal-desktop, factorseal-browser -ErrorAction SilentlyContinue |
+            Where-Object { -not \$_.Path -or \$_.Path.StartsWith(\$target, [StringComparison]::OrdinalIgnoreCase) } |
+            ForEach-Object { \"\$(\$_.Name) (pid \$(\$_.Id))\" }" |
         tr -d '\r' || true) # Get-Process exits 1 when nothing matches.
-    [ -z "$running" ] || die "quit FactorSeal first (tray icon, Quit); running: ${running//$'\n'/, }"
+    [ -z "$running" ] || die "quit the FactorSeal built here first (tray icon, Quit); running: ${running//$'\n'/, }"
 fi
 
 mkdir -p "$windows_tree"
@@ -73,7 +85,7 @@ set -e
 case $mode in
 release)
     echo "Building Desktop"
-    windows "cargo build --locked --release -p factorseal-desktop"
+    windows "cargo build --locked --release -p factorseal-desktop$desktop_features"
     echo "Building the CLI and its helpers"
     windows "cargo build --locked --release --no-default-features --features $cli_features --bin factorseal --bin factorseal-parser --bin factorseal-network --bin factorseal-browser"
     ;;
@@ -83,6 +95,7 @@ check)
     windows "cargo clippy --locked --no-default-features --features $cli_features --bins -- -D warnings"
     echo "Running Desktop's tests"
     windows "cargo test --locked -p factorseal-desktop"
+    [ -z "$desktop_features" ] || windows "cargo test --locked -p factorseal-desktop$desktop_features"
     # The broker's own view of a relayed request (Windows folder, the
     # broker's distro) is checked only where Windows paths are absolute.
     echo "Running the WSL relay's tests"

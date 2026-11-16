@@ -93,6 +93,49 @@ const INVENTORY_SCRIPT: &str =
 const EXPORT_SCRIPT: &str =
     "exec factorseal export-secret-service --framed --passphrase-stdin --wsl-distro $1";
 
+/// Test builds only: the environment variable naming the program run in
+/// WSL in place of `factorseal`, which `check.sh keyring-import` points at
+/// a throwaway gnome-keyring on a private bus. Without the feature,
+/// Desktop has no way to run another command in WSL and restore its
+/// output, and its executable doesn't contain this name.
+#[cfg(feature = "wsl-test-hooks")]
+const TEST_EXPORTER: &str = "FACTORSEAL_TEST_KEYRING_EXPORTER";
+
+/// `script` as it runs: in a test build that names an exporter, with that
+/// program in place of `factorseal`.
+#[cfg_attr(
+    not(feature = "wsl-test-hooks"),
+    allow(clippy::unnecessary_wraps) // Fails only in test builds.
+)]
+fn script(script: &'static str) -> Result<std::borrow::Cow<'static, str>, String> {
+    #[cfg(feature = "wsl-test-hooks")]
+    if let Some(program) = std::env::var_os(TEST_EXPORTER) {
+        return with_exporter(script, &program.to_string_lossy()).map(std::borrow::Cow::Owned);
+    }
+    Ok(std::borrow::Cow::Borrowed(script))
+}
+
+/// `script` with `program` in place of `factorseal`. The program is pasted
+/// into the script, so only an absolute path of characters `sh` takes as
+/// they are is accepted.
+#[cfg(feature = "wsl-test-hooks")]
+fn with_exporter(script: &str, program: &str) -> Result<String, String> {
+    let plain = program.starts_with('/')
+        && program
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"/._-".contains(&byte));
+    if !plain {
+        return Err(format!(
+            "{TEST_EXPORTER} must be an absolute path of letters, digits, '/', '.', '-' \
+             and '_', not {program:?}."
+        ));
+    }
+    let arguments = script
+        .strip_prefix("exec factorseal ")
+        .ok_or_else(|| format!("{script:?} does not run factorseal."))?;
+    Ok(format!("exec {program} {arguments}"))
+}
+
 /// The arguments of `wsl.exe`. `--exec` runs `sh` directly; with `--`, WSL
 /// would hand the line to the user's login shell, which expands it first.
 fn wsl_args(distro: &str, script: &str) -> Vec<String> {
@@ -342,14 +385,15 @@ fn run_failure(distro: &str, error: RunError, limit: Duration) -> String {
 fn record(
     wsl: &dyn Wsl,
     distro: &str,
-    script: &str,
+    script: &'static str,
     kind: &str,
     stdin: Option<&[u8]>,
     limit: Duration,
     cancel: &AtomicBool,
 ) -> Result<Record, String> {
+    let script = self::script(script)?;
     let output = wsl
-        .run(&wsl_args(distro, script), stdin, limit, cancel)
+        .run(&wsl_args(distro, &script), stdin, limit, cancel)
         .map_err(|error| run_failure(distro, error, limit))?;
     let Some((found, content)) = unframe(&output.stdout) else {
         return Err(failure(distro, &output));
@@ -1038,6 +1082,37 @@ mod tests {
         assert_eq!(check.skipped.len(), 1);
         assert_eq!(check.locked_collections, 3);
         assert_eq!(check.prompt_collections, 4, "the unlocked one may lock");
+    }
+
+    #[cfg(feature = "wsl-test-hooks")]
+    #[test]
+    fn a_test_exporter_runs_in_place_of_factorseal() {
+        let exporter = "/tmp/fsk-import/exporter";
+        assert_eq!(
+            with_exporter(INVENTORY_SCRIPT, exporter).unwrap(),
+            "exec /tmp/fsk-import/exporter export-secret-service --inventory --framed \
+             --wsl-distro $1"
+        );
+        assert_eq!(
+            with_exporter(EXPORT_SCRIPT, exporter).unwrap(),
+            "exec /tmp/fsk-import/exporter export-secret-service --framed --passphrase-stdin \
+             --wsl-distro $1"
+        );
+        for refused in [
+            "exporter",
+            "./exporter",
+            "/tmp/my exporter",
+            "/tmp/$(id)",
+            "/tmp/a;b",
+            "/tmp/'a'",
+            "/tmp/a\"b",
+            "",
+        ] {
+            assert!(
+                with_exporter(INVENTORY_SCRIPT, refused).is_err(),
+                "{refused:?} was accepted"
+            );
+        }
     }
 
     #[test]
