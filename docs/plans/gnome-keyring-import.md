@@ -7,7 +7,8 @@ fourth (after b927d1b); step 6 implemented (b3429f9, 6539cb5) and its
 review acted on (4cfeaa0..84ef1d7, see "Step 6 review"), then a review
 of those fixes (1b1ab6d..10439e5, "Step 6 fixes review") and a third
 round (ae8125f.., "Step 6 round 3 review"); steps 8 (the live check on
-Windows) and 9 (docs) done 2026-11-16, not reviewed yet. All reviews
+Windows) and 9 (docs) done 2026-11-16, not reviewed yet; the rollout
+on poita done 2026-11-16. All reviews
 are folded in (see "Review record" and "Implementation
 record" at the end). Branch: `feature/wsl2-keyring` (the WSL keyring this
 targets lives there). The Windows installer that hands off to it is planned
@@ -656,6 +657,14 @@ until the user has seen it in the native build.
 4. **system-flakes, second switch**: `services.factorseal` with `mode =
    "wsl"`, gnome-keyring off. Then switch NixOS on in Desktop; programs find
    their items, each asking once in the popup.
+
+Steps 2–4 done 2026-11-16 (input at 3a7c816): the installer adopted the
+hand-made install and ran `wsl-setup` in NixOS, Move put the 15 items into
+the vault, and the second switch was applied. The gnome-keyring daemon that
+was already running had to be stopped by hand before `factorseal
+wsl-keyring` could take the name, and the first lookups found a libsecret DH
+key bug, fixed in dc597ff and deployed. Details are in step 12 of
+[windows-installer.md](windows-installer.md).
 
 ## Notes and risks
 

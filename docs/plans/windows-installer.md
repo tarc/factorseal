@@ -1,9 +1,9 @@
 # Plan: a small Windows installer (`factorseal-setup.exe`)
 
-Status, 2026-11-16: steps 1–11 done (Desktop `--quit` and `--open`, the
+Status, 2026-11-16: all 12 steps done (Desktop `--quit` and `--open`, the
 manifest crate, the install engine, shortcuts, registry and start,
 stopping the installed version, the `wsl` step, uninstall, the release
-build, the dialogs, the docs); step 12, the rollout, remains;
+build, the dialogs, the docs, and the rollout on the user's machine);
 review folded in (see "Review record" at the end). Branch: `feature/wsl2-keyring`. It hands off to
 Desktop's gnome-keyring check and move, planned in
 [gnome-keyring-import.md](gnome-keyring-import.md).
@@ -957,6 +957,51 @@ in the native build.
     Later versions then go through "Update FactorSeal" with a new manifest.
     Update the `project_windows_install` notes: the uninstaller replaces
     `UNINSTALL.txt`.
+
+    As implemented (2026-11-16):
+    - Backups: an encrypted vault backup before anything else, and a second
+      one after the move (it holds the 15 moved items). The hand-made
+      install's folder was copied aside as well.
+    - The release was built with `dist` from 3541867
+      (`factorseal-0.1.0+g35418677af`). 3a7c816 then changed only the Nix
+      files: `nix/package.nix` and `nix/desktop-package.nix` list the
+      workspace members in their filesets, and `packaging/windows/setup`
+      was missing, so the NixOS build failed reading its `Cargo.toml`.
+    - Its installer, with the dialogs, adopted the hand-made install in
+      `%LOCALAPPDATA%\Programs\FactorSeal`. The old Desktop predates
+      `--quit`, so the run took the ask-to-quit fallback. The list of
+      processes holding the folder showed Desktop's vault worker (a child of
+      Desktop, gone with it) and a short-lived `cmd.exe` that had already
+      exited when the list was read. Quitting Desktop from the tray was
+      enough, and the installer went on by itself. The record lists NixOS
+      and the Start menu, Startup and desktop shortcuts.
+    - The WSL page ran `wsl-setup` in NixOS, which wrote
+      `~/.config/factorseal/wsl.json` with the installed folder's pipe.
+      Desktop then opened on WSL keyrings behind the unlock.
+    - Rollout on poita, the import plan's two switches: the first had installed
+      this branch's CLI (the factorseal input bumped to 3a7c816); Check found
+      the 15 gnome-keyring items, Move put them into the vault, and Check
+      again said all were in FactorSeal. The NixOS toggle was switched on.
+      The second switch set `services.factorseal = { enable = true; mode =
+      "wsl"; }` and turned gnome-keyring off. The gnome-keyring daemon that
+      D-Bus had activated earlier kept the name until it was stopped by hand
+      (`systemctl --user stop` on its `dbus-…org.freedesktop.secrets@…`
+      unit), after which `factorseal wsl-keyring` took
+      `org.freedesktop.secrets` by D-Bus activation.
+    - The first lookups found a bug: libsecret 0.21.8 sends its DH public
+      key as 129 bytes with a leading zero byte whenever the top bit is set
+      (about half of sessions), and `secret-service-protocol` refused keys
+      longer than 128 bytes (`secret-tool: invalid Secret Service DH public
+      key`). dc597ff drops leading zero bytes (a test, seen failing first),
+      and one more switch, with the input bumped, deployed it.
+    - Other lookups waited 30–60 s and failed with "FactorSeal unlock was
+      cancelled". That was not a bug: the vault had sealed itself while
+      idle, so the keyring reported it locked and waited for an unlock.
+    - Final check: after an unlock, the first `secret-tool lookup` raised
+      Desktop's popup, but libsecret gave up after its 25 s D-Bus timeout
+      while the password was being typed. The grant still applied ("Until
+      the vault seals"), and the next two lookups answered in about 0.25 s
+      without a popup.
 
 ## Order with the import plan
 
