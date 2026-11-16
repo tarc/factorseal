@@ -20,6 +20,14 @@ artifact is ready to release:
   executables, the WSL broker (`factorseal-wsl-broker.exe`, through which
   WSL2 distros reach the vault), the askpass helper, Scheduled Task
   installer, and one-command physical acceptance runner;
+- `build-windows-release.ps1` (run by
+  `scripts/windows-desktop-check/build-windows.sh dist`) writes a release for
+  the per-user installer `factorseal-setup.exe`: the same executables as the
+  ZIP, the stored installer, and a `factorseal-release.json` listing them with
+  their hashes and the install steps (`docs/plans/windows-installer.md`). Its
+  `factorseal.exe` is built with the `secretspec-provider` feature; the ZIP's
+  is not, as upstream ships it, so the two packages differ in that feature
+  only;
 - `build-windows-msix.ps1` creates the Desktop MSIX submitted to the
   Microsoft Store. Its Start menu entry opens Desktop, and its `factorseal.exe`
   execution alias opens the CLI. The Store package intentionally does not install
