@@ -1,6 +1,7 @@
 # Plan: a small Windows installer (`factorseal-setup.exe`)
 
-Status, 2026-11-16: steps 1 and 2 done (Desktop `--quit` and `--open`);
+Status, 2026-11-16: steps 1–3 done (Desktop `--quit` and `--open`, the
+manifest crate);
 review folded in (see "Review record" at the end). Branch: `feature/wsl2-keyring`. It hands off to
 Desktop's gnome-keyring check and move, planned in
 [gnome-keyring-import.md](gnome-keyring-import.md).
@@ -362,6 +363,45 @@ in the native build.
    Tests cover each refusal. One test pins that a manifest written for
    schema 1 with a new version and new files installs with an unchanged
    installer.
+
+   As implemented (2026-11-16; `packaging/windows/setup`, crate
+   `factorseal-setup`, a workspace member, so CI's clippy and tests run
+   it on Linux, macOS and Windows):
+   - `Manifest::parse` reads `requires_setup` (and `schema`) from the raw
+     JSON first, so a release for a newer installer is refused as "needs
+     a newer installer" even when it holds fields and steps this one
+     doesn't know; then a strict parse (`deny_unknown_fields` everywhere,
+     step types as an externally tagged enum, so an unknown step is
+     "unknown variant").
+   - The rules without a file system: product, a plain version (shown to
+     the user), relative `/`-separated file paths (no `..`, `.`, empty or
+     absolute parts, no `\`, no characters or device names Windows paths
+     can't hold, no trailing dot or space, which Windows drops), no path
+     listed twice ignoring case, lowercase hex hashes, `install_files`
+     first and once, `start` at most once and last, `wsl` at most once,
+     commands (`stop`, `start`, `quiet_command`), `also_stop` and shortcut
+     targets only listed `.exe` files, shortcut names without path
+     characters and places once, registry keys and `registry_cleanup`
+     compared by `\` segments ignoring case against the five prefixes (so
+     `dev.factorseal.browser.evil` and `..` are out), `ask_to_delete` under
+     `%APPDATA%\Factorseal` or `%LOCALAPPDATA%\Factorseal` and not the
+     vault root, an ancestor of it or a path inside it, no other `%`.
+   - `Release::open` canonicalizes the release folder (a linked release
+     folder is fine), then for each file refuses a link anywhere on its
+     path (`symlink_metadata` per part), a missing file or a folder, a
+     canonical path outside the folder, and a hash mismatch; every file is
+     hashed before it returns. `sha256_hex` is shared for step 4's hashing
+     while staging.
+   - Tests: 16 on Linux (the two link tests are Unix-only); natively 15,
+     with a Windows-only one where a junction (no privilege needed) for a
+     release folder is refused. Mutations, each failing its own test:
+     dropping the vault-ancestor check, matching registry keys as string
+     prefixes, skipping the link check, checking `requires_setup` after the
+     strict parse, skipping the hash comparison. The first native run
+     found that Windows refuses to open a folder as a file ("access
+     denied"), so the file type now comes from the walk's metadata before
+     opening. `build-windows.sh check` now runs the crate's clippy and
+     tests natively.
 4. **Install engine**: `install_files` with hashing while staging, staged
    verification, swap and rollback. Also the relaunch from `%TEMP%`, the
    self-copy into staging, adopting a hand-made install (shortcuts
