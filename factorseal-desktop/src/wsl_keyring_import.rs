@@ -285,6 +285,23 @@ fn failure(distro: &str, output: &RunOutput) -> String {
             "{distro} already uses FactorSeal's keyring, so there is no gnome-keyring to move from."
         );
     }
+    // The activatable Secret Service failed to start: whose it was can't
+    // be told, and FactorSeal's own fails until `wsl-setup` has run.
+    if let Some(detail) = after_on_line(&stderr, "the Secret Service could not be started: ") {
+        return format!(
+            "The Secret Service in {distro} did not start ({detail}). If {distro} is set up for FactorSeal's keyring, there is no gnome-keyring to move from."
+        );
+    }
+    // The export passed the frame limit the CLI and Desktop share.
+    if stderr.contains("more than FactorSeal Desktop reads") {
+        let size = after_on_line(&stderr, "the export is ")
+            .and_then(|rest| rest.split_once(" MiB"))
+            .map(|(size, _)| format!(" ({size} MiB)"))
+            .unwrap_or_default();
+        return format!(
+            "gnome-keyring in {distro} holds more than Desktop can move at once{size}. In {distro}, run factorseal export-secret-service with a file name, then restore that file in Back up vault, Restore backup."
+        );
+    }
     if stderr.contains("unrecognized subcommand") {
         return format!(
             "The factorseal in {distro} is too old to export its keyring. Update it, then check again."
@@ -302,6 +319,12 @@ fn failure(distro: &str, output: &RunOutput) -> String {
             lines.join(" ")
         )
     }
+}
+
+/// What follows `marker` on its line of `text`, trimmed.
+fn after_on_line<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
+    text.lines()
+        .find_map(|line| line.split_once(marker).map(|(_, rest)| rest.trim()))
 }
 
 fn run_failure(distro: &str, error: RunError, limit: Duration) -> String {
@@ -1196,6 +1219,35 @@ mod tests {
         assert_eq!(
             error,
             "NixOS already uses FactorSeal's keyring, so there is no gnome-keyring to move from."
+        );
+    }
+
+    /// A Secret Service that fails to start (the vault's own before
+    /// `wsl-setup`, say), and an export over Desktop's frame limit, each get
+    /// a row that says what happened and what to do.
+    #[test]
+    fn a_failed_start_and_an_oversized_export_get_their_own_rows() {
+        let row = |stderr: &str| {
+            let wsl = FakeWsl::new(vec![output("", stderr, 1)]);
+            check(
+                &wsl,
+                "NixOS",
+                || panic!("no vault call"),
+                &AtomicBool::new(false),
+            )
+            .unwrap_err()
+        };
+        assert_eq!(
+            row(
+                "factorseal: the Secret Service could not be started: org.freedesktop.DBus.Error.Spawn.ChildExited: Process org.freedesktop.secrets exited with status 1\n"
+            ),
+            "The Secret Service in NixOS did not start (org.freedesktop.DBus.Error.Spawn.ChildExited: Process org.freedesktop.secrets exited with status 1). If NixOS is set up for FactorSeal's keyring, there is no gnome-keyring to move from."
+        );
+        assert_eq!(
+            row(
+                "Secret Service: 400000 item(s) to import, 0 skipped\nfactorseal: vault transfer failed: the export is 600 MiB, more than FactorSeal Desktop reads (512 MiB); write it to a file instead with `factorseal export-secret-service FILE` and restore that file in FactorSeal\n"
+            ),
+            "gnome-keyring in NixOS holds more than Desktop can move at once (600 MiB). In NixOS, run factorseal export-secret-service with a file name, then restore that file in Back up vault, Restore backup."
         );
     }
 
