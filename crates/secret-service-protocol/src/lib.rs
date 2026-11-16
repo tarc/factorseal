@@ -127,6 +127,12 @@ impl Session {
     }
 
     fn open_dh(input: &[u8]) -> Result<(Self, SessionOutput), ProtocolError> {
+        // libsecret 0.21 sends a key whose top bit is set as 129 bytes, a
+        // zero byte first; leading zeros don't change the number.
+        let input = input
+            .iter()
+            .position(|byte| *byte != 0)
+            .map_or(&input[..0], |start| &input[start..]);
         if input.is_empty() || input.len() > DH_BYTES {
             return Err(ProtocolError::InvalidDhPublicKey);
         }
@@ -210,5 +216,26 @@ mod tests {
             Session::open(ALGORITHM_DH, &[2; DH_BYTES + 1]),
             Err(ProtocolError::InvalidDhPublicKey)
         ));
+        assert!(matches!(
+            Session::open(ALGORITHM_DH, &[0; DH_BYTES + 1]),
+            Err(ProtocolError::InvalidDhPublicKey)
+        ));
+    }
+
+    /// libsecret 0.21 sends a public key with its top bit set as 129
+    /// bytes, a zero byte first.
+    #[test]
+    fn dh_session_accepts_a_public_key_with_leading_zero_bytes() {
+        let mut client = vec![0_u8];
+        client.extend([0xC5; DH_BYTES - 1]);
+        client.push(0x03);
+        assert_eq!(client.len(), DH_BYTES + 1);
+        let (session, output) = Session::open(ALGORITHM_DH, &client).unwrap();
+        let SessionOutput::DhPublicKey(server) = output else {
+            panic!("no DH public key");
+        };
+        assert_eq!(server.len(), DH_BYTES);
+        let encrypted = session.encrypt(b"secret").unwrap();
+        assert_eq!(encrypted.parameters.len(), AES_BLOCK_BYTES);
     }
 }
