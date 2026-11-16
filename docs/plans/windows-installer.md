@@ -1,7 +1,7 @@
 # Plan: a small Windows installer (`factorseal-setup.exe`)
 
-Status, 2026-11-16: steps 1–4 done (Desktop `--quit` and `--open`, the
-manifest crate, the install engine);
+Status, 2026-11-16: steps 1–5 done (Desktop `--quit` and `--open`, the
+manifest crate, the install engine, shortcuts, registry and start);
 review folded in (see "Review record" at the end). Branch: `feature/wsl2-keyring`. It hands off to
 Desktop's gnome-keyring check and move, planned in
 [gnome-keyring-import.md](gnome-keyring-import.md).
@@ -485,6 +485,57 @@ in the native build.
 5. **Steps `shortcut`, `registry`, `start`**: the registry root is
    configurable so tests write under a test key, never the real Uninstall
    key. Native tests.
+
+   As implemented (2026-11-16; `steps.rs`, `shortcut.rs`, `registry.rs`):
+   - **Shortcuts are written directly** in the `.lnk` format
+     (MS-SHLLINK), so the installer needs no COM, no unsafe code and no
+     PowerShell (which antivirus watches in installers). A link carries an
+     item ID list in the simple form the shell makes ("This PC", the
+     drive, then each folder and the file named in UTF-16), LinkInfo with
+     the path in ANSI and UTF-16, and the description, working directory,
+     arguments (quoted as the C runtime splits them) and icon. Checked
+     natively with a probe link written from Linux: LinkInfo alone opens,
+     but WScript.Shell and Shell.Application read an empty target (as
+     Explorer's Properties would); with the ID list both read it, also
+     for a folder with non-ASCII characters. An environment-variable block
+     tried in between didn't help and was dropped. Targets longer than
+     `MAX_PATH` are refused.
+   - **Working directory**: shortcuts and the launch work in the user's
+     profile, never the install folder, since a process working there
+     stops the next update's swap (step 4).
+   - **Places**: the manifest's `places` always; an optional place when
+     chosen (`--optional-place` under `--quiet`) or when the previous
+     install had the shortcut there. The Startup shortcut gets
+     `startup_args`. Shortcuts are recorded in `Pending`, kept at the
+     commit, and a rollback removes the ones it added.
+   - **Registry** through `windows-registry` (already in the lock file,
+     Microsoft's safe API) behind a `Registry` trait, with a `Root` that
+     maps `HKCU\…` under a test key; an in-memory registry for tests
+     elsewhere. Values the `registry` step writes are recorded; the
+     commit removes old ones the release no longer writes, a rollback
+     the ones it added.
+   - **Installed apps** (Flows, step 6) after the commit: DisplayName,
+     DisplayVersion, Publisher, InstallLocation, UninstallString (the
+     installed setup with `--uninstall`, step 8), DisplayIcon, NoModify,
+     NoRepair, EstimatedSize. From the commit on, a failure there or in
+     the launch only warns.
+   - **`start`** last, after the commit: `quiet_command` under `--quiet`
+     (or `command` when there is none), nothing under `--no-start`; not
+     waited for.
+   - `--quiet` gains `--optional-place` and `--no-start`, and hidden test
+     options `--registry-root`, `--shortcut-root` and `--working-dir`;
+     the binary's tests pass all three, so they never touch the user's
+     shortcuts or keys (removed afterwards).
+   - Tests: 43 unit tests (6 for the steps, 5 for shortcuts); natively, a
+     quiet install whose Desktop is `cmd.exe`: the quiet launch ran in
+     the working folder, the registry values and Installed apps entry are
+     under the test key only, WScript.Shell reads the shortcuts' target,
+     arguments and working directory, and opening the Startup one through
+     ShellExecute runs it with its arguments. Mutations caught: ignoring
+     the previous install's places, Startup arguments on every shortcut,
+     the commit keeping old values, a rollback keeping new values or
+     shortcuts; natively, the missing ID list (the target assertion
+     failed before it was added).
 6. **Stopping**: the recorded command checked against its recorded hash,
    the process wait scoped to the install folder, `also_stop`, and the
    ask-to-quit fallback (no record, or no stop command). Live on a test
