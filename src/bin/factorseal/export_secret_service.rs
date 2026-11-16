@@ -153,15 +153,18 @@ fn write_frame_within(
     content: &[u8],
     limit: usize,
 ) -> std::io::Result<()> {
-    let encoded = Zeroizing::new(STANDARD.encode(content));
-    if encoded.len() > limit {
+    // Padded base64's length, known before encoding, so a refused export
+    // never allocates its encoding.
+    let encoded_len = content.len().div_ceil(3).saturating_mul(4);
+    if encoded_len > limit {
         return Err(std::io::Error::other(format!(
             "the {kind} is {} MiB, more than FactorSeal Desktop reads ({} MiB); \
              export to a file instead",
-            encoded.len().div_ceil(1024 * 1024),
+            encoded_len.div_ceil(1024 * 1024),
             limit / (1024 * 1024)
         )));
     }
+    let encoded = Zeroizing::new(STANDARD.encode(content));
     write!(
         stdout,
         "{FRAME_START} {kind} {}\n{}\n{FRAME_END}\n",
@@ -521,6 +524,19 @@ mod tests {
         assert!(stdout.is_empty(), "no partial frame");
         write_frame_within(&mut stdout, "export", &content, 5 * 1024 * 1024).unwrap();
         assert!(stdout.starts_with(FRAME_START.as_bytes()));
+    }
+
+    /// `write_frame` itself holds Desktop's limit. The input is zeroed,
+    /// lazily mapped memory, never touched: the size is refused before any
+    /// encoding.
+    #[test]
+    fn write_frame_holds_desktops_limit() {
+        let limit = factorseal::vault::MAX_KEYRING_FRAME_BYTES;
+        let content = vec![0_u8; limit / 4 * 3 + 1];
+        let mut stdout = Vec::new();
+        let error = write_frame(&mut stdout, "export", &content).unwrap_err();
+        assert!(error.to_string().contains("(512 MiB)"), "{error}");
+        assert!(stdout.is_empty(), "no partial frame");
     }
 
     #[test]
