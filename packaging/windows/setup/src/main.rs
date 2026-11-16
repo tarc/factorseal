@@ -919,6 +919,10 @@ struct Log {
 
 impl Log {
     fn open(path: &Path) -> Self {
+        // A log in a folder that doesn't exist yet would be lost.
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)

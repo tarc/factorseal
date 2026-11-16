@@ -346,6 +346,16 @@ fn quiet_installs_and_reports_through_exit_codes_and_the_log() {
     assert_eq!(run.code, Some(3), "{}", run.log);
     assert_eq!(installed_version(&install_dir).as_deref(), Some("1.0.0"));
 
+    // A log in a folder that doesn't exist yet is written all the same.
+    let elsewhere = root.path().join("logs").join("setup.log");
+    let run = setup(Path::new(SETUP), &broken, &install_dir, &elsewhere, &[]);
+    assert_eq!(run.code, Some(3));
+    assert!(
+        std::fs::read_to_string(&elsewhere).is_ok_and(|text| text.contains("result: refused")),
+        "no log at {}",
+        elsewhere.display()
+    );
+
     let missing = status(
         Command::new(SETUP)
             .args(["--quiet", "--log"])
