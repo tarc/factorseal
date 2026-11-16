@@ -1,8 +1,8 @@
 # Plan: a small Windows installer (`factorseal-setup.exe`)
 
-Status, 2026-11-16: steps 1–6 done (Desktop `--quit` and `--open`, the
+Status, 2026-11-16: steps 1–7 done (Desktop `--quit` and `--open`, the
 manifest crate, the install engine, shortcuts, registry and start,
-stopping the installed version);
+stopping the installed version, the `wsl` step);
 review folded in (see "Review record" at the end). Branch: `feature/wsl2-keyring`. It hands off to
 Desktop's gnome-keyring check and move, planned in
 [gnome-keyring-import.md](gnome-keyring-import.md).
@@ -180,10 +180,12 @@ version once it is the old one. `start` merges the former `start` and
   path.
 - **WSL commands are the installer's own, not the manifest's.** The `wsl`
   step only says that WSL setup is part of this release. The installer runs
-  fixed lines through `wsl.exe -d <distro> -- sh -lc …`:
+  fixed lines through `wsl.exe -d <distro> --exec sh -lc <line> sh <args>`
+  (step 7: `--exec` hands the arguments over one by one):
   - probe: `command -v factorseal`, and `. /etc/os-release; echo $ID` for
     the hint;
-  - setup: `exec factorseal wsl-setup`;
+  - setup: `exec factorseal wsl-setup --windows-install "$install"`, the
+    install folder arriving as `$1` and translated by `wslpath -u`;
   - removal: `exec factorseal wsl-setup --remove`.
 
   So a tampered manifest can't run arbitrary shell code in a distro. The
@@ -604,6 +606,74 @@ in the native build.
    removal lines, the `/etc/os-release` hint, consent. Tests with a fake
    runner. The real run is on the user's NixOS during rollout, with
    consent.
+
+   As implemented (2026-11-16; `wsl.rs`, wired into `--quiet`):
+   - **The lines** (`Line`): one probe run per distro prints whether
+     `factorseal` is on the login `PATH` and the os-release `ID`; setup is
+     `install=$(wslpath -u "$1") || exit 1; exec factorseal wsl-setup
+     --windows-install "$install"`; removal (for step 8) `exec factorseal
+     wsl-setup --remove`. The install folder is always passed: `wsl-setup`
+     otherwise assumes `%LOCALAPPDATA%\Programs\FactorSeal`, wrong for
+     `--install-dir` elsewhere. Each runs as `wsl.exe -d <distro> --exec
+     sh -lc <line> sh <args>` from the profile folder, `WSL_UTF8=1`,
+     120 s at most (killed after). The plan's `wsl.exe -- …` would join
+     the arguments into one line for the user's own shell; `--exec` hands
+     them over one by one, so the folder is never shell code. Distro
+     names are checked as the vault's protocol checks them.
+   - **Per distro**: the probe; without `factorseal`, the hint by `ID`
+     (`nixos`: add the package, rebuild, run the installer again, and turn
+     on `services.factorseal` only after moving gnome-keyring's items;
+     others: install FactorSeal in it), nothing else runs there; with it,
+     setup, whose output goes to the log. A failure in one distro is
+     reported and the others still run.
+   - **When**: after the commit and the Installed apps entry, before
+     `start` (which opens the WSL keyrings page). The distros set up are
+     added to `install.json` (once, ignoring case); the ones the record
+     already lists stay, so an update with `--no-wsl` keeps them for
+     uninstall. A distro not set up only warns: the install is kept, the
+     result line says how many distros weren't set up, exit 8.
+   - **Consent under `--quiet`**: `--wsl DISTRO` (repeatable) or
+     `--no-wsl`; a release with the `wsl` step refuses `--quiet` without
+     one, before anything is stopped (exit 2). Both are passed on to the
+     relaunched copy, and so is the hidden `--wsl-program` (a stand-in
+     for `wsl.exe`, for tests).
+   - **Left for step 10**: listing the distros (Desktop reads
+     `HKCU\…\Lxss`) belongs to the distro page; under `--quiet` the names
+     come from the command line, and an unknown one fails at its probe
+     with `wsl.exe`'s own message.
+   - Tests: 10 unit tests (3 with a fake WSL: probe then setup with the
+     folder as argument, the hint by `ID` and not by distro name, one
+     failing distro among others; on Unix 4 with the lines run by a real
+     `sh` through a stand-in `wsl.exe`, the folder with spaces, quotes and
+     `$(…)` reaching `wslpath` untouched, a hang killed at the timeout;
+     names, probe parsing, UTF-16 output), one for the record, and two
+     binary tests: the `--wsl`/`--no-wsl` rule, and (Unix) an install with
+     two distros through the stand-in, one without `factorseal`: exit 8,
+     only the other recorded, then an update recording it once. The
+     Windows relaunch test now carries a `wsl` step and `--no-wsl`, and
+     stops waiting on a refusal. 65 unit tests and 5 binary tests on
+     Linux; natively 61 (the Unix-only ones don't build there) and 6.
+     Mutations caught (12 on Linux): the folder unquoted in the setup
+     line, the probe's answer ignored, the hint ignoring `ID`, the folder
+     not passed, stopping at the first failing distro, no timeout, names
+     unchecked, distros not recorded or recorded twice, exit 8 never
+     given, no choice required, the step never running; natively, the
+     relaunch dropping `--no-wsl`.
+   - **The tests' race**: a test thread writing an executable while
+     another forks lets the child hold the file open for writing, and
+     running it then fails with `ETXTBSY` ("Text file busy"); with the
+     shell tests added, step 6's process test hit it about once in ten
+     runs. Tests that write an executable or start a process now hold one
+     lock (`exec_lock`); 20 runs in a row passed.
+   - Live, natively, read-only (an ignored test,
+     `FACTORSEAL_SETUP_WSL_DISTRO=NixOS`): the probe in the user's NixOS
+     found `factorseal` and `id=nixos` through `sh -lc`; a folder
+     `C:\Users\Jo Ann\O'Neil & Co\100%\$(x)\FactorSeal` reached `sh`
+     as one `$1` and `wslpath` turned it into the `/mnt/c/…` path; an
+     unknown distro made `wsl.exe` exit non-zero with its message, in
+     UTF-8, on stdout (the log takes stdout when stderr is empty).
+     `wsl-setup` itself was not run: NixOS has `factorseal`, so it would
+     have rewritten the user's `wsl.json`; that run is the rollout's.
 8. **Uninstall**: everything recorded is undone; self-deletion; the distro
    consent; the confinement of `registry_cleanup` and `ask_to_delete`; the
    vault untouched. Native tests under the test registry root and a
