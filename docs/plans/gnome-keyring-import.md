@@ -733,7 +733,7 @@ mutation, and the gate:
 | ae8125f | round 3 review R3-3: `write_frame` itself holds the limit, checked before encoding |
 | 9b0ff80 | R3-2: the CLI's refusal names the file export |
 | 36e67ec | R3-3: tests of the Windows runner's pipes and Desktop's frame cap |
-| (pending) | R3-1, R3-2: Desktop rows for a Secret Service that did not start and an export over the limit (uncommitted until the user's OK) |
+| 92e7648 | R3-1, R3-2: Desktop rows for a Secret Service that did not start and an export over the limit |
 
 `fuzz/Cargo.lock` gained only the `md-5` entry; it already failed
 `cargo metadata --locked` at 4ed2d2d (missing `embed-resource`), which is
@@ -1109,13 +1109,13 @@ relay's 14.
   `wsl-setup` (the CLI: "the Secret Service could not be started: …
   ChildExited"). Desktop now gives it its own row, with the D-Bus error,
   naming FactorSeal's keyring as a possible reason, since whose service
-  failed can't be told without reading service files (pending commit).
+  failed can't be told without reading service files (92e7648).
   Its test failed before.
 - **R3-2, low (ran/read): the size refusal read as an unreadable answer,
   came after Move's prompts, and named no command.** The CLI now names
   `factorseal export-secret-service FILE` and the restore (9b0ff80), and
   Desktop gives it its own row with the size, the command and where the
-  restore is (pending commit); the test failed before. The timing is
+  restore is (92e7648); the test failed before. The timing is
   kept: the size is known only once values are read, and an inventory
   of a locked keyring has no values, so Check can't warn ahead. The
   reviewer's `--file` doesn't exist; the file is a positional argument.
