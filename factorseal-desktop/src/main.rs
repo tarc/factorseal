@@ -145,6 +145,8 @@ const SECRET_SERVICE_NAME: &str = "org.freedesktop.secrets";
 const ACTIVATION_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Set to `0` to keep an instance off the system keyring.
 const SECRET_SERVICE_ENV: &str = "FACTORSEAL_DESKTOP_SECRET_SERVICE";
+/// How long `--quit` waits for the running Desktop to exit.
+const QUIT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Debug, Parser)]
 #[command(name = "factorseal-desktop", version, about = "FactorSeal Desktop")]
@@ -161,6 +163,17 @@ struct Args {
     /// Start in the tray without opening the main window.
     #[arg(long)]
     background: bool,
+
+    /// Open on this page: in the running Desktop of this vault if there is
+    /// one, else in the one starting. A sealed vault asks for the unlock
+    /// first.
+    #[arg(long, value_enum, value_name = "PAGE", conflicts_with_all = ["background", "keyring_activation"])]
+    open: Option<instance::Page>,
+
+    /// Ask the Desktop running on this vault to seal and quit, and wait
+    /// until it has exited (at most 30 seconds). Starts nothing.
+    #[arg(long, conflicts_with_all = ["background", "no_tray", "keyring_activation", "open"])]
+    quit: bool,
 
     #[arg(long, hide = true, conflicts_with_all = ["background", "keyring_activation"])]
     no_tray: bool,
@@ -184,6 +197,14 @@ struct Args {
     /// switched on in Settings; repeat for more. For development instances.
     #[arg(long = "wsl-keyring", value_name = "DISTRO", hide = true)]
     wsl_keyrings: Vec<String>,
+}
+
+impl Args {
+    /// What this launch asks a running Desktop: a visible launch asks it to
+    /// come forward, on `--open`'s page.
+    fn request(&self) -> Option<instance::Request> {
+        (!self.background && !self.keyring_activation).then_some(instance::Request::Open(self.open))
+    }
 }
 
 /// The WSL keyrings this instance grants: those named on the command line,
@@ -221,6 +242,9 @@ fn main() {
         factorseal::diagnostics::finish(false);
         std::process::exit(1);
     });
+    if args.quit {
+        quit_running(&root);
+    }
     let saved = settings::path()
         .map_or_else(
             || Ok(settings::DesktopSettings::default()),
@@ -247,6 +271,7 @@ fn main() {
         && !args.no_secret_service
         && args.root.is_none()
         && std::env::var_os(SECRET_SERVICE_ENV).is_none_or(|value| value != "0");
+    let request = args.request();
     let config = runtime::RuntimeConfig {
         root,
         socket: args.socket,
@@ -254,12 +279,7 @@ fn main() {
         secret_service,
         wsl_keyrings: wsl_keyrings(args.wsl_keyrings, &saved),
     };
-    let instance = instance::acquire(&config.root, !args.background && !args.keyring_activation)
-        .unwrap_or_else(|error| {
-            eprintln!("factorseal-desktop: {error}");
-            factorseal::diagnostics::finish(false);
-            std::process::exit(1);
-        });
+    let instance = acquire_instance(&config.root, request);
     if matches!(instance, instance::Instance::Secondary) {
         #[cfg(target_os = "linux")]
         if args.keyring_activation
@@ -277,7 +297,7 @@ fn main() {
     }
     let instance::Instance::Primary {
         _lock: instance_lock,
-        activations,
+        requests,
     } = instance
     else {
         unreachable!("secondary Desktop instances return before application startup")
@@ -293,9 +313,12 @@ fn main() {
     desktop_application().run(move |cx| {
         app::setup(
             config,
-            args.background || args.keyring_activation,
-            args.no_tray,
-            activations,
+            app::Launch {
+                background: args.background || args.keyring_activation,
+                no_tray: args.no_tray,
+                open: args.open,
+            },
+            requests,
             access_requests,
             secret_service_host,
             cx,
@@ -303,6 +326,36 @@ fn main() {
     });
     drop(instance_lock);
     factorseal::diagnostics::finish(true);
+}
+
+/// Become the vault's Desktop, or hand `request` to the one running.
+fn acquire_instance(
+    root: &std::path::Path,
+    request: Option<instance::Request>,
+) -> instance::Instance {
+    instance::acquire(root, request).unwrap_or_else(|error| {
+        eprintln!("factorseal-desktop: {error}");
+        factorseal::diagnostics::finish(false);
+        std::process::exit(1);
+    })
+}
+
+/// `--quit`: ask the Desktop running on `root` to seal and quit, wait for
+/// it, and exit 0 once none runs (also when none did), 1 otherwise.
+fn quit_running(root: &std::path::Path) -> ! {
+    let code = match instance::request_quit(root, QUIT_WAIT) {
+        Ok(instance::Quit::Quit) => 0,
+        Ok(instance::Quit::NotRunning) => {
+            eprintln!("factorseal-desktop: no Desktop is running on this vault");
+            0
+        }
+        Err(error) => {
+            eprintln!("factorseal-desktop: {error}");
+            1
+        }
+    };
+    factorseal::diagnostics::finish(code == 0);
+    std::process::exit(code);
 }
 
 fn desktop_application() -> gpui::Application {
@@ -451,6 +504,28 @@ mod tests {
 
         let help = Args::command().render_long_help().to_string();
         assert!(!help.contains("keyring-activation"));
+    }
+
+    #[test]
+    fn quit_and_open_are_launches_of_their_own() {
+        let open = Args::try_parse_from(["factorseal-desktop", "--open", "wsl-keyrings"]).unwrap();
+        assert_eq!(open.open, Some(super::instance::Page::WslKeyrings));
+        assert!(
+            Args::try_parse_from(["factorseal-desktop", "--quit"])
+                .unwrap()
+                .quit
+        );
+        for arguments in [
+            &["--quit", "--background"][..],
+            &["--quit", "--open", "wsl-keyrings"],
+            &["--quit", "--keyring-activation"],
+            &["--open", "wsl-keyrings", "--background"],
+            &["--open", "passwords"],
+        ] {
+            let mut line = vec!["factorseal-desktop"];
+            line.extend_from_slice(arguments);
+            assert!(Args::try_parse_from(line).is_err(), "{arguments:?}");
+        }
     }
 
     #[test]

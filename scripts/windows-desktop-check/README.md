@@ -97,8 +97,11 @@ covers it, and it releases it afterwards.
   so `check.sh` checks before sending (and again after `--delay`); unlock and
   rerun when it says the vault is sealed.
 - **Desktop locks its executables.** Quit the one built in the Windows copy
-  (the test Desktop too) from the tray before `build-windows.sh release`; an
-  installed Desktop elsewhere can stay open.
+  (the test Desktop too) before `build-windows.sh release`, from the tray or
+  with `factorseal-desktop.exe --quit` (add `--root` for the test vault's);
+  an installed Desktop elsewhere can stay open. `--quit` seals and quits as
+  the tray's Quit does and returns once Desktop has exited; Desktops built
+  before it reject the option.
 - **Windows blocks UI Automation from a normal process into an elevated
   one.** Desktop no longer needs elevation, but if it is started elevated,
   `uia-dump.ps1` and `drive.ps1` from WSL see only window frames.

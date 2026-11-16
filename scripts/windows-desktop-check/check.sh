@@ -193,6 +193,21 @@ desktop_command_line() {
         (Get-CimInstance Win32_Process -Filter \"ProcessId=$1\").CommandLine" </dev/null | tr -d '\r'
 }
 
+# Quit the test Desktop as its tray's Quit does (seal, then exit). A
+# Desktop built before --quit only comes forward when asked, so it is
+# sealed and killed instead.
+stop_test_desktop() {
+    if ! "$desktop" --root "$test_root" --quit </dev/null >/dev/null 2>&1 || [ -n "$(desktop_pid)" ]; then
+        factorseal seal >/dev/null || true
+        taskkill.exe /F /PID "$1" >/dev/null 2>&1 || true
+    fi
+    for _ in $(seq 50); do
+        [ -z "$(desktop_pid)" ] && break
+        sleep 0.2
+    done
+    [ -z "$(desktop_pid)" ] || die "the test Desktop did not stop"
+}
+
 if [ "$command" = test-desktop ]; then
     powershell test-vault.ps1 -Cli "$(wslpath -w "$cli")" | sed 's/^/test vault:    /'
     pid=$(desktop_pid)
@@ -363,12 +378,7 @@ PY
     pid=$(desktop_pid)
     if [ -n "$pid" ]; then
         echo "desktop:       restarting the test Desktop with the test exporter"
-        factorseal seal >/dev/null || true
-        taskkill.exe /F /PID "$pid" >/dev/null
-        for _ in $(seq 50); do
-            [ -z "$(desktop_pid)" ] && break
-            sleep 0.2
-        done
+        stop_test_desktop "$pid"
     fi
     # WSLENV's /w passes the variable from WSL to Windows only (/u is the
     # other way). Without it, Desktop would run the distro's own factorseal
@@ -422,12 +432,7 @@ if [ "$command" = keyring ] && [ -z "${FACTORSEAL_CHECK_PRIVATE_BUS:-}" ]; then
     pid=$(desktop_pid)
     if [ -n "$pid" ] && ! desktop_command_line "$pid" | grep -qF -- "--wsl-keyring $distro"; then
         echo "desktop:       restarting the test Desktop with --wsl-keyring $distro"
-        factorseal seal >/dev/null || true
-        taskkill.exe /F /PID "$pid" >/dev/null
-        for _ in $(seq 50); do
-            [ -z "$(desktop_pid)" ] && break
-            sleep 0.2
-        done
+        stop_test_desktop "$pid"
     fi
     # Unlocked after the broker is in place, so the worker grants it.
     if [ -n "$pid" ] && [ "$(desktop_pid)" = "$pid" ] && [ "$(state)" = unsealed ]; then

@@ -96,6 +96,35 @@ impl DesktopView {
         }
     }
 
+    /// Open `page`, as `--open` asks. A sealed vault shows the unlock
+    /// first; the page opens once it is unsealed.
+    pub(super) fn open_page(&mut self, page: crate::instance::Page, cx: &mut Context<Self>) {
+        if self.is_unsealed() {
+            self.show_page(page, cx);
+        } else {
+            self.pending_page = Some(page);
+            self.settings_open = false;
+            cx.notify();
+        }
+    }
+
+    /// The page `--open` asked for while the vault was sealed, now that it
+    /// is unsealed.
+    pub(super) fn show_pending_page(&mut self, cx: &mut Context<Self>) {
+        if let Some(page) = self.pending_page.take() {
+            self.show_page(page, cx);
+        }
+    }
+
+    fn show_page(&mut self, page: crate::instance::Page, cx: &mut Context<Self>) {
+        match page {
+            crate::instance::Page::WslKeyrings => {
+                self.open_settings(cx);
+                self.open_section(SectionRow::Settings(Section::WslKeyrings), cx);
+            }
+        }
+    }
+
     pub(super) fn open_section(&mut self, row: SectionRow, cx: &mut Context<Self>) {
         match row {
             SectionRow::Settings(section) => {

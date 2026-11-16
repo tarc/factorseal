@@ -1545,6 +1545,8 @@ struct DesktopView {
     pairing_focus: gpui::FocusHandle,
     selected_device: usize,
     section_opened: bool,
+    /// The page `--open` asked for while the vault was sealed.
+    pending_page: Option<crate::instance::Page>,
     devices_notice: Option<String>,
     device_name: gpui::Entity<InputState>,
     device_renaming: bool,
@@ -1941,6 +1943,7 @@ impl DesktopView {
             pairing_focus: cx.focus_handle(),
             selected_device: 0,
             section_opened: false,
+            pending_page: None,
             devices_notice: None,
             device_name,
             device_renaming: false,
@@ -2373,6 +2376,9 @@ impl DesktopView {
         self.refresh_website_icons(cx);
         if unsealed && !was_unsealed && self.selected_vault_item.is_none() {
             self.restore_page(cx);
+        }
+        if unsealed && !was_unsealed {
+            self.show_pending_page(cx);
         }
         if let Some(refreshed_item) = refreshed_item {
             match refreshed_item {
@@ -4592,6 +4598,22 @@ fn open_settings(_: &OpenSettings, cx: &mut App) {
     });
 }
 
+/// Bring Desktop forward on `page`, as `--open` asks.
+fn open_page(page: crate::instance::Page, cx: &mut App) {
+    cx.defer(move |cx| {
+        show_desktop(cx);
+        let view = cx
+            .global::<DesktopWindow>()
+            .view
+            .lock()
+            .ok()
+            .and_then(|view| view.clone());
+        if let Some(view) = view {
+            view.update(cx, |view, cx| view.open_page(page, cx));
+        }
+    });
+}
+
 fn close_desktop(_: &CloseDesktop, cx: &mut App) {
     cx.defer(hide_desktop);
 }
@@ -4941,15 +4963,29 @@ fn open_desktop_window(
     Ok(handle.into())
 }
 
+/// How this Desktop was launched.
+#[derive(Clone, Copy)]
+pub(crate) struct Launch {
+    /// In the tray, without opening the main window.
+    pub(crate) background: bool,
+    pub(crate) no_tray: bool,
+    /// The page `--open` asked for.
+    pub(crate) open: Option<crate::instance::Page>,
+}
+
 pub(crate) fn setup(
     config: RuntimeConfig,
-    background: bool,
-    no_tray: bool,
-    activations: smol::channel::Receiver<()>,
+    launch: Launch,
+    requests: smol::channel::Receiver<crate::instance::Request>,
     access_requests: smol::channel::Receiver<AccessEvent>,
     secret_service: Option<Arc<SecretServiceHost>>,
     cx: &mut App,
 ) {
+    let Launch {
+        background,
+        no_tray,
+        open,
+    } = launch;
     gpui_component::init(cx);
     theming::initialize(cx);
     crate::appearance::use_launch_lease(config.lease, cx);
@@ -5020,9 +5056,16 @@ pub(crate) fn setup(
         }
     });
     cx.set_global(EventTask { _task: task });
+    if let Some(page) = open {
+        open_page(page, cx);
+    }
     cx.spawn(async move |cx| {
-        while activations.recv().await.is_ok() {
-            cx.update(|cx| open_desktop(&OpenDesktop, cx));
+        while let Ok(request) = requests.recv().await {
+            cx.update(|cx| match request {
+                crate::instance::Request::Open(None) => open_desktop(&OpenDesktop, cx),
+                crate::instance::Request::Open(Some(page)) => open_page(page, cx),
+                crate::instance::Request::Quit => quit(&Quit, cx),
+            });
         }
     })
     .detach();
