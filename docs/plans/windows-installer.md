@@ -1,9 +1,9 @@
 # Plan: a small Windows installer (`factorseal-setup.exe`)
 
-Status, 2026-11-16: steps 1–9 done (Desktop `--quit` and `--open`, the
+Status, 2026-11-16: steps 1–10 done (Desktop `--quit` and `--open`, the
 manifest crate, the install engine, shortcuts, registry and start,
 stopping the installed version, the `wsl` step, uninstall, the release
-build);
+build, the dialogs);
 review folded in (see "Review record" at the end). Branch: `feature/wsl2-keyring`. It hands off to
 Desktop's gnome-keyring check and move, planned in
 [gnome-keyring-import.md](gnome-keyring-import.md).
@@ -836,6 +836,80 @@ in the native build.
 10. **Task dialog UI**: the four pages and the uninstall page. Then the
     user tries it natively (install into a test folder, update to a second
     build with the same installer, uninstall) before it is committed.
+
+    As implemented (2026-11-16; `src/dialog.rs`, `src/ui.rs`, `src/gui.rs`
+    in the binary, `build.rs` and `windows/`):
+    - **Pages as data** (`ui.rs`, tested on Linux): install or update
+      (heading by what is installed: install, update from version X,
+      reinstall, or taking over a hand-made install with what adoption
+      does; the optional shortcut places as toggles, except places the
+      installed version has, which are kept anyway and named), the WSL
+      distros (from `HKCU\…\Lxss`, listed by the new
+      `wsl::registered_distros`, step 7's leftover; those the record lists
+      on), progress, and done (by exit code: installed, installed but not
+      in every distro, not installed with the result line, and "Open
+      FactorSeal now", on); uninstall (what goes, the release's
+      `keep_note`, the recorded distros on, "Also delete FactorSeal's
+      settings" off with the folders as a note line, from the new
+      `uninstall::listed_folders`), progress, done (uninstalled with the
+      note, left in a distro, partly, or not). The details under "Show
+      details" are the run's log.
+    - **Every choice comes first**, the WSL distros included, then one
+      progress page: the plan's order (install, then the distro page) would
+      have stopped the work midway for a question. The choices become the
+      `--quiet` options (`optional_places`, `wsl`/`no_wsl`, `adopt` for a
+      hand-made install, `also_delete`, `no_start`) and the same
+      `install`/`uninstall` run on a worker thread; the log hands its lines
+      to the progress page, which polls on the dialog's timer. The launch
+      happens after the last page, when its toggle is on.
+    - **The dialog** (`dialog.rs`, the binary's one module allowed unsafe
+      code; `windows-sys` 0.61, already in the lock file): one window for
+      all pages, moving with `TDM_NAVIGATE_PAGE`. A toggle is a command link
+      without the arrow, `☐`/`☑` before its label, which flips and shows
+      the page again with the focus on it (a task dialog has one check box
+      only); the details' state survives that. Common buttons OK/Cancel
+      and Close, in Windows' language; Cancel is disabled while working.
+      300 dialog units wide, so install paths fit. `TaskDialogIndirect` is
+      looked up at run time in Common Controls 6: imported, it would keep
+      the test executables (no manifest) from starting.
+    - **Manifest and icon** (`windows/factorseal-setup.rc`, embedded by
+      `build.rs` with `embed-resource`, already in the lock file):
+      Common Controls 6, `asInvoker` (a program named setup is otherwise
+      guessed to want administrator rights), per-monitor DPI awareness, and
+      FactorSeal's icon.
+    - **A Windows program**: no console window opens beside the dialogs.
+      `--quiet` still reports through its exit code and log; PowerShell
+      waits for it only through `Start-Process -Wait -PassThru`, which the
+      help now says. Command-line errors and `--help` show in a dialog
+      unless `--quiet` was given.
+    - Without `--manifest`, the dialogs install the
+      `factorseal-release.json` beside the installer; none there gets a
+      page saying where to run it from (exit 2). The relaunch from the
+      install folder (Installed apps' `--uninstall`) passes `--quiet` only
+      when given, so the copy shows the dialogs. A dialog closed before
+      the work starts exits 10 (logged "result: cancelled").
+    - The quiet binary tests now hold an exec lock too: a test copying an
+      executable while another forked hit `ETXTBSY` (step 7's finding),
+      seen once in the first run with the dialogs.
+    - Tests: 5 for the pages (places kept or offered, the first page's
+      headings, the WSL page's defaults, the done page by exit code, the
+      uninstall pages), 1 for `listed_folders`; 75 unit, 5 bin and 7
+      binary tests on Linux, 15 runs in a row; natively 71 (+1 ignored),
+      5, 7 and 1. Mutations caught: kept places offered again, recorded
+      distros off, the result prefix kept, exit 8 shown as plain success,
+      the settings deleted by default, a partial uninstall called a
+      failure.
+    - Driven natively through UI Automation (`TDM_CLICK_BUTTON` for the
+      common buttons, which .NET's client sees as panes without an invoke
+      pattern) and screenshots, in a test folder with the test roots:
+      install with the desktop shortcut, update to a second release with
+      the same installer (the desktop shortcut kept, Startup added),
+      uninstall with the settings deleted, and the installed copy's
+      `--uninstall` run from its folder, whose relaunched copy showed the
+      dialogs and deleted itself; Cancel, the missing release and a
+      command-line error. Then the user did install, update and uninstall
+      in a trial folder and approved; the uninstall's details no longer
+      repeat the note shown above them.
 11. **Docs**:
     - `packaging/README.md`: the installer beside the ZIP and MSIX, the
       manifest, the provider feature difference, SmartScreen.
