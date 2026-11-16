@@ -6,8 +6,8 @@ those fixes (cbada0a..d03d54a), a third review (bf0e7e6..b927d1b) and a
 fourth (after b927d1b); step 6 implemented (b3429f9, 6539cb5) and its
 review acted on (4cfeaa0..84ef1d7, see "Step 6 review"), then a review
 of those fixes (1b1ab6d..10439e5, "Step 6 fixes review") and a third
-round (ae8125f.., "Step 6 round 3 review"); step 8 done 2026-11-16 (the
-live check on Windows); step 9 remains. All reviews
+round (ae8125f.., "Step 6 round 3 review"); steps 8 (the live check on
+Windows) and 9 (docs) done 2026-11-16, not reviewed yet. All reviews
 are folded in (see "Review record" and "Implementation
 record" at the end). Branch: `feature/wsl2-keyring` (the WSL keyring this
 targets lives there). The Windows installer that hands off to it is planned
@@ -621,6 +621,20 @@ until the user has seen it in the native build.
 
    Done right after step 8, before the installer work starts (see the
    installer plan's "Order with the import plan").
+
+   As done (2026-11-16): `usage.md` has "Moving gnome-keyring items into
+   FactorSeal" after the WSL keyring section (whose "not moved" sentence
+   now points to it): Desktop's check and move (install the package, not
+   the module, first), what a move leaves out, the CLI by hand with the
+   restore and deleting the archive, the native case (`--native`, required
+   outside WSL; FactorSeal's own service refused, Nix-wrapped Desktop
+   included), and the private-bus recipe for after gnome-keyring is off.
+   The recipe was run against a throwaway locked keyring on poita (a
+   fresh private bus there activates gcr's prompter and gnome-keyring;
+   the daemon is started explicitly so a FactorSeal activation file can't
+   answer instead). The restore rule, with the attribute-less rule and
+   F1, is under "Import and export"; `CHANGELOG.md` has both changes; the
+   design's decision 3 points here.
 
 ## Rollout on poita (with the user)
 

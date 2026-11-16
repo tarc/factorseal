@@ -4,6 +4,24 @@ All notable changes to FactorSeal will be documented in this file.
 
 ## Unreleased
 
+- Move gnome-keyring items into FactorSeal. `factorseal
+  export-secret-service` reads the Secret Service on the session bus and
+  writes an encrypted archive of keyring items for a WSL2 distro's keyring
+  in the Windows vault or for the native Linux keyring, restored like a
+  backup; `--inventory` lists what it would bring without unlocking or
+  reading secrets. On Windows, Desktop's Settings, WSL keyrings checks how
+  many of a distro's items the vault lacks and moves them, with
+  gnome-keyring's own unlock prompt. gnome-keyring keeps its items. Wi-Fi
+  passwords, items without attributes and values over 256 KiB are left out.
+
+- Restoring a backup now treats a keyring item with the same attributes as
+  one already in the vault as existing: it is kept, or with
+  `--replace-existing` replaced under the vault item's id. An archived item
+  whose id is taken by an item with other attributes is added under an id
+  derived from its own instead of being kept or overwriting it. Items
+  without attributes still match by id. Before, items matched by id only,
+  so a restore could add a second item answering the same lookup.
+
 - Write Desktop and mobile text in plain words and drop the tagline
   from the footer. The Desktop footer now has a labeled Report an
   issue button.

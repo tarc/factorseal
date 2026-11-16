@@ -208,12 +208,92 @@ items (a `gh` token, a git credential) are approved for the program wherever
 it runs.
 A program's `Lock` call does not seal the Windows
 vault. While the vault is sealed the keyring reports locked; unlocking brings
-Desktop forward. Items already in the distro's gnome-keyring are not moved:
-they stay in its files, and programs ask you to sign in again. To go back,
-switch the distro off, stop `factorseal wsl-keyring` (or set the NixOS mode
-back) and start gnome-keyring again. See
+Desktop forward. Items already in the distro's gnome-keyring are not moved
+by switching: move them first (see the next section), or programs ask you to
+sign in again. To go back, switch the distro off, stop `factorseal
+wsl-keyring` (or set the NixOS mode back) and start gnome-keyring again. See
 [WSL keyring](architecture.md#wsl-keyring) for what the vault can and cannot
 verify.
+
+### Moving gnome-keyring items into FactorSeal (experimental)
+
+Items that programs stored in gnome-keyring (a `gh` token, git credentials,
+an editor's, anything written through libsecret) can be moved into
+FactorSeal's keyring, so switching `org.freedesktop.secrets` to FactorSeal
+doesn't mean signing in to everything again. The move only reads
+gnome-keyring: its items stay in its files, as the fallback for switching
+back, and you can delete them in Seahorse later.
+
+**From Desktop on Windows, for a WSL2 distro.** Do it before the distro
+uses FactorSeal's keyring. Install the `factorseal` package in the distro,
+from the same release as Desktop, but don't enable the NixOS module yet:
+every mode of the module claims `org.freedesktop.secrets`, which
+gnome-keyring still needs. Then, with the vault unlocked, open Settings,
+WSL keyrings:
+
+1. **Check gnome-keyring** on the distro's row starts the distro and counts
+   the items a move would bring and how many the vault lacks, without
+   unlocking gnome-keyring. Labels show only if gnome-keyring is unlocked.
+2. **Move** asks gnome-keyring to unlock each locked collection with its
+   own password prompt (in WSLg), then copies the items into the distro's
+   keyring in the vault and reports how many were added, how many were
+   already there, and which were left out and why.
+
+Desktop runs `factorseal export-secret-service` in the distro through
+`wsl.exe` and receives an archive encrypted with a one-time passphrase over
+its pipe: no file is written and nothing is typed. Items already in the
+vault are kept as they are, so moving twice adds nothing. Then switch the
+distro to FactorSeal's keyring (see above). Moved items carry no approvals:
+each program asks once in the popup the first time it reads one.
+
+A move leaves out Wi-Fi passwords (NetworkManager's items; on a Linux
+desktop, use **Move existing Wi-Fi passwords**, see
+[NetworkManager](network-manager.md)), items without attributes (no program
+can look them up), and values over 256 KiB. Items with the same attributes
+in several collections move once, the most recently changed readable one. A
+locked check can't see values, so a move can leave out an item the check
+counted, for example as too large.
+
+**By hand**, in WSL or on a Linux desktop:
+
+```console
+$ factorseal export-secret-service --inventory
+$ factorseal export-secret-service /mnt/c/Users/me/Downloads/keyring.factorseal
+Archive passphrase:
+Confirm archive passphrase:
+```
+
+`--inventory` prints, as JSON, the items an export would bring and the ones
+it would leave out, with reasons; it reads no secrets and never unlocks. In
+WSL the archive is for this distro's keyring in the Windows vault; pass
+`--wsl-distro NAME` for another distro, or `--native` for the keyring of a
+Linux vault; outside WSL one of the two is required. Check the archive on Windows with `factorseal.exe import
+keyring.factorseal --dry-run`, restore it with Desktop's **Back up vault**
+(or `factorseal.exe import` without `--dry-run`), and delete it: under
+`/mnt/c` it is readable by your Windows programs (encrypted), and WSL ignores
+its `0600` mode there.
+
+On a Linux desktop, run `factorseal export-secret-service --native FILE`
+while gnome-keyring still owns `org.freedesktop.secrets`, then restore the
+archive in Desktop or with `factorseal import FILE`. The command refuses to
+read FactorSeal's own Secret Service, which it recognizes also when Nix
+wraps Desktop.
+
+**After gnome-keyring is off**, its files are still in
+`~/.local/share/keyrings`. Run it for one export on a private D-Bus session,
+with a runtime directory of its own:
+
+```console
+$ export XDG_RUNTIME_DIR=$(mktemp -d /tmp/keyring.XXXXXX)
+$ dbus-run-session -- sh -c 'gnome-keyring-daemon --daemonize --components=secrets >/dev/null &&
+    factorseal export-secret-service keyring.factorseal'
+```
+
+The runtime directory must be new, or the daemon joins a gnome-keyring
+already running for you, and short: the daemon's control socket lives in
+it, and a path past the 108-byte socket limit is cut, so the daemon fails
+with `discover_other_daemon`. The export asks for gnome-keyring's password
+through its usual prompt. On a Linux desktop, add `--native`.
 
 ### Import and export
 
@@ -237,6 +317,20 @@ explicitly passed. Exports read the live vault and fail if its contents change
 during collection; retry the export in that case. Linux keyring metadata and
 values restore together, preserving unrelated destination items. Archive v2
 readers also convert v1 archives during import.
+
+A keyring item counts as existing when the vault already has an item with
+the same attributes, whatever its id, since both would answer the same
+lookup. It is kept; with `--replace-existing`, the archive's label, content
+type and value replace it under the vault item's id, which keeps its creation
+time. An archived item whose id is taken by an item with other attributes
+(one a program changed after an earlier restore) is added under an id
+derived from its own, the same one on every restore. An item without
+attributes answers no lookup, so it matches only by id: its own id, or one
+of the ids derived from it, so it is found on every restore. Known
+limitation: an archive holding two attribute-less items at such related ids
+(left by a restore, a deletion and another restore in the keyring the
+archive came from), restored where an item with attributes holds the first
+id, keeps only one of the two.
 
 Password-manager formats operate on Personal Secrets only:
 

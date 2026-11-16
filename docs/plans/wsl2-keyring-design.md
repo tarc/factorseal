@@ -15,7 +15,8 @@ were put to the user before coding.
    namespace and the allowlist has no `Seal`; the WSL host answers `Lock`
    with nothing locked. The Windows vault is sealed from Desktop.
 3. **Items already in a distro's gnome-keyring are left alone**: no import in
-   milestone 2; the docs say so and how to switch back.
+   milestone 2; the docs say so and how to switch back. Replaced by an
+   explicit move: [gnome-keyring-import.md](gnome-keyring-import.md).
 
 ## Facts re-checked on 7cddb54
 
@@ -261,7 +262,8 @@ same `wsl.json` that `wsl-setup` writes (`FACTORSEAL_WSL_CONFIG` overrides):
 
 **Open (3), decided: left alone.** Items in poita's gnome-keyring are not
 imported; its files stay on disk, apps ask to sign in again, and the docs say
-how to switch back.
+how to switch back. (Later replaced by an explicit move,
+[gnome-keyring-import.md](gnome-keyring-import.md).)
 
 ## Step 8: packaging
 
