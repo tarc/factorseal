@@ -82,6 +82,23 @@ impl InstallRecord {
         std::fs::rename(&temporary, Self::path(install_dir))
     }
 
+    /// Add `distros` to the record in `install_dir`: the `wsl` step runs
+    /// after the install committed its record. Names already there (in any
+    /// case, as WSL compares them) are not repeated.
+    pub fn add_distros(install_dir: &Path, distros: &[String]) -> std::io::Result<()> {
+        let mut record = Self::read(&Self::path(install_dir))?;
+        for distro in distros {
+            if !record
+                .distros
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(distro))
+            {
+                record.distros.push(distro.clone());
+            }
+        }
+        record.write(install_dir)
+    }
+
     fn read(path: &Path) -> std::io::Result<Self> {
         let record: Self = serde_json::from_slice(&std::fs::read(path)?)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
@@ -177,6 +194,24 @@ mod tests {
         newer.write(dir.path()).unwrap();
         let error = Existing::detect(dir.path()).unwrap_err().to_string();
         assert!(error.contains("format 2"), "{error}");
+    }
+
+    #[test]
+    fn distros_set_up_are_added_once_and_the_rest_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        record().write(dir.path()).unwrap();
+        InstallRecord::add_distros(dir.path(), &["nixos".to_owned(), "Ubuntu".to_owned()]).unwrap();
+        let Existing::Recorded(updated) = Existing::detect(dir.path()).unwrap() else {
+            panic!("the record is gone");
+        };
+        assert_eq!(updated.distros, ["NixOS", "Ubuntu"]);
+        assert_eq!(
+            InstallRecord {
+                distros: record().distros,
+                ..*updated
+            },
+            record()
+        );
     }
 
     #[test]

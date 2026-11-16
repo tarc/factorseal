@@ -479,6 +479,7 @@ fn long_runner() -> (PathBuf, Vec<&'static str>) {
 }
 
 fn start(program: &Path, arguments: &[&str], cwd: &Path) -> Running {
+    let _exec = crate::exec_lock();
     Running(
         std::process::Command::new(program)
             .args(arguments)
@@ -496,7 +497,10 @@ fn the_system_list_finds_what_runs_from_or_works_in_the_folder() {
     let install_dir = setup.install_dir();
     let (program, arguments) = long_runner();
     let host = install_dir.join(BROWSER_HOST);
-    std::fs::copy(&program, &host).unwrap();
+    {
+        let _exec = crate::exec_lock();
+        std::fs::copy(&program, &host).unwrap();
+    }
     let outside = setup.root.path();
     let mut from_folder = start(&host, &arguments, outside);
     let working_in = start(&program, &arguments, &install_dir);
@@ -567,6 +571,7 @@ fn the_command_runner_reports_the_exit_and_a_timeout() {
         ("sh", "-c")
     };
     let run = |runner: &mut CommandRunner, script: &str, timeout| {
+        let _exec = crate::exec_lock();
         runner.run(
             Path::new(shell),
             &[flag.to_owned(), script.to_owned()],
@@ -579,6 +584,7 @@ fn the_command_runner_reports_the_exit_and_a_timeout() {
     let started = Instant::now();
     let slow = if cfg!(windows) {
         let ping = ["-n", "60", "127.0.0.1"].map(str::to_owned);
+        let _exec = crate::exec_lock();
         runner.run(Path::new("ping"), &ping, Duration::from_millis(300))
     } else {
         run(&mut runner, "sleep 5", Duration::from_millis(300))

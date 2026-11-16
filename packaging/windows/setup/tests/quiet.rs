@@ -11,6 +11,21 @@ const SETUP: &str = env!("CARGO_BIN_EXE_factorseal-setup");
 /// A release folder `root/<version>` with Desktop, the CLI and the browser
 /// host, stopped by Desktop's `--quit`; returns its manifest's path.
 fn release(root: &Path, version: &str, requires_setup: u32) -> PathBuf {
+    release_with_steps(
+        root,
+        version,
+        requires_setup,
+        &json!([{ "install_files": {} }]),
+    )
+}
+
+/// The same, with these steps.
+fn release_with_steps(
+    root: &Path,
+    version: &str,
+    requires_setup: u32,
+    steps: &serde_json::Value,
+) -> PathBuf {
     let dir = root.join(version);
     std::fs::create_dir_all(&dir).unwrap();
     let mut files = Vec::new();
@@ -32,7 +47,7 @@ fn release(root: &Path, version: &str, requires_setup: u32) -> PathBuf {
             "command": ["factorseal-desktop.exe", "--quit"],
             "also_stop": ["factorseal-browser.exe"],
         },
-        "steps": [{ "install_files": {} }],
+        "steps": steps,
     });
     let path = dir.join("factorseal-release.json");
     std::fs::write(&path, manifest.to_string()).unwrap();
@@ -108,10 +123,155 @@ fn setup_in(
     }
 }
 
+fn installed_record(install_dir: &Path) -> Option<serde_json::Value> {
+    serde_json::from_slice(&std::fs::read(install_dir.join("install.json")).ok()?).ok()
+}
+
 fn installed_version(install_dir: &Path) -> Option<String> {
-    let record: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(install_dir.join("install.json")).ok()?).ok()?;
-    record["version"].as_str().map(str::to_owned)
+    installed_record(install_dir)?["version"]
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn recorded_distros(install_dir: &Path) -> Vec<String> {
+    installed_record(install_dir)
+        .and_then(|record| serde_json::from_value(record["distros"].clone()).ok())
+        .unwrap_or_default()
+}
+
+/// A release whose steps include `wsl`.
+fn wsl_release(root: &Path, version: &str) -> PathBuf {
+    release_with_steps(
+        root,
+        version,
+        1,
+        &json!([{ "install_files": {} }, { "wsl": {} }]),
+    )
+}
+
+#[test]
+fn a_release_that_sets_up_wsl_needs_wsl_or_no_wsl_under_quiet() {
+    let root = tempfile::tempdir().unwrap();
+    let install_dir = root.path().join("Programs").join("FactorSeal");
+    let log = root.path().join("setup.log");
+    let _cleanup = RegistryCleanup(root.path().to_owned());
+    let manifest = wsl_release(root.path(), "1.0.0");
+
+    let run = setup(Path::new(SETUP), &manifest, &install_dir, &log, &[]);
+    assert_eq!(run.code, Some(2), "{}", run.log);
+    assert!(run.log.contains("pass --wsl DISTRO"), "{}", run.log);
+    assert_eq!(installed_version(&install_dir), None);
+
+    let bad_name = setup(
+        Path::new(SETUP),
+        &manifest,
+        &install_dir,
+        &log,
+        &["--wsl", "a b"],
+    );
+    assert_eq!(bad_name.code, Some(2));
+    assert_eq!(installed_version(&install_dir), None);
+
+    let run = setup(
+        Path::new(SETUP),
+        &manifest,
+        &install_dir,
+        &log,
+        &["--no-wsl"],
+    );
+    assert_eq!(run.code, Some(0), "{}", run.log);
+    assert_eq!(installed_version(&install_dir).as_deref(), Some("1.0.0"));
+    assert_eq!(recorded_distros(&install_dir), Vec::<String>::new());
+}
+
+/// Unix: the installer's own lines, run by a real `sh` through a stand-in
+/// for `wsl.exe` whose distro `Bare` has no `factorseal`: the distro with
+/// it is set up and recorded, `Bare` gets the hint, and the run says so
+/// through exit code 8, with the install kept.
+#[cfg(unix)]
+#[test]
+fn quiet_sets_up_the_chosen_distros_and_records_those_set_up() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let executable = |path: &Path, text: &str| {
+        std::fs::write(path, text).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    let root = tempfile::tempdir().unwrap();
+    let install_dir = root.path().join("Programs").join("FactorSeal");
+    let log = root.path().join("setup.log");
+    let _cleanup = RegistryCleanup(root.path().to_owned());
+    let (with, bare) = (root.path().join("bin"), root.path().join("bare"));
+    std::fs::create_dir_all(&with).unwrap();
+    std::fs::create_dir_all(&bare).unwrap();
+    let calls = root.path().join("calls");
+    executable(
+        &with.join("factorseal"),
+        &format!(
+            "#!/bin/sh\nprintf '%s %s\\n' \"$WSL_DISTRO\" \"$*\" >> '{}'\necho \"Wrote config\"\n",
+            calls.display()
+        ),
+    );
+    for bin in [&with, &bare] {
+        executable(
+            &bin.join("wslpath"),
+            "#!/bin/sh\n[ \"$1\" = -u ] || exit 2\nprintf '/mnt/c%s\\n' \"$2\"\n",
+        );
+    }
+    let stand_in = root.path().join("wsl.exe");
+    executable(
+        &stand_in,
+        &format!(
+            "#!/bin/sh\n[ \"$1\" = -d ] && [ \"$3\" = --exec ] || exit 9\n\
+             if [ \"$2\" = Bare ]; then bin='{}'; else bin='{}'; fi\n\
+             distro=$2; shift 5\nWSL_DISTRO=$distro PATH=$bin exec /bin/sh -c \"$@\"\n",
+            bare.display(),
+            with.display()
+        ),
+    );
+    let stand_in = stand_in.to_string_lossy().into_owned();
+
+    let manifest = wsl_release(root.path(), "1.0.0");
+    let extra = [
+        "--wsl",
+        "NixOS",
+        "--wsl",
+        "Bare",
+        "--wsl-program",
+        &stand_in,
+    ];
+    let run = setup(Path::new(SETUP), &manifest, &install_dir, &log, &extra);
+    assert_eq!(run.code, Some(8), "{}", run.log);
+    assert!(run.log.contains("set up WSL distro NixOS"), "{}", run.log);
+    assert!(
+        run.log
+            .contains("FactorSeal isn't installed in WSL distro Bare"),
+        "{}",
+        run.log
+    );
+    assert!(
+        run.log.contains("result: installed 1.0.0 in ")
+            && run.log.contains("but WSL was not set up in 1 distro(s)"),
+        "{}",
+        run.log
+    );
+    assert_eq!(installed_version(&install_dir).as_deref(), Some("1.0.0"));
+    assert_eq!(recorded_distros(&install_dir), ["NixOS"]);
+    assert_eq!(
+        std::fs::read_to_string(&calls).unwrap(),
+        format!(
+            "NixOS wsl-setup --windows-install /mnt/c{}\n",
+            install_dir.display()
+        )
+    );
+
+    // An update in the same distro: set up again, recorded once.
+    let manifest = wsl_release(root.path(), "2.0.0");
+    let extra = ["--wsl", "NixOS", "--wsl-program", &stand_in];
+    let run = setup(Path::new(SETUP), &manifest, &install_dir, &log, &extra);
+    assert_eq!(run.code, Some(0), "{}", run.log);
+    assert_eq!(installed_version(&install_dir).as_deref(), Some("2.0.0"));
+    assert_eq!(recorded_distros(&install_dir), ["NixOS"]);
+    assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 2);
 }
 
 #[test]
@@ -292,13 +452,14 @@ fn an_update_run_from_inside_the_install_folder_succeeds_through_the_relaunch() 
     );
 
     let installed_setup = install_dir.join("factorseal-setup.exe");
-    let second = release(root.path(), "2.0.0", 1);
+    // The choice about WSL reaches the copy too.
+    let second = wsl_release(root.path(), "2.0.0");
     let run = setup_in(
         &installed_setup,
         &second,
         &install_dir,
         &log,
-        &[],
+        &["--no-wsl"],
         &install_dir,
     );
     assert_eq!(run.code, Some(0), "{}", run.log);
@@ -307,7 +468,14 @@ fn an_update_run_from_inside_the_install_folder_succeeds_through_the_relaunch() 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let log_text = loop {
         let text = std::fs::read_to_string(&log).unwrap_or_default();
-        if text.contains("result: installed 2.0.0") || text.contains("result: failed") {
+        if [
+            "result: installed 2.0.0",
+            "result: failed",
+            "result: refused",
+        ]
+        .iter()
+        .any(|result| text.contains(result))
+        {
             break text;
         }
         assert!(std::time::Instant::now() < deadline, "no result: {text}");

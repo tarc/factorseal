@@ -8,11 +8,12 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use factorseal_setup::engine::{self, InstallError, Options};
-use factorseal_setup::manifest::{ManifestError, Place, Release};
-use factorseal_setup::record::Existing;
+use factorseal_setup::manifest::{ManifestError, Place, Release, Step};
+use factorseal_setup::record::{Existing, InstallRecord};
 use factorseal_setup::registry::Registry;
 use factorseal_setup::steps::{self, Launch, Places, StepOptions};
 use factorseal_setup::stop::{self, CommandRunner, StopPlan, Stopped, SystemProcesses, Waits};
+use factorseal_setup::wsl::{self, SystemWsl};
 
 /// Exit codes of `--quiet`; the log says more.
 mod exit {
@@ -23,6 +24,7 @@ mod exit {
     pub const INSTALL_FAILED: u8 = 5;
     pub const NEEDS_ADOPTION: u8 = 6;
     pub const STILL_RUNNING: u8 = 7;
+    pub const WSL_INCOMPLETE: u8 = 8;
 }
 
 /// The name a relaunched copy gets in the temporary folder.
@@ -37,8 +39,10 @@ const RELAUNCH_PREFIX: &str = "factorseal-setup-";
     after_help = "With --quiet, the exit code is 0 when installed, 2 for a usage error, 3 when \
                   the release is refused, 4 when it needs a newer installer, 5 when installing \
                   failed (the previous install is kept), 6 when a hand-made install needs \
-                  --adopt, 7 when FactorSeal still runs (nothing changed). Run from inside the install folder, it continues from a copy in the \
-                  temporary folder and exits 0 at once; the log has the result."
+                  --adopt, 7 when FactorSeal still runs (nothing changed), 8 when installed but \
+                  WSL setup failed in a distro. Run from inside the install folder, it continues \
+                  from a copy in the temporary folder and exits 0 at once; the log has the \
+                  result."
 )]
 struct Args {
     /// The release to install: its factorseal-release.json.
@@ -77,6 +81,16 @@ struct Args {
     #[arg(long, value_name = "SECONDS", default_value_t = 300)]
     wait_for_quit: u64,
 
+    /// Set FactorSeal up in this WSL distro (repeat for more). Checking a
+    /// distro starts it. With --quiet, a release that sets up WSL needs
+    /// --wsl or --no-wsl.
+    #[arg(long = "wsl", value_name = "DISTRO", value_parser = distro_name)]
+    wsl: Vec<String>,
+
+    /// Leave WSL alone.
+    #[arg(long, conflicts_with = "wsl")]
+    no_wsl: bool,
+
     /// Set on the copy that continues from the temporary folder.
     #[arg(long, hide = true)]
     relaunched: bool,
@@ -94,6 +108,23 @@ struct Args {
     /// start-menu\Startup, desktop) instead of the user's.
     #[arg(long, hide = true, value_name = "DIR")]
     shortcut_root: Option<PathBuf>,
+
+    /// For tests: run this instead of wsl.exe.
+    #[arg(long, hide = true, value_name = "PATH")]
+    wsl_program: Option<PathBuf>,
+}
+
+/// Whether the release has the `wsl` step.
+fn sets_up_wsl(release: &Release) -> bool {
+    release
+        .manifest
+        .steps
+        .iter()
+        .any(|step| matches!(step, Step::Wsl {}))
+}
+
+fn distro_name(name: &str) -> Result<String, String> {
+    wsl::check_distro(name).map(|()| name.to_owned())
 }
 
 fn main() -> ExitCode {
@@ -151,6 +182,17 @@ fn run(args: &Args, log: &mut Log) -> u8 {
             };
         }
     };
+    let sets_up_wsl = sets_up_wsl(&release);
+    if sets_up_wsl && args.wsl.is_empty() && !args.no_wsl {
+        log.line(
+            "result: refused: this release sets up WSL; pass --wsl DISTRO (repeat for more) or \
+             --no-wsl",
+        );
+        return exit::USAGE;
+    }
+    if !sets_up_wsl && !args.wsl.is_empty() {
+        log.line("this release doesn't set up WSL; --wsl is ignored");
+    }
     install(args, log, &release, &install_dir, setup_exe)
 }
 
@@ -234,17 +276,62 @@ fn install(
     if let Err(error) = steps::register_installed_app(release, install_dir, registry.as_ref()) {
         log.line(&format!("could not register in Installed apps: {error}"));
     }
+    let wsl_problems = set_up_wsl(args, log, release, install_dir, &step_options.working_dir);
     match steps::start(release, install_dir, &step_options) {
         Ok(true) => log.line("started FactorSeal"),
         Ok(false) => {}
         Err(error) => log.line(&format!("could not start FactorSeal: {error}")),
     }
-    log.line(&format!(
+    let installed = format!(
         "result: installed {} in {}",
         release.manifest.version,
         install_dir.display()
-    ));
+    );
+    if wsl_problems > 0 {
+        log.line(&format!(
+            "{installed}, but WSL was not set up in {wsl_problems} distro(s); see above"
+        ));
+        return exit::WSL_INCOMPLETE;
+    }
+    log.line(&installed);
     exit::INSTALLED
+}
+
+/// The `wsl` step, in the distros chosen with `--wsl`, after the install
+/// committed: a failure only warns. Returns how many distros weren't set
+/// up.
+fn set_up_wsl(
+    args: &Args,
+    log: &mut Log,
+    release: &Release,
+    install_dir: &Path,
+    working_dir: &Path,
+) -> usize {
+    if !sets_up_wsl(release) || args.wsl.is_empty() {
+        return 0;
+    }
+    let mut system = SystemWsl {
+        program: args
+            .wsl_program
+            .as_deref()
+            .map_or_else(|| PathBuf::from("wsl.exe"), absolute),
+        working_dir: working_dir.to_owned(),
+        timeout: wsl::LINE_TIMEOUT,
+    };
+    let report = wsl::set_up(&args.wsl, install_dir, &mut system, &mut |line: &str| {
+        log.line(line);
+    });
+    let mut problems = report.problems.len();
+    if !report.set_up.is_empty()
+        && let Err(error) = InstallRecord::add_distros(install_dir, &report.set_up)
+    {
+        log.line(&format!(
+            "could not record the WSL distros set up ({}): {error}",
+            report.set_up.join(", ")
+        ));
+        problems += report.set_up.len();
+    }
+    problems
 }
 
 /// Stop the installed version, the way its record says, before anything
@@ -265,7 +352,7 @@ fn stop_installed(
         Ok(existing) => existing,
         Err(error) => {
             let error = InstallError::Record {
-                path: factorseal_setup::record::InstallRecord::path(install_dir),
+                path: InstallRecord::path(install_dir),
                 source: error,
             };
             log.line(&format!("result: failed: {error}"));
@@ -388,6 +475,15 @@ fn relaunch(
     command
         .arg("--wait-for-quit")
         .arg(args.wait_for_quit.to_string());
+    for distro in &args.wsl {
+        command.arg("--wsl").arg(distro);
+    }
+    if args.no_wsl {
+        command.arg("--no-wsl");
+    }
+    if let Some(program) = &args.wsl_program {
+        command.arg("--wsl-program").arg(absolute(program));
+    }
     for place in &args.optional_places {
         if let Some(value) = clap::ValueEnum::to_possible_value(place) {
             command.arg("--optional-place").arg(value.get_name());
