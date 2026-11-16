@@ -1,7 +1,8 @@
 # Plan: a small Windows installer (`factorseal-setup.exe`)
 
-Status, 2026-11-16: steps 1–5 done (Desktop `--quit` and `--open`, the
-manifest crate, the install engine, shortcuts, registry and start);
+Status, 2026-11-16: steps 1–6 done (Desktop `--quit` and `--open`, the
+manifest crate, the install engine, shortcuts, registry and start,
+stopping the installed version);
 review folded in (see "Review record" at the end). Branch: `feature/wsl2-keyring`. It hands off to
 Desktop's gnome-keyring check and move, planned in
 [gnome-keyring-import.md](gnome-keyring-import.md).
@@ -541,6 +542,64 @@ in the native build.
    ask-to-quit fallback (no record, or no stop command). Live on a test
    install with the test vault: a stop through `--quit`, and one through
    the fallback with a Desktop built before step 1.
+
+   As implemented (2026-11-16; `stop.rs`, wired into `--quiet` before
+   `install_files`):
+   - **The plan** (`StopPlan`): the record's stop command, used only when
+     its executable is a recorded file (a plain release path, `.exe`)
+     whose installed copy still matches the recorded hash; otherwise the
+     reason is shown and the user is asked. A hand-made install and a
+     record without `stop` take the fallback. `also_stop` joins the
+     record's (checked like manifest paths, since the record sits in the
+     user's folder) and the new release's, so a hand-made install still
+     gets its browser host and broker stopped.
+   - **Who holds the folder**: through `sysinfo` (already in the lock
+     file; safe API, only its `system` feature), every process running an
+     executable from the folder, or working in it (its current
+     directory, which stops the swap), other than the installer itself and
+     `factorseal-setup.exe` (the copy that relaunched this one, exiting).
+     A process whose path can't be read (elevated) counts when its name is
+     one of the folder's executables.
+   - **The order**: `also_stop` processes are terminated whenever they
+     show up, the browser host after the line that a waiting browser fill
+     is cancelled; when only they run, nothing else happens. Otherwise
+     the stop command runs (working in the profile, 45 s at most), then
+     the folder's processes get 15 s to exit. Without a command, after a
+     failed one, or when processes remain, the user is asked to quit
+     FactorSeal from its tray icon (and to close programs working in the
+     folder), naming each process, and the installer waits
+     (`--wait-for-quit`, 300 s by default). What is left then is named,
+     nothing changes, exit 7. Desktop and the vault worker are never
+     terminated. Processes that refused termination alone are not a
+     reason to ask.
+   - A hand-made install without `--adopt` is refused before anything is
+     stopped.
+   - Tests: 11 unit tests (9 with fake processes and runner, one with real
+     processes: a copy of a shell, or of ping on Windows, running from the
+     folder and one working in it; one of the command runner's exit codes
+     and timeout), and a binary test: an update waits in vain for the CLI
+     running from the folder (exit 7, nothing changed, the process named)
+     and then terminates the browser host and installs. 54 unit tests and
+     4 binary tests on both platforms. Mutations caught: skipping the hash
+     check, `also_stop` never matching a path, an unreadable process never
+     terminated, ignoring working directories, never asking, ignoring the
+     release's `also_stop`, `--quiet` not stopping at all.
+   - Live, natively, on the test vault (every run `--no-start`, test
+     registry root and shortcut folders; the test releases ship no browser
+     host, so the test Desktop doesn't re-register the user's): a release
+     whose stop command is `factorseal-desktop.exe --root <test vault>
+     --quit` installed, its Desktop started and unlocked, then the update
+     to a second release stopped it through the recorded command and
+     installed, 2.8 s in all, nothing left running. Then a hand-made
+     folder with the user's installed Desktop (14 Nov, before `--quit`)
+     running on the test vault: `--adopt` said it can't stop a hand-made
+     install and asked, naming the process; the tray's Quit was clicked
+     (simulated) and the update finished 4.3 s later. The user's own
+     Desktop and browser host ran on throughout. Not tried live: an
+     elevated Desktop (the path-hidden case), covered by a unit test only.
+   - Since the recorded command runs as written, it targets the default
+     vault unless it names one; a release's `stop` stays
+     `factorseal-desktop.exe --quit`.
 7. **Step `wsl`** behind a command runner trait: the fixed probe, setup and
    removal lines, the `/etc/os-release` hint, consent. Tests with a fake
    runner. The real run is on the user's NixOS during rollout, with
