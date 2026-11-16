@@ -435,7 +435,7 @@ fn is_sha256(text: &str) -> bool {
 
 /// A release file's path: relative, `/` between plain folder and file
 /// names that mean the same file on Windows as they say.
-fn check_release_path(path: &str) -> Result<(), ManifestError> {
+pub(crate) fn check_release_path(path: &str) -> Result<(), ManifestError> {
     let refuse = |reason: &str| Err(invalid(format!("file path {path:?}: {reason}")));
     if path.is_empty() || path.len() > 200 {
         return refuse("empty or too long");

@@ -9,8 +9,10 @@ use std::process::ExitCode;
 use clap::Parser;
 use factorseal_setup::engine::{self, InstallError, Options};
 use factorseal_setup::manifest::{ManifestError, Place, Release};
+use factorseal_setup::record::Existing;
 use factorseal_setup::registry::Registry;
 use factorseal_setup::steps::{self, Launch, Places, StepOptions};
+use factorseal_setup::stop::{self, CommandRunner, StopPlan, Stopped, SystemProcesses, Waits};
 
 /// Exit codes of `--quiet`; the log says more.
 mod exit {
@@ -20,6 +22,7 @@ mod exit {
     pub const NEEDS_NEWER_SETUP: u8 = 4;
     pub const INSTALL_FAILED: u8 = 5;
     pub const NEEDS_ADOPTION: u8 = 6;
+    pub const STILL_RUNNING: u8 = 7;
 }
 
 /// The name a relaunched copy gets in the temporary folder.
@@ -34,7 +37,7 @@ const RELAUNCH_PREFIX: &str = "factorseal-setup-";
     after_help = "With --quiet, the exit code is 0 when installed, 2 for a usage error, 3 when \
                   the release is refused, 4 when it needs a newer installer, 5 when installing \
                   failed (the previous install is kept), 6 when a hand-made install needs \
-                  --adopt. Run from inside the install folder, it continues from a copy in the \
+                  --adopt, 7 when FactorSeal still runs (nothing changed). Run from inside the install folder, it continues from a copy in the \
                   temporary folder and exits 0 at once; the log has the result."
 )]
 struct Args {
@@ -67,6 +70,12 @@ struct Args {
     /// Don't start FactorSeal at the end.
     #[arg(long)]
     no_start: bool,
+
+    /// How long to wait for FactorSeal to be quit from its tray icon, when
+    /// the installer can't stop it itself (an install made by hand or
+    /// before FactorSeal could be told to quit).
+    #[arg(long, value_name = "SECONDS", default_value_t = 300)]
+    wait_for_quit: u64,
 
     /// Set on the copy that continues from the temporary folder.
     #[arg(long, hide = true)]
@@ -180,6 +189,9 @@ fn install(
             .map_or_else(working_dir, absolute),
     };
     let registry = registry(args.registry_root.as_deref());
+    if let Err(code) = stop_installed(args, log, release, install_dir, &step_options.working_dir) {
+        return code;
+    }
     let mut pending = match engine::install_files(release, &options) {
         Ok(pending) => pending,
         Err(error) => {
@@ -233,6 +245,63 @@ fn install(
         install_dir.display()
     ));
     exit::INSTALLED
+}
+
+/// Stop the installed version, the way its record says, before anything
+/// changes. A hand-made install is checked first, so FactorSeal isn't
+/// stopped for an install that will be refused.
+fn stop_installed(
+    args: &Args,
+    log: &mut Log,
+    release: &Release,
+    install_dir: &Path,
+    working_dir: &Path,
+) -> Result<(), u8> {
+    if let Err(error) = engine::recover(install_dir) {
+        log.line(&format!("result: failed: {error}"));
+        return Err(exit::INSTALL_FAILED);
+    }
+    let existing = match Existing::detect(install_dir) {
+        Ok(existing) => existing,
+        Err(error) => {
+            let error = InstallError::Record {
+                path: factorseal_setup::record::InstallRecord::path(install_dir),
+                source: error,
+            };
+            log.line(&format!("result: failed: {error}"));
+            return Err(exit::INSTALL_FAILED);
+        }
+    };
+    if existing == Existing::HandMade && !args.adopt {
+        let error = InstallError::NeedsAdoption(install_dir.to_owned());
+        log.line(&format!("result: failed: {error}"));
+        return Err(exit::NEEDS_ADOPTION);
+    }
+    let plan = StopPlan::new(install_dir, &existing, release);
+    let waits = Waits {
+        quit: std::time::Duration::from_secs(args.wait_for_quit),
+        ..Waits::default()
+    };
+    let mut runner = CommandRunner {
+        working_dir: working_dir.to_owned(),
+    };
+    match stop::stop_running(
+        &plan,
+        &mut SystemProcesses::default(),
+        &mut runner,
+        log,
+        &waits,
+    ) {
+        Ok(Stopped::NothingRan) => {}
+        Ok(Stopped::Terminated) => log.line("stopped FactorSeal's helpers"),
+        Ok(Stopped::ByCommand) => log.line("FactorSeal stopped"),
+        Ok(Stopped::ByUser) => log.line("FactorSeal was quit"),
+        Err(error) => {
+            log.line(&format!("result: failed: {error}"));
+            return Err(exit::STILL_RUNNING);
+        }
+    }
+    Ok(())
 }
 
 /// The registry: the user's (or a test key) on Windows; elsewhere, where
@@ -316,6 +385,9 @@ fn relaunch(
     if args.no_start {
         command.arg("--no-start");
     }
+    command
+        .arg("--wait-for-quit")
+        .arg(args.wait_for_quit.to_string());
     for place in &args.optional_places {
         if let Some(value) = clap::ValueEnum::to_possible_value(place) {
             command.arg("--optional-place").arg(value.get_name());
@@ -386,6 +458,18 @@ fn absolute(path: &Path) -> PathBuf {
 fn default_install_dir() -> Option<PathBuf> {
     directories::BaseDirs::new()
         .map(|dirs| dirs.data_local_dir().join("Programs").join("FactorSeal"))
+}
+
+/// Under `--quiet`, the stop's messages and its request to quit go to the
+/// log.
+impl stop::Ui for Log {
+    fn say(&mut self, line: &str) {
+        self.line(line);
+    }
+
+    fn ask_to_quit(&mut self, holders: &[stop::Holder], wait: std::time::Duration) {
+        self.line(&stop::ask_text(holders, wait));
+    }
 }
 
 /// Appends timestamped lines to the log, and to standard error.

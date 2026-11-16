@@ -8,8 +8,8 @@ use serde_json::json;
 
 const SETUP: &str = env!("CARGO_BIN_EXE_factorseal-setup");
 
-/// A release folder `root/<version>` with Desktop and the CLI; returns
-/// its manifest's path.
+/// A release folder `root/<version>` with Desktop, the CLI and the browser
+/// host, stopped by Desktop's `--quit`; returns its manifest's path.
 fn release(root: &Path, version: &str, requires_setup: u32) -> PathBuf {
     let dir = root.join(version);
     std::fs::create_dir_all(&dir).unwrap();
@@ -17,6 +17,7 @@ fn release(root: &Path, version: &str, requires_setup: u32) -> PathBuf {
     for (name, contents) in [
         ("factorseal-desktop.exe", format!("desktop {version}")),
         ("factorseal.exe", format!("cli {version}")),
+        ("factorseal-browser.exe", format!("browser {version}")),
     ] {
         std::fs::write(dir.join(name), &contents).unwrap();
         files.push(json!({ "path": name, "sha256": sha256_hex(contents.as_bytes()).unwrap().0 }));
@@ -27,6 +28,10 @@ fn release(root: &Path, version: &str, requires_setup: u32) -> PathBuf {
         "version": version,
         "requires_setup": requires_setup,
         "files": files,
+        "stop": {
+            "command": ["factorseal-desktop.exe", "--quit"],
+            "also_stop": ["factorseal-browser.exe"],
+        },
         "steps": [{ "install_files": {} }],
     });
     let path = dir.join("factorseal-release.json");
@@ -168,6 +173,103 @@ fn a_hand_made_install_is_updated_only_with_adopt() {
     );
     assert_eq!(run.code, Some(0), "{}", run.log);
     assert_eq!(installed_version(&install_dir).as_deref(), Some("1.0.0"));
+}
+
+/// A process started from `program`, killed when dropped.
+struct Running(std::process::Child);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Put a program that runs until stopped in place of the installed `name`,
+/// and start it from there.
+fn run_installed(install_dir: &Path, name: &str) -> Running {
+    #[cfg(windows)]
+    let (program, arguments) = (
+        Path::new(&std::env::var_os("SystemRoot").unwrap()).join(r"System32\PING.EXE"),
+        ["-n", "120", "127.0.0.1"],
+    );
+    // A shell builtin waiting on its standard input.
+    #[cfg(not(windows))]
+    let (program, arguments) = (
+        std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|dir| dir.join("sh"))
+            .find(|path| path.is_file())
+            .unwrap(),
+        ["-c", "read line"],
+    );
+    let path = install_dir.join(name);
+    std::fs::copy(&program, &path).unwrap();
+    Running(
+        Command::new(&path)
+            .args(arguments)
+            .current_dir(install_dir.parent().unwrap())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    )
+}
+
+/// An update waits for what runs from the install folder: the CLI is
+/// waited for (here in vain, so nothing changes, exit 7), the browser host
+/// is terminated.
+#[test]
+fn an_update_waits_for_the_folders_processes_and_stops_the_browser_host() {
+    let root = tempfile::tempdir().unwrap();
+    let install_dir = root.path().join("Programs").join("FactorSeal");
+    let log = root.path().join("setup.log");
+    let _cleanup = RegistryCleanup(root.path().to_owned());
+    let first = release(root.path(), "1.0.0", 1);
+    assert_eq!(
+        setup(Path::new(SETUP), &first, &install_dir, &log, &[]).code,
+        Some(0)
+    );
+    let second = release(root.path(), "2.0.0", 1);
+
+    let cli = run_installed(&install_dir, "factorseal.exe");
+    let run = setup(
+        Path::new(SETUP),
+        &second,
+        &install_dir,
+        &log,
+        &["--wait-for-quit", "1"],
+    );
+    assert_eq!(run.code, Some(7), "{}", run.log);
+    let pid = cli.0.id();
+    assert!(
+        run.log.contains("quit FactorSeal from its tray icon")
+            && run.log.contains(&format!("factorseal.exe (process {pid})")),
+        "{}",
+        run.log
+    );
+    // Desktop here is no program: its stop command fails, and the user is
+    // asked instead.
+    assert!(
+        run.log.contains("the stop command didn't stop FactorSeal"),
+        "{}",
+        run.log
+    );
+    assert_eq!(installed_version(&install_dir).as_deref(), Some("1.0.0"));
+    drop(cli);
+
+    let mut host = run_installed(&install_dir, "factorseal-browser.exe");
+    let run = setup(Path::new(SETUP), &second, &install_dir, &log, &[]);
+    assert_eq!(run.code, Some(0), "{}", run.log);
+    assert!(
+        run.log.contains(&format!(
+            "stopping factorseal-browser.exe (process {}); a browser fill",
+            host.0.id()
+        )),
+        "{}",
+        run.log
+    );
+    assert!(host.0.wait().is_ok_and(|status| !status.success()));
+    assert_eq!(installed_version(&install_dir).as_deref(), Some("2.0.0"));
 }
 
 /// Windows: the installed copy, run from the install folder with it as the
