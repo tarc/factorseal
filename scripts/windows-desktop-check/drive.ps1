@@ -324,6 +324,15 @@ try {
 switch ($Action) {
     'unlock' {
         $field = WaitFor $window 'FactorSeal password' 5
+        if (-not $field) {
+            # A seal while Settings is open leaves Settings there; the
+            # password field is behind its link back to the vault.
+            $back = Find $window 'Back to your vault' -Button
+            if ($back) {
+                ClickOn $window $back 'Back to your vault'
+                $field = WaitFor $window 'FactorSeal password' 5
+            }
+        }
         if (-not $field) { Fail 'no password field; is the vault already unlocked?' }
         ClickOn $window $field 'password field'
         Start-Sleep -Milliseconds 200
