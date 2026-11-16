@@ -1,7 +1,7 @@
 # Plan: a small Windows installer (`factorseal-setup.exe`)
 
-Status, 2026-11-15: planned, not started; review folded in (see "Review
-record" at the end). Branch: `feature/wsl2-keyring`. It hands off to
+Status, 2026-11-16: steps 1 and 2 done (Desktop `--quit` and `--open`);
+review folded in (see "Review record" at the end). Branch: `feature/wsl2-keyring`. It hands off to
 Desktop's gnome-keyring check and move, planned in
 [gnome-keyring-import.md](gnome-keyring-import.md).
 
@@ -311,6 +311,42 @@ in the native build.
    instance itself (nothing running), it starts on that page. A sealed
    vault shows the unlock first and then the page. It changes navigation,
    so the user sees it natively.
+
+   As implemented (2026-11-16, steps 1 and 2 in one commit, since both
+   are requests on the same channel):
+   - **The channel** (`factorseal-desktop/src/instance.rs`): the
+     activation file now carries one line, `open`, `open <page>` or
+     `quit`; every Desktop so far writes `open`, and builds before this
+     one treat any write as `open`. A line this build doesn't know opens
+     Desktop (forward compatible), and a line left without its newline
+     for five polls (a writer that died) counts as `open`, so it can't
+     block later requests.
+   - **`--quit`** sends `quit` and waits until the instance lock is free,
+     which happens when the running Desktop's process exits, at most
+     30 s; exit 0 then, and also when nothing ran ("no Desktop is
+     running on this vault"), exit 1 on the timeout. The running Desktop
+     runs the tray's Quit (seal, close the tray, quit). It conflicts with
+     `--background`, `--no-tray`, `--keyring-activation` and `--open`,
+     and starts nothing.
+   - **`--open wsl-keyrings`** (a clap value enum, so an unknown page is
+     a usage error) goes with the visible launch's request; a launch that
+     becomes the primary opens the page itself. Sealed, Desktop leaves a
+     sealed Settings page for the unlock and keeps the page pending until
+     the vault is unsealed.
+   - Tests: the request lines round-trip, unknown and incomplete lines
+     open, a page request arrives, `--quit` waits for the lock and times
+     out against a Desktop that stays (mutation: returning right after
+     the request fails it), the argument conflicts. Desktop 219 passed,
+     1 ignored on Linux, 205 natively; clippy on both.
+   - Live (test vault, native build): `--quit` on an unlocked Desktop
+     returned 0 after 268 ms with Desktop and its worker gone; `--open`
+     from nothing running (unlock, then the page), on a running unlocked
+     Desktop, on a sealed one on the vault page, and on one sealed while
+     Settings was open, each checked through UI Automation; then the
+     user watched unlock, `--open` and `--quit` (window and tray icon
+     gone).
+   - `check.sh` stops the test Desktop with `--quit`, falling back to a
+     seal and `taskkill` for a Desktop built before it.
 3. **Manifest schema and verification** (new crate
    `packaging/windows/setup`; the parsing and checks are plain Rust, tested
    on Linux too):
