@@ -1,9 +1,9 @@
 # Plan: a small Windows installer (`factorseal-setup.exe`)
 
-Status, 2026-11-16: steps 1–10 done (Desktop `--quit` and `--open`, the
+Status, 2026-11-16: steps 1–11 done (Desktop `--quit` and `--open`, the
 manifest crate, the install engine, shortcuts, registry and start,
 stopping the installed version, the `wsl` step, uninstall, the release
-build, the dialogs);
+build, the dialogs, the docs); step 12, the rollout, remains;
 review folded in (see "Review record" at the end). Branch: `feature/wsl2-keyring`. It hands off to
 Desktop's gnome-keyring check and move, planned in
 [gnome-keyring-import.md](gnome-keyring-import.md).
@@ -917,6 +917,32 @@ in the native build.
     - The WSL keyring section points at the installer.
     - A short "Releasing" note: `build-windows.sh dist`, the stored
       installer, run the installed setup.
+
+    As implemented (2026-11-16):
+    - `packaging/README.md`, "Windows installer": what the installer and a
+      release are, that the folder is distributed whole, the SmartScreen
+      steps for the unsigned files (one unchanging installer), "Building a
+      release for the installer" (`setup` only when the installer changed,
+      after raising its version; `dist` from a clean commit, what it
+      writes and checks), and "Unattended use" (`--quiet`, the log, the WSL
+      choice, `--uninstall`, and `Start-Process -Wait -PassThru` with
+      quoted absolute paths). The provider difference from the ZIP was
+      written in step 9.
+    - `docs/usage.md`, "Installing on Windows": the pages in order, the
+      stop or ask-to-quit, updates (run the new release's installer), and
+      uninstall from Installed apps with the vault always kept. Both WSL
+      sections say the installer's WSL page runs `wsl-setup`. The README's
+      Desktop quick start links there.
+    - Checking the unattended example natively (with test options, in a
+      folder with spaces) found that `--log` in a folder that doesn't exist
+      yet lost the log silently: the installer now creates the folder
+      (a quiet test, seen failing first).
+    - The installer stored in step 9 predated the dialogs, so releases
+      would have carried the one without them. Version 0.1.0 never left
+      the build machine, so it was stored again (`setup --replace`,
+      `980e9679…`), and `dist` from the docs commit wrote
+      `factorseal-0.1.0+g1156cd1b44`, installed and uninstalled in the test
+      folder. The rollout's release is built from the commit it uses.
 12. **Rollout on the user's machine**, with the user, as step 2 of "Rollout
     on poita" in the import plan:
     1. back up the vault first;
