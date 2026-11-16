@@ -7,8 +7,8 @@
 #       Refuses to start while a Desktop or CLI built in the copy runs, since
 #       Windows locks their executables; an installed one elsewhere can run.
 #   build-windows.sh check [--broker] [--test-hooks]
-#       Mirror, then run clippy, Desktop's tests and the WSL relay's tests
-#       natively. Leaves the release executables alone, so it can run while
+#       Mirror, then run clippy, Desktop's tests, the installer's tests and
+#       the WSL relay's tests natively. Leaves the release executables alone, so it can run while
 #       Desktop is open.
 #   --broker also cross-compiles the WSL broker on the WSL side.
 #   --test-hooks builds Desktop with the `wsl-test-hooks` feature (and, with
@@ -93,9 +93,13 @@ check)
     echo "Running clippy"
     windows "cargo clippy --locked -p factorseal-desktop --all-targets -- -D warnings"
     windows "cargo clippy --locked --no-default-features --features $cli_features --bins -- -D warnings"
+    windows "cargo clippy --locked -p factorseal-setup --all-targets -- -D warnings"
     echo "Running Desktop's tests"
     windows "cargo test --locked -p factorseal-desktop"
     [ -z "$desktop_features" ] || windows "cargo test --locked -p factorseal-desktop$desktop_features"
+    # The installer's manifest checks, where paths are Windows paths.
+    echo "Running the installer's tests"
+    windows "cargo test --locked -p factorseal-setup"
     # The broker's own view of a relayed request (Windows folder, the
     # broker's distro) is checked only where Windows paths are absolute.
     echo "Running the WSL relay's tests"

@@ -14,6 +14,7 @@ members = [
     "crates/secret-service-protocol",
     "factorseal-desktop",
     "factorseal-mobile/core",
+    "packaging/windows/setup",
 ]
 resolver = "2"
 exclude = ["fuzz"]
