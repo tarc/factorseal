@@ -1,0 +1,4 @@
+// The installer's resources, embedded by build.rs: FactorSeal's icon (shown
+// in Explorer and by the task dialogs) and the application manifest.
+1 ICON "factorseal-app-icon.ico"
+1 24 "factorseal-setup.manifest"

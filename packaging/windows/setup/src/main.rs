@@ -1,6 +1,10 @@
-//! `factorseal-setup.exe`. So far only the unattended form, `--quiet`,
-//! for our harness and scripts; the dialogs come with step 10 of
-//! `docs/plans/windows-installer.md`.
+//! `factorseal-setup.exe`: with dialogs on Windows (`gui`, step 10 of
+//! `docs/plans/windows-installer.md`), or unattended with `--quiet`, for
+//! our harness and scripts. A Windows program, not a console one, so
+//! starting it opens no console window; `--quiet` reports through its exit
+//! code and log file.
+
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -16,6 +20,13 @@ use factorseal_setup::stop::{self, CommandRunner, StopPlan, Stopped, SystemProce
 use factorseal_setup::uninstall::{self, Choices, Folders, System};
 use factorseal_setup::wsl::{self, SystemWsl};
 
+#[cfg(windows)]
+mod dialog;
+#[cfg(windows)]
+mod gui;
+#[cfg_attr(not(windows), allow(dead_code))] // Shown only on Windows.
+mod ui;
+
 /// Exit codes of `--quiet`; the log says more.
 mod exit {
     pub const INSTALLED: u8 = 0;
@@ -27,12 +38,15 @@ mod exit {
     pub const STILL_RUNNING: u8 = 7;
     pub const WSL_INCOMPLETE: u8 = 8;
     pub const NOT_INSTALLED: u8 = 9;
+    /// The dialogs were closed before anything changed.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub const CANCELLED: u8 = 10;
 }
 
 /// The name a relaunched copy gets in the temporary folder.
 const RELAUNCH_PREFIX: &str = "factorseal-setup-";
 
-#[derive(Debug, Parser)]
+#[derive(Clone, Debug, Parser)]
 #[allow(clippy::struct_excessive_bools)] // Command-line flags.
 #[command(
     name = "factorseal-setup",
@@ -45,7 +59,10 @@ const RELAUNCH_PREFIX: &str = "factorseal-setup-";
                   7 when FactorSeal still runs (nothing changed), 8 when WSL setup or its \
                   removal failed in a distro (the rest was done), 9 when there is no install to \
                   uninstall. Run from inside the install folder, it continues from a copy in \
-                  the temporary folder and exits 0 at once; the log has the result."
+                  the temporary folder and exits 0 at once; the log has the result. It is a \
+                  Windows program: PowerShell waits for it and sets $LASTEXITCODE only through \
+                  Start-Process -Wait -PassThru. Without --quiet it shows dialogs, installing \
+                  by default the factorseal-release.json beside it."
 )]
 struct Args {
     /// The release to install: its factorseal-release.json.
@@ -147,7 +164,19 @@ fn distro_name(name: &str) -> Result<String, String> {
 }
 
 fn main() -> ExitCode {
-    let args = Args::parse();
+    let args = match Args::try_parse() {
+        Ok(args) => args,
+        Err(error) => {
+            // A Windows program has no console to print to, unless its
+            // output is redirected.
+            #[cfg(windows)]
+            if !std::env::args().any(|argument| argument == "--quiet") {
+                gui::usage(&error.to_string());
+            }
+            let _ = error.print();
+            return ExitCode::from(u8::try_from(error.exit_code()).unwrap_or(exit::USAGE));
+        }
+    };
     let log_path = args
         .log
         .clone()
@@ -157,12 +186,13 @@ fn main() -> ExitCode {
 }
 
 fn run(args: &Args, log: &mut Log) -> u8 {
-    if !args.quiet {
-        log.line("the installer's dialogs are not built yet; run it with --quiet");
-        return exit::USAGE;
-    }
-    let manifest = args.manifest.as_deref().map(absolute);
-    if manifest.is_none() && !args.uninstall {
+    // The dialogs install the release beside the installer by default.
+    let manifest = args.manifest.as_deref().map(absolute).or_else(|| {
+        (!args.quiet && !args.uninstall)
+            .then(release_beside_installer)
+            .flatten()
+    });
+    if args.quiet && manifest.is_none() && !args.uninstall {
         log.line("--quiet needs --manifest or --uninstall");
         return exit::USAGE;
     }
@@ -190,6 +220,9 @@ fn run(args: &Args, log: &mut Log) -> u8 {
         return relaunch(&setup_exe, args, manifest.as_deref(), &install_dir, log);
     }
     remove_old_relaunch_copies(&setup_exe);
+    if !args.quiet {
+        return with_dialogs(args, log, manifest, &install_dir, &setup_exe);
+    }
     let Some(manifest) = manifest else {
         let code = uninstall(args, log, &install_dir);
         if args.relaunched {
@@ -223,6 +256,43 @@ fn run(args: &Args, log: &mut Log) -> u8 {
     install(args, log, &release, &install_dir, setup_exe)
 }
 
+/// The installer with dialogs; on Windows only.
+fn with_dialogs(
+    args: &Args,
+    log: &mut Log,
+    manifest: Option<PathBuf>,
+    install_dir: &Path,
+    setup_exe: &Path,
+) -> u8 {
+    #[cfg(windows)]
+    {
+        if args.uninstall {
+            let code = gui::uninstall(args, log, install_dir);
+            if args.relaunched {
+                delete_later(setup_exe, log);
+            }
+            code
+        } else {
+            gui::install(args, log, manifest, install_dir, setup_exe)
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (args, manifest, install_dir, setup_exe);
+        log.line("the installer's dialogs exist only on Windows; run it with --quiet");
+        exit::USAGE
+    }
+}
+
+/// The `factorseal-release.json` beside this installer, if there is one.
+fn release_beside_installer() -> Option<PathBuf> {
+    let manifest = std::env::current_exe()
+        .ok()?
+        .parent()?
+        .join(factorseal_setup::manifest::MANIFEST_FILE);
+    manifest.is_file().then_some(manifest)
+}
+
 /// Install a verified release: the files, shortcuts and registry values
 /// (rolled back together on failure), then the Installed apps entry and
 /// the launch.
@@ -244,19 +314,12 @@ fn install(
         adopt: args.adopt,
         shortcut_dirs: vec![places.start_menu.clone(), places.desktop.clone()],
     };
-    let step_options = StepOptions {
-        places,
-        optional_places: args.optional_places.clone(),
-        launch: if args.no_start {
-            Launch::None
-        } else {
-            Launch::Quiet
-        },
-        working_dir: args
-            .working_dir
-            .as_deref()
-            .map_or_else(working_dir, absolute),
+    let launch = if args.no_start {
+        Launch::None
+    } else {
+        Launch::Quiet
     };
+    let step_options = step_options(args, places, launch);
     let registry = registry(args.registry_root.as_deref());
     if let Err(code) = stop_installed(args, log, release, install_dir, &step_options.working_dir) {
         return code;
@@ -322,6 +385,19 @@ fn install(
     }
     log.line(&installed);
     exit::INSTALLED
+}
+
+/// The options of the steps after `install_files`.
+fn step_options(args: &Args, places: Places, launch: Launch) -> StepOptions {
+    StepOptions {
+        places,
+        optional_places: args.optional_places.clone(),
+        launch,
+        working_dir: args
+            .working_dir
+            .as_deref()
+            .map_or_else(working_dir, absolute),
+    }
 }
 
 /// The `wsl` step, in the distros chosen with `--wsl`, after the install
@@ -713,12 +789,14 @@ fn relaunch(
     let mut command = std::process::Command::new(&copy);
     command
         .current_dir(std::env::temp_dir())
-        .arg("--quiet")
         .arg("--relaunched")
         .arg("--install-dir")
         .arg(install_dir)
         .arg("--log")
         .arg(&log.path);
+    if args.quiet {
+        command.arg("--quiet");
+    }
     match manifest {
         Some(manifest) => command.arg("--manifest").arg(manifest),
         None => command.arg("--uninstall"),
@@ -831,10 +909,12 @@ impl stop::Ui for Log {
     }
 }
 
-/// Appends timestamped lines to the log, and to standard error.
+/// Appends timestamped lines to the log, to standard error, and to the
+/// dialogs' progress page when they run the work.
 struct Log {
     path: PathBuf,
     file: Option<std::fs::File>,
+    sink: Option<std::sync::mpsc::Sender<String>>,
 }
 
 impl Log {
@@ -847,7 +927,15 @@ impl Log {
         Self {
             path: path.to_owned(),
             file,
+            sink: None,
         }
+    }
+
+    /// Also hand each line, without its time stamp, to `sink`.
+    #[cfg_attr(not(windows), allow(dead_code))] // The dialogs' only.
+    fn with_sink(mut self, sink: std::sync::mpsc::Sender<String>) -> Self {
+        self.sink = Some(sink);
+        self
     }
 
     fn line(&mut self, text: &str) {
@@ -858,6 +946,9 @@ impl Log {
         eprintln!("{line}");
         if let Some(file) = &mut self.file {
             let _ = writeln!(file, "{line}");
+        }
+        if let Some(sink) = &self.sink {
+            let _ = sink.send(text.to_owned());
         }
     }
 }

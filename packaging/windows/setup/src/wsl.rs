@@ -93,6 +93,34 @@ pub fn check_distro(name: &str) -> Result<(), String> {
     }
 }
 
+/// The WSL distros registered for this user, from
+/// `HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss` (as Desktop
+/// lists them), so WSL is not started: sorted, valid names only. Empty
+/// when WSL has none, and on other systems.
+#[must_use]
+pub fn registered_distros() -> Vec<String> {
+    #[cfg(windows)]
+    {
+        let Ok(lxss) =
+            windows_registry::CURRENT_USER.open(r"Software\Microsoft\Windows\CurrentVersion\Lxss")
+        else {
+            return Vec::new();
+        };
+        let Ok(keys) = lxss.keys() else {
+            return Vec::new();
+        };
+        let mut distros: Vec<String> = keys
+            .filter_map(|key| lxss.open(&key).ok()?.get_string("DistributionName").ok())
+            .filter(|name| check_distro(name).is_ok())
+            .collect();
+        distros.sort_unstable();
+        distros.dedup();
+        distros
+    }
+    #[cfg(not(windows))]
+    Vec::new()
+}
+
 /// What setting up WSL did.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Report {

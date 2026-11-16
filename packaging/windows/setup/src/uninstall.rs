@@ -228,6 +228,20 @@ fn delete_listed(
     }
 }
 
+/// The record's `ask_to_delete` folders that pass the rules and exist,
+/// expanded: what the uninstall would delete when asked to.
+#[must_use]
+pub fn listed_folders(record: &InstallRecord, folders: &Folders) -> Vec<PathBuf> {
+    record
+        .uninstall
+        .ask_to_delete
+        .iter()
+        .filter(|listed| check_deletable(listed).is_ok())
+        .filter_map(|listed| expand(listed, folders))
+        .filter(|path| path.exists())
+        .collect()
+}
+
 /// Remove a file the installer made; one already gone is fine.
 fn remove(path: &Path) -> Result<(), (PathBuf, std::io::Error)> {
     match retrying(|| std::fs::remove_file(path)) {

@@ -8,6 +8,26 @@ use serde_json::json;
 
 const SETUP: &str = env!("CARGO_BIN_EXE_factorseal-setup");
 
+/// Linux refuses to run a file some process has open for writing
+/// (`ETXTBSY`), and a child forked by one test thread holds the file
+/// another thread is writing until it runs its program. Writing an
+/// executable and starting a process hold this lock, so the two never
+/// overlap; waiting for a process doesn't.
+fn exec_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Start `command` under the exec lock and wait for it outside.
+fn status(command: &mut Command) -> std::process::ExitStatus {
+    let mut child = {
+        let _exec = exec_lock();
+        command.spawn().unwrap()
+    };
+    child.wait().unwrap()
+}
+
 /// A release folder `root/<version>` with Desktop, the CLI and the browser
 /// host, stopped by Desktop's `--quit`; returns its manifest's path.
 fn release(root: &Path, version: &str, requires_setup: u32) -> PathBuf {
@@ -113,7 +133,7 @@ fn setup_in(
         Some(manifest) => command.arg("--manifest").arg(manifest),
         None => command.arg("--uninstall"),
     };
-    let status = command
+    command
         .current_dir(cwd)
         .arg("--appdata-root")
         .arg(sandbox.join("appdata"))
@@ -131,9 +151,8 @@ fn setup_in(
         .env("TMP", log.parent().unwrap())
         .env("TEMP", log.parent().unwrap())
         .env("TMPDIR", log.parent().unwrap())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .unwrap();
+        .stderr(std::process::Stdio::null());
+    let status = status(&mut command);
     Run {
         code: status.code(),
         log: std::fs::read_to_string(log).unwrap_or_default(),
@@ -209,6 +228,7 @@ fn a_release_that_sets_up_wsl_needs_wsl_or_no_wsl_under_quiet() {
 fn wsl_stand_in(root: &Path) -> (String, PathBuf) {
     use std::os::unix::fs::PermissionsExt as _;
     let executable = |path: &Path, text: &str| {
+        let _exec = exec_lock();
         std::fs::write(path, text).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     };
@@ -326,12 +346,12 @@ fn quiet_installs_and_reports_through_exit_codes_and_the_log() {
     assert_eq!(run.code, Some(3), "{}", run.log);
     assert_eq!(installed_version(&install_dir).as_deref(), Some("1.0.0"));
 
-    let missing = Command::new(SETUP)
-        .args(["--quiet", "--log"])
-        .arg(&log)
-        .stderr(std::process::Stdio::null())
-        .status()
-        .unwrap();
+    let missing = status(
+        Command::new(SETUP)
+            .args(["--quiet", "--log"])
+            .arg(&log)
+            .stderr(std::process::Stdio::null()),
+    );
     assert_eq!(missing.code(), Some(2));
 }
 
@@ -390,6 +410,7 @@ fn run_installed(install_dir: &Path, name: &str) -> Running {
         ["-c", "read line"],
     );
     let path = install_dir.join(name);
+    let _exec = exec_lock();
     std::fs::copy(&program, &path).unwrap();
     Running(
         Command::new(&path)

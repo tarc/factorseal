@@ -22,6 +22,18 @@ thiserror = "2.0.12"
 
 [target.'cfg(windows)'.dependencies]
 windows-registry = "0.6.1"
+# The task dialogs (src/dialog.rs, the binary's one module allowed unsafe
+# code).
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Controls",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+# The application manifest (Common Controls 6, for task dialogs) and icon.
+embed-resource = "3.0.11"
 
 [dev-dependencies]
 tempfile = "3.20.0"

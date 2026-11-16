@@ -357,6 +357,20 @@ impl Drop for Restore {
 }
 
 #[test]
+fn the_listed_folders_offered_are_those_allowed_that_exist() {
+    let world = World::new();
+    let mut record = world.record();
+    record.uninstall.ask_to_delete.extend([
+        r"%APPDATA%\Factorseal\missing".to_owned(),
+        r"%LOCALAPPDATA%\Factorseal\Factorseal\data".to_owned(),
+    ]);
+    assert_eq!(
+        listed_folders(&record, &world.folders()),
+        [world.path("Roaming/Factorseal/settings")]
+    );
+}
+
+#[test]
 fn folder_variables_expand_to_the_users_folders() {
     let folders = Folders {
         appdata: PathBuf::from("/roaming"),
