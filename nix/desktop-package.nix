@@ -32,6 +32,8 @@ rustPlatform.buildRustPackage {
       ../crates
       ../factorseal-desktop
       ../factorseal-mobile/core
+      # A workspace member: Cargo loads its manifest to read the workspace.
+      ../packaging/windows/setup
       ../src
     ];
   };
