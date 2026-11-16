@@ -159,7 +159,8 @@ fn write_frame_within(
     if encoded_len > limit {
         return Err(std::io::Error::other(format!(
             "the {kind} is {} MiB, more than FactorSeal Desktop reads ({} MiB); \
-             export to a file instead",
+             write it to a file instead with `factorseal export-secret-service FILE` \
+             and restore that file in FactorSeal",
             encoded_len.div_ceil(1024 * 1024),
             limit / (1024 * 1024)
         )));
@@ -536,6 +537,12 @@ mod tests {
         let mut stdout = Vec::new();
         let error = write_frame(&mut stdout, "export", &content).unwrap_err();
         assert!(error.to_string().contains("(512 MiB)"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("with `factorseal export-secret-service FILE` and restore that file"),
+            "{error}"
+        );
         assert!(stdout.is_empty(), "no partial frame");
     }
 
