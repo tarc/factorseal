@@ -1,7 +1,7 @@
 # Plan: a small Windows installer (`factorseal-setup.exe`)
 
-Status, 2026-11-16: steps 1–3 done (Desktop `--quit` and `--open`, the
-manifest crate);
+Status, 2026-11-16: steps 1–4 done (Desktop `--quit` and `--open`, the
+manifest crate, the install engine);
 review folded in (see "Review record" at the end). Branch: `feature/wsl2-keyring`. It hands off to
 Desktop's gnome-keyring check and move, planned in
 [gnome-keyring-import.md](gnome-keyring-import.md).
@@ -98,8 +98,12 @@ The installer sits beside the ZIP and the Store MSIX
     relaunch it at any moment. So can native SecretSpec with the
     provider-enabled `factorseal.exe`, though only for a short time.
   - A plain `taskkill` only hides Desktop.
-  - Windows refuses to rename a folder while an executable inside it runs,
-    the installer's own included.
+  - ~~Windows refuses to rename a folder while an executable inside it
+    runs, the installer's own included.~~ Wrong, checked 2026-11-16 (step
+    4): the folder renames while a program started from it runs, but that
+    program's file can't be deleted. What stops the rename is a process
+    whose working directory is in the folder (a Start menu shortcut sets
+    it there) or a file open in it without delete sharing.
 - **Desktop lists distros from `HKCU\…\Lxss`** without starting WSL
   (`wsl_distros.rs`). Probing a distro starts it, so the installer asks
   first. Distro names are the user's choice; `NixOS` is only a default.
@@ -240,7 +244,9 @@ version's location: without `--manifest` it opens a file picker for a
      then replaces them, and uninstall removes them.
 3. If the running setup exe lies inside the install folder, it copies
    itself to `%TEMP%` and relaunches from there with the same arguments,
-   as uninstall does. Otherwise the swap couldn't rename the folder.
+   as uninstall does, with the copy's working directory outside the
+   install folder. Otherwise its working directory could stop the swap,
+   and its own file would keep the old folder from being removed.
 4. Stop the running version (see "Which version's files a command runs"),
    then wait for every process whose image is in the install folder,
    `also_stop` included. The browser host is stopped only after the
@@ -414,6 +420,68 @@ in the native build.
      one;
    - an update run from inside the install folder succeeds through the
      relaunch.
+
+   As implemented (2026-11-16; `packaging/windows/setup/src/engine.rs`,
+   `record.rs`, and a `--quiet` front end in `main.rs` so the relaunch
+   can be tested; the dialogs are step 10):
+   - **Staging and swap**: files are copied into `<install folder>.new`,
+     hashed while copied (an early abort) and read back (the check the
+     tests pin: removing only the copy-time one leaves the test green,
+     removing both fails it). The swap renames the install folder to
+     `.old` and the staging folder into place; a failed rename puts the
+     old folder back. [`Pending`] holds the swap for later steps:
+     `commit` removes the old folder and the old record's shortcuts this
+     install didn't make again, then writes `install.json`; `rollback`
+     restores the old folder and touches no shortcut.
+   - **What Windows allows** (probed with PowerShell before changing the
+     code): see the corrected fact above. So a running FactorSeal doesn't
+     stop the swap; it keeps the old folder, which `commit` then moves to
+     `<install folder>.old-<pid>-<time>` for a later run to remove, so it
+     never blocks the next update. Renames and removals retry for five
+     seconds (a process that just exited, an antivirus scan). The
+     installer moves its own working directory, and the relaunched
+     copy's, to the temporary folder.
+   - **Recovery**: a run first restores `.old` when the install folder is
+     missing (stopped between the renames), removes it otherwise (or moves
+     it aside if in use), removes `.new`, and removes moved-aside folders
+     no longer in use.
+   - **The record** (`install.json`, format 1): version, installer
+     version, files with hashes, shortcuts, registry values, distros, and
+     the manifest's `stop` and `uninstall`. Shortcuts stay recorded until
+     the commit removes them, so a crash before it leaves them for the
+     next run. An unreadable record is an error, never a fresh install.
+     The manifest may not list `factorseal-setup.exe` or `install.json`.
+   - **Self-copy**: the running installer goes into staging unless the
+     record's installer version is the same or newer and its copy is
+     there, which is then carried over.
+   - **Adoption**: a folder with `factorseal-desktop.exe` and no record
+     needs consent (`--adopt` under `--quiet`, exit 6 without). Its
+     shortcuts under the Start menu (Startup included) and the Desktop
+     (`directories`, so OneDrive's redirect too) are found by the target
+     path inside the `.lnk` bytes (UTF-16LE at either alignment, or
+     ASCII), recorded, and removed at the commit unless made again;
+     `UNINSTALL.txt` goes with the old folder.
+   - **`--quiet`**: `--manifest`, `--install-dir`, `--adopt`, `--log`;
+     exit 0 installed, 2 usage, 3 refused, 4 needs a newer installer, 5
+     failed (previous install kept), 6 needs `--adopt`. Run from inside
+     the install folder (Windows), it copies itself to the temporary
+     folder as `factorseal-setup-<pid>.exe`, starts it there with
+     `--relaunched`, and exits 0; the log has the result. Later runs
+     delete such copies no longer running.
+   - Tests: 30 unit tests on each platform (the engine's 13 include two
+     Windows-only and one Unix-only), 3 runs of the binary (one
+     Windows-only, the relaunch).
+     Natively: a working directory inside the folder stops the update
+     with nothing changed; a program running from it lets the update
+     through and the old folder is moved aside, then removed by the next
+     run; the installed copy run with the install folder as its working
+     directory finishes through the relaunch with nothing left beside the
+     install folder. Mutations caught: keeping old shortcuts, not
+     restoring after a failed swap, not restoring in recovery, always
+     copying the running installer, adopting without consent, both hash
+     checks removed (Linux); keeping the working directory, no relaunch
+     (natively). Not in step 4: naming the process that holds the folder
+     (step 6 waits for the folder's processes first).
 5. **Steps `shortcut`, `registry`, `start`**: the registry root is
    configurable so tests write under a test key, never the real Uninstall
    key. Native tests.
