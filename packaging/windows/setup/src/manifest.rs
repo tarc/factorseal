@@ -410,7 +410,7 @@ fn check_version(version: &str) -> Result<(), ManifestError> {
     }
 }
 
-fn check_text(what: &str, text: &str, limit: usize) -> Result<(), ManifestError> {
+pub(crate) fn check_text(what: &str, text: &str, limit: usize) -> Result<(), ManifestError> {
     if text.chars().count() > limit || text.contains('\0') {
         return Err(invalid(format!("{what} is too long or holds a NUL")));
     }
@@ -493,7 +493,7 @@ fn starts_with(path: &[String], prefix: &[String]) -> bool {
     path.len() >= prefix.len() && path[..prefix.len()] == *prefix
 }
 
-fn check_registry_key(key: &str) -> Result<(), ManifestError> {
+pub(crate) fn check_registry_key(key: &str) -> Result<(), ManifestError> {
     let allowed = segments(key).is_some_and(|key| {
         REGISTRY_PREFIXES
             .iter()
@@ -508,7 +508,7 @@ fn check_registry_key(key: &str) -> Result<(), ManifestError> {
     }
 }
 
-fn check_deletable(path: &str) -> Result<(), ManifestError> {
+pub(crate) fn check_deletable(path: &str) -> Result<(), ManifestError> {
     let refuse = |reason: &str| Err(invalid(format!("ask_to_delete {path:?}: {reason}")));
     let Some(parts) = segments(path) else {
         return refuse("not a plain path");

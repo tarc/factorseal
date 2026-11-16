@@ -317,6 +317,56 @@ fn an_update_whose_release_drops_a_shortcut_still_removes_the_old_one() {
     assert!(kept.exists());
 }
 
+/// The record sits in the user's folder: a path it lists that isn't a
+/// shortcut in the shortcut folders is never removed, and drops out of the
+/// record.
+#[test]
+fn an_update_removes_only_recorded_shortcuts_in_the_shortcut_folders() {
+    let world = World::new();
+    let precious = world.path("precious.lnk");
+    let not_a_link = world.path("shortcuts/start/notes.txt");
+    let sneaky = world.path("shortcuts/start/../../precious.lnk");
+    for file in [&precious, &not_a_link] {
+        std::fs::write(file, b"keep").unwrap();
+    }
+    install_files(&v1(&world.releases()), &world.options("0.1.0"))
+        .unwrap()
+        .commit(&MemoryRegistry::default())
+        .unwrap();
+    let mut record = world.record();
+    record.shortcuts = vec![precious.clone(), not_a_link.clone(), sneaky];
+    record.write(&world.install_dir()).unwrap();
+
+    install_files(&v2(&world.releases()), &world.options("0.1.0"))
+        .unwrap()
+        .commit(&MemoryRegistry::default())
+        .unwrap();
+    assert!(precious.exists() && not_a_link.exists());
+    assert_eq!(world.record().shortcuts, Vec::<PathBuf>::new());
+}
+
+#[test]
+fn shortcut_folders_hold_only_links_below_them() {
+    let dirs = [PathBuf::from("/u/Start Menu"), PathBuf::from("/u/Desktop")];
+    for good in [
+        "/u/Start Menu/FactorSeal Desktop.lnk",
+        "/u/Start Menu/Startup/FactorSeal Desktop.LNK",
+        "/U/DESKTOP/FactorSeal Desktop.lnk",
+    ] {
+        assert!(in_shortcut_folders(Path::new(good), &dirs), "{good}");
+    }
+    for bad in [
+        "/u/Start Menu",
+        "/u/Start Menu.lnk",
+        "/u/Start Menu/notes.txt",
+        "/u/Start Menu/../precious.lnk",
+        "/u/Documents/FactorSeal Desktop.lnk",
+        "FactorSeal Desktop.lnk",
+    ] {
+        assert!(!in_shortcut_folders(Path::new(bad), &dirs), "{bad}");
+    }
+}
+
 /// A shortcut file holding `target` the way Windows stores it: UTF-16LE,
 /// at an odd offset, after other bytes.
 fn shortcut_to(target: &Path) -> Vec<u8> {

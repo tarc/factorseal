@@ -11,7 +11,8 @@
 //!   registers the install in Installed apps, through [`shortcut`] (shell
 //!   links written directly) and [`registry`];
 //! - [`stop`] stops the installed version before its files change;
-//! - [`wsl`] sets FactorSeal up in the WSL distros the user chose.
+//! - [`wsl`] sets FactorSeal up in the WSL distros the user chose;
+//! - [`uninstall`] undoes what the record says the installer did.
 
 pub mod engine;
 pub mod manifest;
@@ -20,6 +21,7 @@ pub mod registry;
 pub mod shortcut;
 pub mod steps;
 pub mod stop;
+pub mod uninstall;
 pub mod wsl;
 
 /// Linux refuses to run a file some process has open for writing

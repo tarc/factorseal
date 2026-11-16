@@ -150,6 +150,27 @@ impl StopPlan {
     /// installing `release`.
     #[must_use]
     pub fn new(install_dir: &Path, existing: &Existing, release: &Release) -> Self {
+        let new_also_stop = release
+            .manifest
+            .stop
+            .as_ref()
+            .map(|stop| stop.also_stop.clone())
+            .unwrap_or_default();
+        Self::with_also_stop(install_dir, existing, new_also_stop)
+    }
+
+    /// The plan for uninstalling the install `record` describes: only what
+    /// it recorded.
+    #[must_use]
+    pub fn for_uninstall(install_dir: &Path, record: &InstallRecord) -> Self {
+        Self::with_also_stop(
+            install_dir,
+            &Existing::Recorded(Box::new(record.clone())),
+            Vec::new(),
+        )
+    }
+
+    fn with_also_stop(install_dir: &Path, existing: &Existing, new_also_stop: Vec<String>) -> Self {
         let (command, no_command, recorded_also_stop) = match existing {
             Existing::Recorded(record) => {
                 let also_stop = record
@@ -169,12 +190,6 @@ impl StopPlan {
             ),
             Existing::Fresh => (None, None, Vec::new()),
         };
-        let new_also_stop = release
-            .manifest
-            .stop
-            .as_ref()
-            .map(|stop| stop.also_stop.clone())
-            .unwrap_or_default();
         let mut also_stop: Vec<String> = Vec::new();
         for path in recorded_also_stop.into_iter().chain(new_also_stop) {
             // The record lives in the user's folder: its paths are checked

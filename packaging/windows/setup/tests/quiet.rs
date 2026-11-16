@@ -83,28 +83,45 @@ struct Run {
 }
 
 fn setup(program: &Path, manifest: &Path, install_dir: &Path, log: &Path, extra: &[&str]) -> Run {
-    setup_in(program, manifest, install_dir, log, extra, Path::new("."))
+    setup_in(
+        program,
+        Some(manifest),
+        install_dir,
+        log,
+        extra,
+        Path::new("."),
+    )
+}
+
+/// `--uninstall` instead of a manifest.
+fn uninstall(program: &Path, install_dir: &Path, log: &Path, extra: &[&str]) -> Run {
+    setup_in(program, None, install_dir, log, extra, Path::new("."))
 }
 
 fn setup_in(
     program: &Path,
-    manifest: &Path,
+    manifest: Option<&Path>,
     install_dir: &Path,
     log: &Path,
     extra: &[&str],
     cwd: &Path,
 ) -> Run {
-    // Never the user's shortcut folders or registry keys.
+    // Never the user's shortcut folders, registry keys or AppData.
     let sandbox = log.parent().unwrap();
-    let status = Command::new(program)
+    let mut command = Command::new(program);
+    match manifest {
+        Some(manifest) => command.arg("--manifest").arg(manifest),
+        None => command.arg("--uninstall"),
+    };
+    let status = command
         .current_dir(cwd)
+        .arg("--appdata-root")
+        .arg(sandbox.join("appdata"))
         .arg("--shortcut-root")
         .arg(sandbox.join("shortcuts"))
         .arg("--registry-root")
         .arg(registry_root(sandbox))
         .arg("--quiet")
-        .arg("--manifest")
-        .arg(manifest)
         .arg("--install-dir")
         .arg(install_dir)
         .arg("--log")
@@ -184,26 +201,21 @@ fn a_release_that_sets_up_wsl_needs_wsl_or_no_wsl_under_quiet() {
     assert_eq!(recorded_distros(&install_dir), Vec::<String>::new());
 }
 
-/// Unix: the installer's own lines, run by a real `sh` through a stand-in
-/// for `wsl.exe` whose distro `Bare` has no `factorseal`: the distro with
-/// it is set up and recorded, `Bare` gets the hint, and the run says so
-/// through exit code 8, with the install kept.
+/// Unix: a stand-in for `wsl.exe` in `root` that runs the installer's
+/// lines with a real `sh`, where the distro `Bare` has no `factorseal` and
+/// the others a fake one appending `<distro> <arguments>` to the calls
+/// file. Returns the stand-in and that file.
 #[cfg(unix)]
-#[test]
-fn quiet_sets_up_the_chosen_distros_and_records_those_set_up() {
+fn wsl_stand_in(root: &Path) -> (String, PathBuf) {
     use std::os::unix::fs::PermissionsExt as _;
     let executable = |path: &Path, text: &str| {
         std::fs::write(path, text).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     };
-    let root = tempfile::tempdir().unwrap();
-    let install_dir = root.path().join("Programs").join("FactorSeal");
-    let log = root.path().join("setup.log");
-    let _cleanup = RegistryCleanup(root.path().to_owned());
-    let (with, bare) = (root.path().join("bin"), root.path().join("bare"));
+    let (with, bare) = (root.join("bin"), root.join("bare"));
     std::fs::create_dir_all(&with).unwrap();
     std::fs::create_dir_all(&bare).unwrap();
-    let calls = root.path().join("calls");
+    let calls = root.join("calls");
     executable(
         &with.join("factorseal"),
         &format!(
@@ -217,7 +229,7 @@ fn quiet_sets_up_the_chosen_distros_and_records_those_set_up() {
             "#!/bin/sh\n[ \"$1\" = -u ] || exit 2\nprintf '/mnt/c%s\\n' \"$2\"\n",
         );
     }
-    let stand_in = root.path().join("wsl.exe");
+    let stand_in = root.join("wsl.exe");
     executable(
         &stand_in,
         &format!(
@@ -229,6 +241,21 @@ fn quiet_sets_up_the_chosen_distros_and_records_those_set_up() {
         ),
     );
     let stand_in = stand_in.to_string_lossy().into_owned();
+    (stand_in, calls)
+}
+
+/// Unix: the installer's own lines, run by a real `sh` through a stand-in
+/// for `wsl.exe` whose distro `Bare` has no `factorseal`: the distro with
+/// it is set up and recorded, `Bare` gets the hint, and the run says so
+/// through exit code 8, with the install kept.
+#[cfg(unix)]
+#[test]
+fn quiet_sets_up_the_chosen_distros_and_records_those_set_up() {
+    let root = tempfile::tempdir().unwrap();
+    let install_dir = root.path().join("Programs").join("FactorSeal");
+    let log = root.path().join("setup.log");
+    let _cleanup = RegistryCleanup(root.path().to_owned());
+    let (stand_in, calls) = wsl_stand_in(root.path());
 
     let manifest = wsl_release(root.path(), "1.0.0");
     let extra = [
@@ -456,7 +483,7 @@ fn an_update_run_from_inside_the_install_folder_succeeds_through_the_relaunch() 
     let second = wsl_release(root.path(), "2.0.0");
     let run = setup_in(
         &installed_setup,
-        &second,
+        Some(&second),
         &install_dir,
         &log,
         &["--no-wsl"],
@@ -511,4 +538,242 @@ fn an_update_run_from_inside_the_install_folder_succeeds_through_the_relaunch() 
         "no relaunched copy in {}",
         temp.display()
     );
+}
+
+const MOZILLA: &str = r"HKCU\Software\Mozilla\NativeMessagingHosts\dev.factorseal.browser";
+#[cfg(windows)]
+use factorseal_setup::manifest::UNINSTALL_KEY;
+const NOTE: &str = "The vault stays; factorseal.exe destroy removes it.";
+
+/// A release with a shortcut, a registry value and an uninstall section.
+fn full_release(root: &Path, version: &str) -> PathBuf {
+    let manifest = release_with_steps(
+        root,
+        version,
+        1,
+        &json!([
+            { "install_files": {} },
+            { "shortcut": {
+                "name": "FactorSeal Desktop",
+                "target": "factorseal-desktop.exe",
+                "places": ["start-menu"],
+                "optional_places": ["desktop"],
+            } },
+            { "registry": { "values": [{ "key": MOZILLA, "name": "", "value": "host.json" }] } },
+        ]),
+    );
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+    json["uninstall"] = json!({
+        "registry_cleanup": [r"HKCU\Software\Microsoft\Edge\NativeMessagingHosts\dev.factorseal.browser"],
+        "ask_to_delete": [r"%APPDATA%\Factorseal\settings"],
+        "keep_note": NOTE,
+    });
+    std::fs::write(&manifest, json.to_string()).unwrap();
+    manifest
+}
+
+/// The `.lnk` files under the sandbox's shortcut folders.
+fn links(sandbox: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![sandbox.join("shortcuts")];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|extension| extension == "lnk") {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// Windows: a string value under the sandbox's test registry key.
+#[cfg(windows)]
+fn test_value(sandbox: &Path, key: &str, name: &str) -> Option<String> {
+    use factorseal_setup::registry::{Registry as _, Root, SystemRegistry};
+    SystemRegistry {
+        root: Root::Test(registry_root(sandbox)),
+    }
+    .get_string(key, name)
+    .unwrap()
+}
+
+#[test]
+fn quiet_uninstall_removes_what_the_install_made_and_keeps_the_vault() {
+    let root = tempfile::tempdir().unwrap();
+    let install_dir = root.path().join("Programs").join("FactorSeal");
+    let log = root.path().join("setup.log");
+    let _cleanup = RegistryCleanup(root.path().to_owned());
+    let settings = root.path().join("appdata/Roaming/Factorseal/settings");
+    let vault = root.path().join("appdata/Local/Factorseal/Factorseal/data");
+    for folder in [&settings, &vault] {
+        std::fs::create_dir_all(folder).unwrap();
+        std::fs::write(folder.join("file"), b"data").unwrap();
+    }
+    let manifest = full_release(root.path(), "1.0.0");
+    let extra = ["--no-start", "--optional-place", "desktop"];
+    let run = setup(Path::new(SETUP), &manifest, &install_dir, &log, &extra);
+    assert_eq!(run.code, Some(0), "{}", run.log);
+    assert_eq!(links(root.path()).len(), 2);
+    #[cfg(windows)]
+    {
+        assert!(test_value(root.path(), MOZILLA, "").is_some());
+        assert!(test_value(root.path(), UNINSTALL_KEY, "DisplayName").is_some());
+    }
+
+    // While the CLI runs from the folder, nothing is removed.
+    let cli = run_installed(&install_dir, "factorseal.exe");
+    let extra = ["--also-delete", "--wait-for-quit", "1"];
+    let run = uninstall(Path::new(SETUP), &install_dir, &log, &extra);
+    assert_eq!(run.code, Some(7), "{}", run.log);
+    assert_eq!(installed_version(&install_dir).as_deref(), Some("1.0.0"));
+    assert_eq!(links(root.path()).len(), 2);
+    assert!(settings.exists());
+    drop(cli);
+
+    let run = uninstall(Path::new(SETUP), &install_dir, &log, &["--also-delete"]);
+    assert_eq!(run.code, Some(0), "{}", run.log);
+    assert!(
+        run.log
+            .contains("result: uninstalled FactorSeal 1.0.0 from"),
+        "{}",
+        run.log
+    );
+    assert!(run.log.contains(NOTE), "{}", run.log);
+    assert!(!install_dir.exists(), "{}", run.log);
+    assert_eq!(links(root.path()), Vec::<PathBuf>::new());
+    assert!(!settings.exists());
+    assert!(vault.join("file").exists());
+    #[cfg(windows)]
+    {
+        assert_eq!(test_value(root.path(), MOZILLA, ""), None);
+        assert_eq!(test_value(root.path(), UNINSTALL_KEY, "DisplayName"), None);
+    }
+
+    // Nothing left to uninstall.
+    let run = uninstall(Path::new(SETUP), &install_dir, &log, &[]);
+    assert_eq!(run.code, Some(9), "{}", run.log);
+    assert!(run.log.contains("is not installed in"), "{}", run.log);
+}
+
+/// Unix: an install recorded in a distro needs a choice about it, naming
+/// only recorded distros; the chosen one gets the removal line.
+#[cfg(unix)]
+#[test]
+fn quiet_uninstall_removes_the_wsl_setup_from_the_chosen_recorded_distros() {
+    let root = tempfile::tempdir().unwrap();
+    let install_dir = root.path().join("Programs").join("FactorSeal");
+    let log = root.path().join("setup.log");
+    let _cleanup = RegistryCleanup(root.path().to_owned());
+    let (stand_in, calls) = wsl_stand_in(root.path());
+    let manifest = wsl_release(root.path(), "1.0.0");
+    let run = setup(
+        Path::new(SETUP),
+        &manifest,
+        &install_dir,
+        &log,
+        &["--wsl", "NixOS", "--wsl-program", &stand_in],
+    );
+    assert_eq!(run.code, Some(0), "{}", run.log);
+
+    let program = ["--wsl-program", stand_in.as_str()];
+    let run = uninstall(Path::new(SETUP), &install_dir, &log, &program);
+    assert_eq!(run.code, Some(2), "{}", run.log);
+    assert!(run.log.contains("was set up in WSL (NixOS)"), "{}", run.log);
+    let run = uninstall(
+        Path::new(SETUP),
+        &install_dir,
+        &log,
+        &[&program[..], &["--wsl", "Ubuntu"]].concat(),
+    );
+    assert_eq!(run.code, Some(2), "{}", run.log);
+    assert!(
+        run.log.contains("not set up in WSL distro Ubuntu"),
+        "{}",
+        run.log
+    );
+    assert_eq!(installed_version(&install_dir).as_deref(), Some("1.0.0"));
+
+    let run = uninstall(
+        Path::new(SETUP),
+        &install_dir,
+        &log,
+        &[&program[..], &["--wsl", "nixos"]].concat(),
+    );
+    assert_eq!(run.code, Some(0), "{}", run.log);
+    assert!(!install_dir.exists());
+    let calls = std::fs::read_to_string(&calls).unwrap();
+    assert_eq!(
+        calls.lines().last(),
+        Some("NixOS wsl-setup --remove"),
+        "{calls}"
+    );
+}
+
+/// Windows: the installed copy, run with --uninstall from the install
+/// folder (as Installed apps runs it), continues from a copy in the
+/// temporary folder, which removes the folder with the installed copy in
+/// it and then deletes itself.
+#[cfg(windows)]
+#[test]
+fn an_uninstall_run_from_the_install_folder_removes_it_and_the_copy_deletes_itself() {
+    let root = tempfile::tempdir().unwrap();
+    let install_dir = root.path().join("Programs").join("FactorSeal");
+    let temp = root.path().join("temp");
+    std::fs::create_dir_all(&temp).unwrap();
+    let log = temp.join("setup.log");
+    let _cleanup = RegistryCleanup(temp.clone());
+    let manifest = full_release(root.path(), "1.0.0");
+    let run = setup(
+        Path::new(SETUP),
+        &manifest,
+        &install_dir,
+        &log,
+        &["--no-start"],
+    );
+    assert_eq!(run.code, Some(0), "{}", run.log);
+
+    let run = setup_in(
+        &install_dir.join("factorseal-setup.exe"),
+        None,
+        &install_dir,
+        &log,
+        &[],
+        &install_dir,
+    );
+    assert_eq!(run.code, Some(0), "{}", run.log);
+    assert!(run.log.contains("continuing from"), "{}", run.log);
+    let copies = || -> Vec<String> {
+        std::fs::read_dir(&temp)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("factorseal-setup-"))
+            .collect()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        let ended = ["result: uninstalled", "result: failed", "result: refused"]
+            .iter()
+            .any(|result| text.contains(result));
+        if ended && copies().is_empty() {
+            assert!(
+                text.contains("result: uninstalled FactorSeal 1.0.0"),
+                "{text}"
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "copies left: {:?}\n{text}",
+            copies()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    assert!(!install_dir.exists());
+    assert_eq!(test_value(&temp, UNINSTALL_KEY, "DisplayName"), None);
 }

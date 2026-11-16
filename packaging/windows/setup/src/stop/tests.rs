@@ -593,3 +593,17 @@ fn the_command_runner_reports_the_exit_and_a_timeout() {
     assert!(slow.contains("didn't return"), "{slow}");
     assert!(started.elapsed() < Duration::from_secs(10));
 }
+
+#[test]
+fn the_uninstall_plan_uses_only_what_the_record_says() {
+    let setup = Setup::new();
+    let Existing::Recorded(record) = recorded(Some(quit_stop(&[BROWSER_HOST, "../x.exe"]))) else {
+        unreachable!();
+    };
+    let plan = StopPlan::for_uninstall(&setup.install_dir(), &record);
+    assert_eq!(
+        plan.command,
+        Some(vec![DESKTOP.to_owned(), "--quit".to_owned()])
+    );
+    assert_eq!(plan.also_stop, [BROWSER_HOST]);
+}

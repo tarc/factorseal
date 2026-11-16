@@ -74,7 +74,9 @@ impl World {
             setup_exe: self.path("setup.exe"),
             setup_version: "0.1.0".to_owned(),
             adopt: false,
-            shortcut_dirs: Vec::new(),
+            // As the installer passes them: the Start menu (Startup inside
+            // it) and the desktop.
+            shortcut_dirs: vec![self.path("start"), self.path("desktop")],
         }
     }
 

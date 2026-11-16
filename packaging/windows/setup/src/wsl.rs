@@ -160,6 +160,34 @@ fn set_up_one(
     Ok(())
 }
 
+/// Remove FactorSeal's setup from each of `distros` (uninstall), telling
+/// `say` what happens. Returns one line per distro where that failed.
+pub fn remove(distros: &[String], wsl: &mut dyn Wsl, say: &mut dyn FnMut(&str)) -> Vec<String> {
+    let mut problems = Vec::new();
+    for distro in distros {
+        say(&format!(
+            "removing FactorSeal's setup from WSL distro {distro}"
+        ));
+        let why = match wsl.run(distro, Line::Remove, &[]) {
+            Ok(output) if output.success => {
+                for line in output.stdout.lines().filter(|line| !line.trim().is_empty()) {
+                    say(&format!("{distro}: {}", line.trim()));
+                }
+                continue;
+            }
+            Ok(output) => detail(&output),
+            Err(error) => error,
+        };
+        let problem = format!(
+            "removing FactorSeal's setup from WSL distro {distro} failed: {why}; run \
+             `factorseal wsl-setup --remove` in it"
+        );
+        say(&problem);
+        problems.push(problem);
+    }
+    problems
+}
+
 /// What [`Line::Probe`] found.
 #[derive(Debug, PartialEq, Eq)]
 struct Probe {

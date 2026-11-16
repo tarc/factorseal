@@ -160,7 +160,7 @@ fn remove_stuck(install_dir: &Path) {
 const RETRY_FOR: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Run `operation` until it succeeds or [`RETRY_FOR`] has passed.
-fn retrying(mut operation: impl FnMut() -> std::io::Result<()>) -> std::io::Result<()> {
+pub(crate) fn retrying(mut operation: impl FnMut() -> std::io::Result<()>) -> std::io::Result<()> {
     let deadline = std::time::Instant::now() + RETRY_FOR;
     loop {
         match operation() {
@@ -303,7 +303,17 @@ fn install_files_with(
     })?;
     let (old_shortcuts, carried) = match &existing {
         Existing::Fresh => (Vec::new(), None),
-        Existing::Recorded(record) => (record.shortcuts.clone(), Some(&**record)),
+        // A recorded path that isn't a shortcut in the shortcut folders is
+        // neither removed nor kept in the record.
+        Existing::Recorded(record) => (
+            record
+                .shortcuts
+                .iter()
+                .filter(|path| in_shortcut_folders(path, &options.shortcut_dirs))
+                .cloned()
+                .collect(),
+            Some(&**record),
+        ),
         Existing::HandMade if !options.adopt => {
             return Err(InstallError::NeedsAdoption(install_dir.clone()));
         }
@@ -454,6 +464,32 @@ fn copy_hashing(from: &Path, to: &Path) -> std::io::Result<String> {
     }
     target.sync_all()?;
     Ok(to_hex(&hasher.finalize()))
+}
+
+/// Whether `path` may be removed as one of the installer's shortcuts: a
+/// `.lnk` file below one of `dirs`, reached without `..`, compared without
+/// regard to case as Windows does. The record listing the shortcuts sits
+/// in the user's folder, so its paths are checked before any is deleted.
+#[must_use]
+pub fn in_shortcut_folders(path: &Path, dirs: &[PathBuf]) -> bool {
+    use std::path::Component;
+    let parts = |path: &Path| -> Option<Vec<String>> {
+        path.components()
+            .map(|component| match component {
+                Component::ParentDir | Component::CurDir => None,
+                other => Some(other.as_os_str().to_string_lossy().to_lowercase()),
+            })
+            .collect()
+    };
+    let link = path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("lnk"));
+    let Some(path) = parts(path).filter(|_| link) else {
+        return false;
+    };
+    dirs.iter()
+        .filter_map(|dir| parts(dir))
+        .any(|dir| path.len() > dir.len() && path[..dir.len()] == dir[..])
 }
 
 /// The shortcuts (`.lnk`) under `dirs` that point at `target`. A shortcut

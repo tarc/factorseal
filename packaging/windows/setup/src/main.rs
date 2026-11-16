@@ -13,6 +13,7 @@ use factorseal_setup::record::{Existing, InstallRecord};
 use factorseal_setup::registry::Registry;
 use factorseal_setup::steps::{self, Launch, Places, StepOptions};
 use factorseal_setup::stop::{self, CommandRunner, StopPlan, Stopped, SystemProcesses, Waits};
+use factorseal_setup::uninstall::{self, Choices, Folders, System};
 use factorseal_setup::wsl::{self, SystemWsl};
 
 /// Exit codes of `--quiet`; the log says more.
@@ -25,6 +26,7 @@ mod exit {
     pub const NEEDS_ADOPTION: u8 = 6;
     pub const STILL_RUNNING: u8 = 7;
     pub const WSL_INCOMPLETE: u8 = 8;
+    pub const NOT_INSTALLED: u8 = 9;
 }
 
 /// The name a relaunched copy gets in the temporary folder.
@@ -35,19 +37,30 @@ const RELAUNCH_PREFIX: &str = "factorseal-setup-";
 #[command(
     name = "factorseal-setup",
     version,
-    about = "Install or update FactorSeal for this Windows user",
-    after_help = "With --quiet, the exit code is 0 when installed, 2 for a usage error, 3 when \
-                  the release is refused, 4 when it needs a newer installer, 5 when installing \
-                  failed (the previous install is kept), 6 when a hand-made install needs \
-                  --adopt, 7 when FactorSeal still runs (nothing changed), 8 when installed but \
-                  WSL setup failed in a distro. Run from inside the install folder, it continues \
-                  from a copy in the temporary folder and exits 0 at once; the log has the \
-                  result."
+    about = "Install, update or uninstall FactorSeal for this Windows user",
+    after_help = "With --quiet, the exit code is 0 when installed (or uninstalled), 2 for a \
+                  usage error, 3 when the release is refused, 4 when it needs a newer installer, \
+                  5 when installing failed (the previous install is kept) or uninstalling \
+                  failed (the log says what is left), 6 when a hand-made install needs --adopt, \
+                  7 when FactorSeal still runs (nothing changed), 8 when WSL setup or its \
+                  removal failed in a distro (the rest was done), 9 when there is no install to \
+                  uninstall. Run from inside the install folder, it continues from a copy in \
+                  the temporary folder and exits 0 at once; the log has the result."
 )]
 struct Args {
     /// The release to install: its factorseal-release.json.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", conflicts_with = "uninstall")]
     manifest: Option<PathBuf>,
+
+    /// Uninstall FactorSeal: what the installer recorded goes, the vault
+    /// stays.
+    #[arg(long)]
+    uninstall: bool,
+
+    /// With --uninstall: also delete the folders the release lists for it
+    /// (its settings; never the vault).
+    #[arg(long, requires = "uninstall")]
+    also_delete: bool,
 
     /// Where FactorSeal is installed. Defaults to %LOCALAPPDATA%\Programs\FactorSeal.
     #[arg(long, value_name = "DIR")]
@@ -81,9 +94,10 @@ struct Args {
     #[arg(long, value_name = "SECONDS", default_value_t = 300)]
     wait_for_quit: u64,
 
-    /// Set FactorSeal up in this WSL distro (repeat for more). Checking a
-    /// distro starts it. With --quiet, a release that sets up WSL needs
-    /// --wsl or --no-wsl.
+    /// Set FactorSeal up in this WSL distro (repeat for more); with
+    /// --uninstall, remove its setup from this recorded distro. Either
+    /// starts the distro. With --quiet, a release that sets up WSL, or an
+    /// uninstall of one that did, needs --wsl or --no-wsl.
     #[arg(long = "wsl", value_name = "DISTRO", value_parser = distro_name)]
     wsl: Vec<String>,
 
@@ -112,6 +126,11 @@ struct Args {
     /// For tests: run this instead of wsl.exe.
     #[arg(long, hide = true, value_name = "PATH")]
     wsl_program: Option<PathBuf>,
+
+    /// For tests: %APPDATA% is this folder's Roaming, %LOCALAPPDATA% its
+    /// Local.
+    #[arg(long, hide = true, value_name = "DIR")]
+    appdata_root: Option<PathBuf>,
 }
 
 /// Whether the release has the `wsl` step.
@@ -142,10 +161,11 @@ fn run(args: &Args, log: &mut Log) -> u8 {
         log.line("the installer's dialogs are not built yet; run it with --quiet");
         return exit::USAGE;
     }
-    let Some(manifest) = args.manifest.as_deref().map(absolute) else {
-        log.line("--quiet needs --manifest");
+    let manifest = args.manifest.as_deref().map(absolute);
+    if manifest.is_none() && !args.uninstall {
+        log.line("--quiet needs --manifest or --uninstall");
         return exit::USAGE;
-    };
+    }
     let Some(install_dir) = args
         .install_dir
         .as_deref()
@@ -167,9 +187,16 @@ fn run(args: &Args, log: &mut Log) -> u8 {
     if cfg!(windows) && !args.relaunched && inside(&setup_exe, &install_dir) {
         // This executable can't be deleted with the old folder while it
         // runs; a copy elsewhere can finish the update after it exits.
-        return relaunch(&setup_exe, args, &manifest, &install_dir, log);
+        return relaunch(&setup_exe, args, manifest.as_deref(), &install_dir, log);
     }
     remove_old_relaunch_copies(&setup_exe);
+    let Some(manifest) = manifest else {
+        let code = uninstall(args, log, &install_dir);
+        if args.relaunched {
+            delete_later(&setup_exe, log);
+        }
+        return code;
+    };
 
     log.line(&format!("release: {}", manifest.display()));
     let release = match Release::open(&manifest) {
@@ -310,14 +337,7 @@ fn set_up_wsl(
     if !sets_up_wsl(release) || args.wsl.is_empty() {
         return 0;
     }
-    let mut system = SystemWsl {
-        program: args
-            .wsl_program
-            .as_deref()
-            .map_or_else(|| PathBuf::from("wsl.exe"), absolute),
-        working_dir: working_dir.to_owned(),
-        timeout: wsl::LINE_TIMEOUT,
-    };
+    let mut system = system_wsl(args, working_dir);
     let report = wsl::set_up(&args.wsl, install_dir, &mut system, &mut |line: &str| {
         log.line(line);
     });
@@ -364,7 +384,16 @@ fn stop_installed(
         log.line(&format!("result: failed: {error}"));
         return Err(exit::NEEDS_ADOPTION);
     }
-    let plan = StopPlan::new(install_dir, &existing, release);
+    stop_with(
+        args,
+        log,
+        &StopPlan::new(install_dir, &existing, release),
+        working_dir,
+    )
+}
+
+/// Stop what `plan` says, or fail with exit 7.
+fn stop_with(args: &Args, log: &mut Log, plan: &StopPlan, working_dir: &Path) -> Result<(), u8> {
     let waits = Waits {
         quit: std::time::Duration::from_secs(args.wait_for_quit),
         ..Waits::default()
@@ -373,7 +402,7 @@ fn stop_installed(
         working_dir: working_dir.to_owned(),
     };
     match stop::stop_running(
-        &plan,
+        plan,
         &mut SystemProcesses::default(),
         &mut runner,
         log,
@@ -389,6 +418,232 @@ fn stop_installed(
         }
     }
     Ok(())
+}
+
+/// Uninstall the install in `install_dir`: stop it the way it recorded,
+/// remove its setup from the chosen distros, then everything recorded.
+fn uninstall(args: &Args, log: &mut Log, install_dir: &Path) -> u8 {
+    log.line(&format!(
+        "uninstalling FactorSeal from {}",
+        install_dir.display()
+    ));
+    let record = match recorded_install(log, install_dir) {
+        Ok(record) => record,
+        Err(code) => return code,
+    };
+    if let Err(code) = check_distro_choice(args, log, &record) {
+        return code;
+    }
+    let (Some(places), Some(folders)) = (
+        places(args.shortcut_root.as_deref()),
+        folders(args.appdata_root.as_deref()),
+    ) else {
+        log.line("result: failed: cannot find the Start menu, Desktop or AppData folders");
+        return exit::INSTALL_FAILED;
+    };
+    let working_dir = args
+        .working_dir
+        .as_deref()
+        .map_or_else(working_dir, absolute);
+    if let Err(code) = stop_with(
+        args,
+        log,
+        &StopPlan::for_uninstall(install_dir, &record),
+        &working_dir,
+    ) {
+        return code;
+    }
+
+    let registry = registry(args.registry_root.as_deref());
+    let mut wsl = system_wsl(args, &working_dir);
+    let shortcut_dirs = [places.start_menu, places.desktop];
+    let choices = Choices {
+        distros: args.wsl.clone(),
+        delete_listed: args.also_delete,
+    };
+    let result = uninstall::uninstall(
+        install_dir,
+        &record,
+        &choices,
+        &mut System {
+            registry: registry.as_ref(),
+            wsl: &mut wsl,
+            shortcut_dirs: &shortcut_dirs,
+            folders: &folders,
+        },
+        &mut |line: &str| log.line(line),
+    );
+    report_uninstall(log, &result, &record, install_dir)
+}
+
+/// The record of the install in `install_dir`, after recovering an
+/// interrupted run; or the exit code when there is none to undo.
+fn recorded_install(log: &mut Log, install_dir: &Path) -> Result<InstallRecord, u8> {
+    if let Err(error) = engine::recover(install_dir) {
+        log.line(&format!("result: failed: {error}"));
+        return Err(exit::INSTALL_FAILED);
+    }
+    match Existing::detect(install_dir) {
+        Ok(Existing::Recorded(record)) => Ok(*record),
+        Ok(Existing::HandMade) => {
+            log.line(&format!(
+                "result: refused: FactorSeal in {} was installed by hand, without a record to \
+                 undo; delete that folder as its UNINSTALL.txt says",
+                install_dir.display()
+            ));
+            Err(exit::NOT_INSTALLED)
+        }
+        Ok(Existing::Fresh) => {
+            log.line(&format!(
+                "result: refused: FactorSeal is not installed in {}",
+                install_dir.display()
+            ));
+            Err(exit::NOT_INSTALLED)
+        }
+        Err(error) => {
+            let error = InstallError::Record {
+                path: InstallRecord::path(install_dir),
+                source: error,
+            };
+            log.line(&format!("result: failed: {error}"));
+            Err(exit::INSTALL_FAILED)
+        }
+    }
+}
+
+/// Under `--quiet`, a choice about each recorded distro, naming only
+/// recorded ones.
+fn check_distro_choice(args: &Args, log: &mut Log, record: &InstallRecord) -> Result<(), u8> {
+    if !record.distros.is_empty() && args.wsl.is_empty() && !args.no_wsl {
+        log.line(&format!(
+            "result: refused: FactorSeal was set up in WSL ({}); pass --wsl DISTRO for each \
+             distro to remove that setup from, or --no-wsl",
+            record.distros.join(", ")
+        ));
+        return Err(exit::USAGE);
+    }
+    if let Some(unknown) = args.wsl.iter().find(|distro| {
+        !record
+            .distros
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(distro))
+    }) {
+        log.line(&format!(
+            "result: refused: FactorSeal was not set up in WSL distro {unknown} (it was in: {})",
+            if record.distros.is_empty() {
+                "none".to_owned()
+            } else {
+                record.distros.join(", ")
+            }
+        ));
+        return Err(exit::USAGE);
+    }
+    Ok(())
+}
+
+/// Log how the uninstall ended; its exit code.
+fn report_uninstall(
+    log: &mut Log,
+    result: &Result<uninstall::Report, uninstall::UninstallError>,
+    record: &InstallRecord,
+    install_dir: &Path,
+) -> u8 {
+    let done = format!(
+        "result: uninstalled FactorSeal {} from {}",
+        record.version,
+        install_dir.display()
+    );
+    match result {
+        Err(error) => {
+            log.line(&format!("result: failed: {error}"));
+            exit::INSTALL_FAILED
+        }
+        Ok(report) if !report.problems.is_empty() => {
+            for problem in &report.problems {
+                log.line(problem);
+            }
+            log.line(&format!(
+                "{done}, but {} thing(s) could not be removed; see above",
+                report.problems.len()
+            ));
+            exit::INSTALL_FAILED
+        }
+        Ok(report) if !report.wsl_problems.is_empty() => {
+            log.line(&format!(
+                "{done}, but its WSL setup is left in {} distro(s); see above",
+                report.wsl_problems.len()
+            ));
+            exit::WSL_INCOMPLETE
+        }
+        Ok(_) => {
+            log.line(&done);
+            exit::INSTALLED
+        }
+    }
+}
+
+/// `wsl.exe`, or the test's stand-in.
+fn system_wsl(args: &Args, working_dir: &Path) -> SystemWsl {
+    SystemWsl {
+        program: args
+            .wsl_program
+            .as_deref()
+            .map_or_else(|| PathBuf::from("wsl.exe"), absolute),
+        working_dir: working_dir.to_owned(),
+        timeout: wsl::LINE_TIMEOUT,
+    }
+}
+
+/// `%APPDATA%` and `%LOCALAPPDATA%`, or test folders under `root`.
+fn folders(root: Option<&Path>) -> Option<Folders> {
+    if let Some(root) = root {
+        let root = absolute(root);
+        return Some(Folders {
+            appdata: root.join("Roaming"),
+            local_appdata: root.join("Local"),
+        });
+    }
+    let dirs = directories::BaseDirs::new()?;
+    Some(Folders {
+        appdata: dirs.config_dir().to_owned(),
+        local_appdata: dirs.data_local_dir().to_owned(),
+    })
+}
+
+/// Windows: delete this relaunched copy once it has exited, through
+/// `cmd.exe`, which waits a moment and then deletes it. A path `cmd.exe`
+/// would read as more than a path (holding `"` or `%`) is left for the next
+/// run of the installer, which removes old copies.
+fn delete_later(exe: &Path, log: &mut Log) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let path = exe.to_string_lossy();
+        if path.contains(['"', '%']) {
+            return;
+        }
+        let system_root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+        let cmd = Path::new(&system_root).join("System32").join("cmd.exe");
+        let started = std::process::Command::new(cmd)
+            .raw_arg(format!(
+                "/d /c ping -n 3 127.0.0.1 >nul & del /f /q \"{path}\""
+            ))
+            .current_dir(std::env::temp_dir())
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        if let Err(error) = started {
+            log.line(&format!(
+                "could not arrange to delete {}: {error}",
+                exe.display()
+            ));
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (exe, log);
 }
 
 /// The registry: the user's (or a test key) on Windows; elsewhere, where
@@ -443,7 +698,7 @@ fn working_dir() -> PathBuf {
 fn relaunch(
     setup_exe: &Path,
     args: &Args,
-    manifest: &Path,
+    manifest: Option<&Path>,
     install_dir: &Path,
     log: &mut Log,
 ) -> u8 {
@@ -460,12 +715,17 @@ fn relaunch(
         .current_dir(std::env::temp_dir())
         .arg("--quiet")
         .arg("--relaunched")
-        .arg("--manifest")
-        .arg(manifest)
         .arg("--install-dir")
         .arg(install_dir)
         .arg("--log")
         .arg(&log.path);
+    match manifest {
+        Some(manifest) => command.arg("--manifest").arg(manifest),
+        None => command.arg("--uninstall"),
+    };
+    if args.also_delete {
+        command.arg("--also-delete");
+    }
     if args.adopt {
         command.arg("--adopt");
     }
@@ -483,6 +743,9 @@ fn relaunch(
     }
     if let Some(program) = &args.wsl_program {
         command.arg("--wsl-program").arg(absolute(program));
+    }
+    if let Some(root) = &args.appdata_root {
+        command.arg("--appdata-root").arg(absolute(root));
     }
     for place in &args.optional_places {
         if let Some(value) = clap::ValueEnum::to_possible_value(place) {
