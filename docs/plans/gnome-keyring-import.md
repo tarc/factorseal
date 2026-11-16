@@ -5,8 +5,8 @@ the implementation review acted on (fc49f02..3555cbd), the review of
 those fixes (cbada0a..d03d54a), a third review (bf0e7e6..b927d1b) and a
 fourth (after b927d1b); step 6 implemented (b3429f9, 6539cb5) and its
 review acted on (4cfeaa0..84ef1d7, see "Step 6 review"), then a review
-of those fixes (1b1ab6d..10439e5, "Step 6 fixes review"); steps 8 and 9
-remain. All reviews
+of those fixes (1b1ab6d..10439e5, "Step 6 fixes review") and a third
+round (ae8125f.., "Step 6 round 3 review"); steps 8 and 9 remain. All reviews
 are folded in (see "Review record" and "Implementation
 record" at the end). Branch: `feature/wsl2-keyring` (the WSL keyring this
 targets lives there). The Windows installer that hands off to it is planned
@@ -491,8 +491,12 @@ until the user has seen it in the native build.
      32 letters and digits.
    - Errors: exit 127 (no `factorseal`), "no Secret Service" or "no
      session bus" ("none can be started there"), "is FactorSeal itself"
-     ("already uses FactorSeal's keyring", F6-2), "unrecognized
-     subcommand" (a CLI too old), else the CLI's own lines (`factorseal:`
+     ("already uses FactorSeal's keyring", F6-2), "could not be started"
+     (the distro's Secret Service did not start, with FactorSeal's own
+     named as a possible reason, R3-1), "more than FactorSeal Desktop
+     reads" (too large to move from Desktop, with the file export and
+     Desktop's restore named, R3-2), "unrecognized subcommand" (a CLI too
+     old), else the CLI's own lines (`factorseal:`
      or `error:`), or the last three lines, of stderr, or of stdout when
      stderr is empty (where `wsl.exe` writes its UTF-16 messages). A login
      shell's output comes first and the CLI's error last (S6-6).
@@ -726,6 +730,10 @@ mutation, and the gate:
 | f73a05e | F6-3: keep the end of stderr |
 | 8cfd413 | F6-4: one frame limit shared by the CLI and Desktop |
 | 10439e5 | F6-2: Desktop names a distro on FactorSeal's keyring |
+| ae8125f | round 3 review R3-3: `write_frame` itself holds the limit, checked before encoding |
+| 9b0ff80 | R3-2: the CLI's refusal names the file export |
+| 36e67ec | R3-3: tests of the Windows runner's pipes and Desktop's frame cap |
+| (pending) | R3-1, R3-2: Desktop rows for a Secret Service that did not start and an export over the limit (uncommitted until the user's OK) |
 
 `fuzz/Cargo.lock` gained only the `md-5` entry; it already failed
 `cargo metadata --locked` at 4ed2d2d (missing `embed-resource`), which is
@@ -1051,8 +1059,9 @@ Desktop 196 passed, 1 ignored, and the WSL relay's 14.
   Fixed in 1b1ab6d with the reviewer's first option, the base64 check
   before decoding. The test repeats a 30,000-candidate window 20 times
   (22 MB): natively on Windows it took 4.9 s without the check and
-  fails; on Linux it passes either way (glibc's fresh zero pages), so
-  `build-windows.sh check` is where it guards the fix.
+  fails. That it passes on Linux either way was wrong: the round 3
+  reviewer saw it fail there too without the check (4.16 s, twice, on an
+  idle machine), so both platforms guard the fix.
 - **F6-2, low (ran): on a distro switched to FactorSeal's keyring, the
   export starts FactorSeal's own service and refuses it.** The start is
   kept (step 2 gives why); Desktop names the case instead of the generic
@@ -1078,6 +1087,55 @@ within the 3-minute limit), when the service can't be spawned, and with
 a broken service file for an owned name; the header bound (the longest
 valid header is 20 bytes); the old-CLI fallback in `compare`; S6-5's
 paging over mixed-case ids.
+
+### Step 6 round 3 review
+
+An independent review of 1b1ab6d..10439e5 (2026-11-16, at de87a4e),
+behaviour only, on private buses (the user's `Default.keyring` mtime
+equal before and after, checked again here). Its verdict: F6-1..F6-4
+resolved; three low findings. F6-1 held against inputs built to beat it,
+natively on Windows: F6-1's own 476 MB input in 1.74 s (82–110 s before),
+long base64 runs before a shared bad byte, alphabet-only bodies that
+fail to decode, one 512 MiB body, all 1.2–1.6 s. Every point and what
+became of it, so the review file was removed. Gate after the fixes:
+fmt, workspace clippy, lib 557 passed, 1 failed, 6 ignored
+(`libsecret_store_seal_lookup` times out, as on main), CLI 95 passed,
+Desktop 213 passed, 1 ignored; `scripts/test-keyring-import.sh` passes;
+natively on Windows, clippy, Desktop 199 passed, 1 ignored, and the WSL
+relay's 14.
+
+- **R3-1, low (ran): a distro whose Secret Service fails to start got the
+  generic row**, for example FactorSeal's own `wsl-keyring` before
+  `wsl-setup` (the CLI: "the Secret Service could not be started: …
+  ChildExited"). Desktop now gives it its own row, with the D-Bus error,
+  naming FactorSeal's keyring as a possible reason, since whose service
+  failed can't be told without reading service files (pending commit).
+  Its test failed before.
+- **R3-2, low (ran/read): the size refusal read as an unreadable answer,
+  came after Move's prompts, and named no command.** The CLI now names
+  `factorseal export-secret-service FILE` and the restore (9b0ff80), and
+  Desktop gives it its own row with the size, the command and where the
+  restore is (pending commit); the test failed before. The timing is
+  kept: the size is known only once values are read, and an inventory
+  of a locked keyring has no values, so Check can't warn ahead. The
+  reviewer's `--file` doesn't exist; the file is a positional argument.
+- **R3-3, low (ran): two fixes could be undone without a test failing.**
+  `write_frame` passing `usize::MAX`: ae8125f checks the size from padded
+  base64's length before encoding (a refused export no longer allocates
+  its encoding) and tests `write_frame` itself with one byte over the
+  limit, as zeroed memory never touched; the reviewer's mutation fails
+  it. Desktop's side: 36e67ec moves the runner's body into
+  `run_program` and runs it in a Windows-only test with `cmd.exe` typing
+  3000 warning lines and the CLI's error; reading stderr with
+  `read_capped` again fails it natively (in the Windows copy). A plain
+  test checks Desktop's stdout cap against the CLI's limit.
+
+**Checked and fine** (the reviewer's list): the gate at de87a4e, Linux
+and Windows; `read_tail` keeps the exact last 64 KiB for any read size
+and stays under 2 × 64 KiB + 8 KiB; a tail starting mid-line, or UTF-16
+of either parity, still gives the right row; the branch order in
+`failure()`; a frame at the limit fits Desktop's cap; the file export has
+no frame limit.
 
 ### Live check on poita
 
