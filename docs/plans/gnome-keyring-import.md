@@ -6,7 +6,8 @@ those fixes (cbada0a..d03d54a), a third review (bf0e7e6..b927d1b) and a
 fourth (after b927d1b); step 6 implemented (b3429f9, 6539cb5) and its
 review acted on (4cfeaa0..84ef1d7, see "Step 6 review"), then a review
 of those fixes (1b1ab6d..10439e5, "Step 6 fixes review") and a third
-round (ae8125f.., "Step 6 round 3 review"); steps 8 and 9 remain. All reviews
+round (ae8125f.., "Step 6 round 3 review"); step 8 done 2026-11-16 (the
+live check on Windows); step 9 remains. All reviews
 are folded in (see "Review record" and "Implementation
 record" at the end). Branch: `feature/wsl2-keyring` (the WSL keyring this
 targets lives there). The Windows installer that hands off to it is planned
@@ -562,6 +563,49 @@ until the user has seen it in the native build.
    `dbus-run-session`, or in the service file's `Exec` as
    `scripts/test-keyring-import.sh` does, or it opens the real
    `~/.local/share/keyrings` (step 6 review S6-1).
+
+   As implemented (2026-11-16):
+   - **The hook** (`factorseal-desktop/src/wsl_keyring_import.rs`): with
+     the feature, `FACTORSEAL_TEST_KEYRING_EXPORTER` names a program run
+     in place of `factorseal` in both scripts. It is pasted into the
+     script, so only an absolute path of letters, digits, `/`, `.`, `-`
+     and `_` is accepted (a test covers both scripts and the refusals).
+     The distro stays `sh`'s positional argument. Without the feature the
+     executable doesn't contain the variable's name (checked on Linux
+     debug builds, both ways), which is what the installer's release
+     check can test.
+   - **`build-windows.sh --test-hooks`** builds Desktop with the feature
+     (with `check`, also runs its tests with it). Its refusal to build
+     while FactorSeal runs now counts only processes started from the
+     copy's `target\`: the user's installed Desktop no longer has to quit.
+   - **`check.sh keyring-import`** seeds a password-protected throwaway
+     gnome-keyring in `/tmp/fsk-import` (three items tagged with the run,
+     so the test vault lacks them whatever earlier runs moved, the
+     integer and schema-less kinds among them, and a Wi-Fi item), writes
+     an exporter there that runs the Linux CLI under `dbus-run-session`
+     with gnome-keyring only D-Bus-activatable (its service file's `Exec`
+     sets `HOME`, `XDG_DATA_HOME` and a short `XDG_RUNTIME_DIR`) and gcr
+     3's prompter activatable beside it, runs its inventory once through
+     `wsl.exe`, and restarts the test Desktop with the variable. The
+     variable reaches Desktop through `WSLENV` with `/w` (WSL to Windows;
+     the first run used `/u`, which is the other direction, and Desktop
+     ran the distro's own CLI: it stopped at "cannot identify the Secret
+     Service", nothing read). The script now checks with `cmd.exe` that
+     the variable gets through before starting Desktop. It then follows
+     the exporter's log until a Check and a Move succeeded.
+   - **`check.sh keyring --imported`** serves the distro's keyring from
+     the test vault as `keyring` does and looks up two moved items with
+     `secret-tool`, each asked in the popup and granted. `drive.ps1
+     unlock` now follows Settings' "Back to your vault" when a seal left
+     Desktop on Settings (no password field there), which this run hit.
+   - **Seen natively** (2026-11-16, test vault, run 044050): Check, then
+     Move with gcr's unlock prompt, which WSLg showed in front of Desktop,
+     answered by the user; the row
+     read "Moved 3 items into FactorSeal. 1 item not moved: Wi-Fi (import
+     check) in login: a Wi-Fi password, not moved". `keyring --imported`
+     found both looked-up items after their popups; `check.sh keyring`
+     still passes. The user's `~/.local/share/keyrings` was untouched
+     (mtimes unchanged).
 9. **Docs**:
    - `usage.md`: WSL keyring section and native Linux (check, move, the
      private-bus recipe with its short runtime dir, delete a hand-made
@@ -628,8 +672,9 @@ until the user has seen it in the native build.
   `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus` (socket present),
   `DISPLAY=:0`, `WAYLAND_DISPLAY=wayland-0`; `factorseal` is on `PATH`
   without `-l` too. The inventory came framed, with nothing before the
-  frame. The gcr prompt itself is untested (the collection was
-  unlocked); step 8 covers it. The frame (step 4) covers what the login
+  frame. The gcr prompt, untested then (the collection was unlocked),
+  came up in WSLg in front of Desktop in step 8's live check, from a
+  `wsl.exe` started by Desktop. The frame (step 4) covers what the login
   shell prints.
 - **KWallet's Secret Service interface** should work the same way, but it is
   untested; the docs name only gnome-keyring.
