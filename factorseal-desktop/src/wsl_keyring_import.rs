@@ -26,7 +26,7 @@ const FRAME_END: &[u8] = b"FACTORSEAL-FRAME end";
 
 /// The most standard output kept: the largest frame body the CLI writes,
 /// with a MiB for its header and end lines and anything printed before it.
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 const MAX_STDOUT_BYTES: u64 = factorseal::vault::MAX_KEYRING_FRAME_BYTES as u64 + 1024 * 1024;
 
 /// The most standard error kept, from its end: only its lines for a
@@ -605,15 +605,33 @@ impl Wsl for SystemWsl {
         limit: Duration,
         cancel: &AtomicBool,
     ) -> Result<RunOutput, RunError> {
-        use std::io::Write as _;
-        use std::os::windows::process::CommandExt as _;
-        use std::process::{Command, Stdio};
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        run_program(
+            &crate::wsl_distros::system_exe(std::env::var_os("SystemRoot"), "wsl.exe"),
+            args,
+            stdin,
+            limit,
+            cancel,
+        )
+    }
+}
 
-        let mut child = Command::new(crate::wsl_distros::system_exe(
-            std::env::var_os("SystemRoot"),
-            "wsl.exe",
-        ))
+/// Run `program` as [`SystemWsl`] runs `wsl.exe`: pipes read on their own
+/// threads, standard output's head and standard error's tail kept, killed
+/// on the time limit or Cancel.
+#[cfg(windows)]
+fn run_program(
+    program: &std::ffi::OsStr,
+    args: &[String],
+    stdin: Option<&[u8]>,
+    limit: Duration,
+    cancel: &AtomicBool,
+) -> Result<RunOutput, RunError> {
+    use std::io::Write as _;
+    use std::os::windows::process::CommandExt as _;
+    use std::process::{Command, Stdio};
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let mut child = Command::new(program)
         .args(args)
         .stdin(if stdin.is_some() {
             Stdio::piped()
@@ -625,56 +643,55 @@ impl Wsl for SystemWsl {
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .map_err(|error| RunError::Start(error.to_string()))?;
-        // Written on its own thread, so a child that never reads can't
-        // hold this one up; closing the pipe ends the input.
-        let writer = child.stdin.take().zip(stdin).map(|(mut pipe, input)| {
-            let input = Zeroizing::new(input.to_vec());
-            std::thread::spawn(move || {
-                let _ = pipe.write_all(&input);
-            })
-        });
-        let stdout = child
-            .stdout
-            .take()
-            .map(|pipe| std::thread::spawn(move || read_capped(pipe, MAX_STDOUT_BYTES)));
-        let stderr = child
-            .stderr
-            .take()
-            .map(|pipe| std::thread::spawn(move || read_tail(pipe, MAX_STDERR_BYTES)));
-        let started = std::time::Instant::now();
-        let outcome = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break Ok(status.code()),
-                Ok(None) => {}
-                Err(error) => break Err(RunError::Start(error.to_string())),
-            }
-            if cancel.load(Ordering::SeqCst) {
-                break Err(RunError::Cancelled);
-            }
-            if started.elapsed() >= limit {
-                break Err(RunError::TimedOut);
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        };
-        if outcome.is_err() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        if let Some(writer) = writer {
-            let _ = writer.join();
-        }
-        let stdout = stdout
-            .and_then(|reader| reader.join().ok())
-            .unwrap_or_default();
-        let stderr = stderr
-            .and_then(|reader| reader.join().ok())
-            .unwrap_or_default();
-        Ok(RunOutput {
-            code: outcome?,
-            stdout,
-            stderr,
+    // Written on its own thread, so a child that never reads can't
+    // hold this one up; closing the pipe ends the input.
+    let writer = child.stdin.take().zip(stdin).map(|(mut pipe, input)| {
+        let input = Zeroizing::new(input.to_vec());
+        std::thread::spawn(move || {
+            let _ = pipe.write_all(&input);
         })
+    });
+    let stdout = child
+        .stdout
+        .take()
+        .map(|pipe| std::thread::spawn(move || read_capped(pipe, MAX_STDOUT_BYTES)));
+    let stderr = child
+        .stderr
+        .take()
+        .map(|pipe| std::thread::spawn(move || read_tail(pipe, MAX_STDERR_BYTES)));
+    let started = std::time::Instant::now();
+    let outcome = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status.code()),
+            Ok(None) => {}
+            Err(error) => break Err(RunError::Start(error.to_string())),
+        }
+        if cancel.load(Ordering::SeqCst) {
+            break Err(RunError::Cancelled);
+        }
+        if started.elapsed() >= limit {
+            break Err(RunError::TimedOut);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    if outcome.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
     }
+    if let Some(writer) = writer {
+        let _ = writer.join();
+    }
+    let stdout = stdout
+        .and_then(|reader| reader.join().ok())
+        .unwrap_or_default();
+    let stderr = stderr
+        .and_then(|reader| reader.join().ok())
+        .unwrap_or_default();
+    Ok(RunOutput {
+        code: outcome?,
+        stdout,
+        stderr,
+    })
 }
 
 #[cfg(test)]
@@ -816,6 +833,56 @@ mod tests {
             read_tail(std::io::Cursor::new(b"short".to_vec()), 64),
             b"short"
         );
+    }
+
+    /// Desktop reads at least the largest frame the CLI writes, with its
+    /// header and end lines.
+    #[test]
+    fn desktop_reads_the_largest_frame_the_cli_writes() {
+        let lines = "FACTORSEAL-FRAME v1 inventory 536870912\r\n\r\nFACTORSEAL-FRAME end\r\n";
+        assert!(
+            usize::try_from(MAX_STDOUT_BYTES).unwrap()
+                >= factorseal::vault::MAX_KEYRING_FRAME_BYTES + lines.len()
+        );
+    }
+
+    /// The runner keeps standard error's tail and standard output's head:
+    /// `cmd.exe` types a file of 3000 warning lines and the CLI's error.
+    #[cfg(windows)]
+    #[test]
+    fn the_runner_keeps_stderrs_tail_and_stdouts_head() {
+        use std::fmt::Write as _;
+        let mut text = String::new();
+        for line in 0..3000 {
+            let _ = writeln!(
+                text,
+                "warning: profile line {line} of a verbose login shell"
+            );
+        }
+        text.push_str("factorseal: no Secret Service on the session bus\n");
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("output.txt");
+        std::fs::write(&file, &text).unwrap();
+        let cmd = crate::wsl_distros::system_exe(std::env::var_os("SystemRoot"), "cmd.exe");
+        let run = |redirect: &str| {
+            let mut args = vec!["/c".to_owned(), "type".to_owned()];
+            args.push(file.to_str().unwrap().to_owned());
+            args.extend((!redirect.is_empty()).then(|| redirect.to_owned()));
+            run_program(
+                &cmd,
+                &args,
+                None,
+                Duration::from_secs(60),
+                &AtomicBool::new(false),
+            )
+            .unwrap()
+        };
+        let to_stderr = run("1>&2");
+        assert!(to_stderr.stderr.len() <= MAX_STDERR_BYTES);
+        assert!(text.as_bytes().ends_with(&to_stderr.stderr));
+        assert!(failure("NixOS", &to_stderr).starts_with("No Secret Service runs on NixOS"));
+        let to_stdout = run("");
+        assert_eq!(to_stdout.stdout, text.as_bytes());
     }
 
     #[test]
