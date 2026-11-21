@@ -1,8 +1,9 @@
 //! One Desktop per vault root. The first launch holds a lock file and
 //! watches an activation file beside it; a later launch writes its request
-//! there and exits. Requests are one line: `open`, `open <page>` or `quit`.
-//! Desktops built before `open <page>` and `quit` treat any write as
-//! `open`, so an older Desktop asked to quit only comes forward.
+//! there and exits. Requests are one line: `open`, `open <page>`, `attention`
+//! or `quit`. Desktops built before `open <page>`, `attention` and `quit`
+//! treat any write as `open`, so an older Desktop asked to quit or for
+//! attention only comes forward.
 
 use std::collections::hash_map::DefaultHasher;
 use std::fs::{File, OpenOptions};
@@ -43,6 +44,9 @@ impl Page {
 pub(crate) enum Request {
     /// Come forward, on this page if one is named.
     Open(Option<Page>),
+    /// Ask for attention without taking the screen: the window opens
+    /// minimized and its taskbar button flashes until the person clicks it.
+    Attention,
     /// Seal and quit, as the tray's Quit does.
     Quit,
 }
@@ -52,6 +56,7 @@ impl Request {
         match self {
             Self::Open(None) => "open\n".to_owned(),
             Self::Open(Some(page)) => format!("open {}\n", page.name()),
+            Self::Attention => "attention\n".to_owned(),
             Self::Quit => "quit\n".to_owned(),
         }
     }
@@ -64,6 +69,7 @@ impl Request {
         let line = line.trim_end_matches('\r');
         Some(match line.split_once(' ') {
             None if line == "quit" => Self::Quit,
+            None if line == "attention" => Self::Attention,
             Some(("open", page)) => Self::Open(Page::from_name(page)),
             _ => Self::Open(None),
         })
@@ -280,10 +286,16 @@ mod tests {
         for request in [
             Request::Open(None),
             Request::Open(Some(Page::WslKeyrings)),
+            Request::Attention,
             Request::Quit,
         ] {
             assert_eq!(Request::decode(&request.encode()), Some(request));
         }
+        assert_eq!(Request::decode("attention\r\n"), Some(Request::Attention));
+        assert_eq!(
+            Request::decode("attention please\n"),
+            Some(Request::Open(None))
+        );
         // What every Desktop so far writes, also with Windows line ends.
         assert_eq!(Request::decode("open\r\n"), Some(Request::Open(None)));
         // From a newer Desktop: still a request to come forward.

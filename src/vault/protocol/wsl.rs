@@ -245,13 +245,21 @@ pub struct RelayOptions {
     /// the vault by itself (the WSL keyring host's monitor) rather than for
     /// a person waiting on an answer.
     pub no_desktop: bool,
+    /// `--attention`: ask Desktop for attention (its taskbar button flashes,
+    /// the window opens minimized) instead of bringing its window forward,
+    /// for requests no person may be waiting on, such as a keyring unlock a
+    /// background tool asks for. `--no-desktop` wins over it.
+    pub attention: bool,
 }
 
-/// Parse the options after `relay`: `--root <WINDOWS_ROOT>` and
-/// `--no-desktop`, each at most once, in any order.
+/// Parse the options after `relay`: `--root <WINDOWS_ROOT>`, `--no-desktop`
+/// and `--attention`, each at most once, in any order.
 pub fn parse_relay_options(mut options: impl Iterator<Item = String>) -> VaultResult<RelayOptions> {
-    let invalid =
-        || VaultError::Protocol("usage: relay [--root <WINDOWS_ROOT>] [--no-desktop]".to_owned());
+    let invalid = || {
+        VaultError::Protocol(
+            "usage: relay [--root <WINDOWS_ROOT>] [--no-desktop] [--attention]".to_owned(),
+        )
+    };
     let mut parsed = RelayOptions::default();
     while let Some(option) = options.next() {
         match option.as_str() {
@@ -261,6 +269,7 @@ pub fn parse_relay_options(mut options: impl Iterator<Item = String>) -> VaultRe
                 parsed.root = Some(root);
             }
             "--no-desktop" if !parsed.no_desktop => parsed.no_desktop = true,
+            "--attention" if !parsed.attention => parsed.attention = true,
             _ => return Err(invalid()),
         }
     }
@@ -336,6 +345,8 @@ pub struct BrokerVaultClient {
     windows_root: Option<String>,
     /// The broker never brings Desktop forward (`relay --no-desktop`).
     no_desktop: bool,
+    /// The broker only asks Desktop for attention (`relay --attention`).
+    attention: bool,
     relay: std::sync::Mutex<Option<Relay>>,
 }
 
@@ -379,6 +390,7 @@ impl BrokerVaultClient {
             distro,
             windows_root: None,
             no_desktop: false,
+            attention: false,
             relay: std::sync::Mutex::new(None),
         })
     }
@@ -403,6 +415,15 @@ impl BrokerVaultClient {
         self
     }
 
+    /// When the vault is sealed or not running, ask Desktop for attention
+    /// instead of bringing its window forward: for requests no person may be
+    /// waiting on, such as a keyring unlock a background tool asks for.
+    #[must_use]
+    pub fn with_desktop_attention(mut self) -> Self {
+        self.attention = true;
+        self
+    }
+
     fn start(&self) -> VaultResult<Relay> {
         use std::process::{Command, Stdio};
         let mut child = Command::new(&self.broker)
@@ -413,6 +434,7 @@ impl BrokerVaultClient {
                     .flat_map(|root| ["--root", root.as_str()]),
             )
             .args(self.no_desktop.then_some("--no-desktop"))
+            .args(self.attention.then_some("--attention"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -807,6 +829,31 @@ mod tests {
         assert!(matches!(response.result, Ok(VaultResponseBody::Stored)));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_client_asking_for_attention_starts_its_broker_with_attention() {
+        use super::super::wire::{
+            RequestId, VaultClient as _, VaultRequest, VaultResponse, VaultResponseBody,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let template =
+            VaultResponse::success(RequestId::from_bytes([0; 16]), VaultResponseBody::Stored)
+                .encode()
+                .unwrap();
+        let broker = fake_broker_expecting(
+            directory.path(),
+            template.as_ref(),
+            &["pipe", "NixOS", "relay", "--attention"],
+        );
+        let client = BrokerVaultClient::new(broker, "pipe".to_owned(), "NixOS".to_owned())
+            .unwrap()
+            .with_desktop_attention();
+        let response = client
+            .request(&VaultRequest::new(VaultAction::Status).unwrap())
+            .unwrap();
+        assert!(matches!(response.result, Ok(VaultResponseBody::Stored)));
+    }
+
     #[test]
     fn the_relay_takes_a_vault_root_and_no_desktop() {
         let parse = |options: &[&str]| {
@@ -818,6 +865,7 @@ mod tests {
             RelayOptions {
                 root: Some(r"C:\vault".to_owned()),
                 no_desktop: false,
+                attention: false,
             }
         );
         for options in [
@@ -829,10 +877,24 @@ mod tests {
                 RelayOptions {
                     root: Some(r"C:\vault".to_owned()),
                     no_desktop: true,
+                    attention: false,
                 }
             );
         }
         assert!(parse(&["--no-desktop"]).unwrap().no_desktop);
+        for options in [
+            &["--attention", "--root", r"C:\vault"][..],
+            &["--root", r"C:\vault", "--attention"],
+        ] {
+            assert_eq!(
+                parse(options).unwrap(),
+                RelayOptions {
+                    root: Some(r"C:\vault".to_owned()),
+                    no_desktop: false,
+                    attention: true,
+                }
+            );
+        }
         for invalid in [
             &["--root"][..],
             &["--root", ""],
@@ -840,6 +902,7 @@ mod tests {
             &["--root", "a", "b"],
             &["--root", "a", "--root", "b"],
             &["--no-desktop", "--no-desktop"],
+            &["--attention", "--attention"],
             &["--other", "a"],
         ] {
             assert!(parse(invalid).is_err(), "{invalid:?}");
@@ -1018,9 +1081,11 @@ mod tests {
             ]),
         };
         let frames: Vec<_> = (0..3).map(|_| encoded(VaultAction::Status).1).collect();
+        // `--no-desktop` wins over `--attention`.
         let options = RelayOptions {
             root: None,
             no_desktop: true,
+            attention: true,
         };
         let (responses, opened) = served_with(&vault, &options, &frames);
         assert_eq!(opened, 0);

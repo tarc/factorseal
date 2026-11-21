@@ -172,7 +172,7 @@ struct Args {
 
     /// Ask the Desktop running on this vault to seal and quit, and wait
     /// until it has exited (at most 30 seconds). Starts nothing.
-    #[arg(long, conflicts_with_all = ["background", "no_tray", "keyring_activation", "open"])]
+    #[arg(long, conflicts_with_all = ["background", "no_tray", "keyring_activation", "open", "attention"])]
     quit: bool,
 
     #[arg(long, hide = true, conflicts_with_all = ["background", "keyring_activation"])]
@@ -181,6 +181,13 @@ struct Args {
     /// Activate Desktop for a queued Secret Service request.
     #[arg(long, hide = true)]
     keyring_activation: bool,
+
+    /// Ask for attention without taking the screen: the running Desktop of
+    /// this vault (or the one starting, in the tray) opens its window
+    /// minimized and flashes its taskbar button. The WSL broker starts
+    /// Desktop this way for a keyring unlock no person may be waiting on.
+    #[arg(long, hide = true, conflicts_with_all = ["background", "keyring_activation", "open", "no_tray"])]
+    attention: bool,
     /// Do not serve `org.freedesktop.secrets` from this instance.
     #[arg(long, hide = true)]
     no_secret_service: bool,
@@ -200,10 +207,25 @@ struct Args {
 }
 
 impl Args {
-    /// What this launch asks a running Desktop: a visible launch asks it to
-    /// come forward, on `--open`'s page.
+    /// What this launch asks a running Desktop: `--attention` asks for
+    /// attention, and a visible launch asks it to come forward, on
+    /// `--open`'s page.
     fn request(&self) -> Option<instance::Request> {
+        if self.attention {
+            return Some(instance::Request::Attention);
+        }
         (!self.background && !self.keyring_activation).then_some(instance::Request::Open(self.open))
+    }
+
+    /// How this launch starts Desktop when it becomes the vault's Desktop:
+    /// a keyring activation or `--attention` starts in the tray.
+    fn launch(&self) -> app::Launch {
+        app::Launch {
+            background: self.background || self.keyring_activation || self.attention,
+            no_tray: self.no_tray,
+            open: self.open,
+            attention: self.attention,
+        }
     }
 }
 
@@ -272,6 +294,7 @@ fn main() {
         && args.root.is_none()
         && std::env::var_os(SECRET_SERVICE_ENV).is_none_or(|value| value != "0");
     let request = args.request();
+    let launch = args.launch();
     let config = runtime::RuntimeConfig {
         root,
         socket: args.socket,
@@ -313,11 +336,7 @@ fn main() {
     desktop_application().run(move |cx| {
         app::setup(
             config,
-            app::Launch {
-                background: args.background || args.keyring_activation,
-                no_tray: args.no_tray,
-                open: args.open,
-            },
+            launch,
             requests,
             access_requests,
             secret_service_host,
@@ -504,6 +523,29 @@ mod tests {
 
         let help = Args::command().render_long_help().to_string();
         assert!(!help.contains("keyring-activation"));
+    }
+
+    #[test]
+    fn attention_is_a_hidden_request_of_its_own() {
+        let args = Args::try_parse_from(["factorseal-desktop", "--attention"]).unwrap();
+        assert!(args.attention);
+        assert_eq!(args.request(), Some(super::instance::Request::Attention));
+        let rooted =
+            Args::try_parse_from(["factorseal-desktop", "--root", "vault", "--attention"]).unwrap();
+        assert_eq!(rooted.request(), Some(super::instance::Request::Attention));
+        for arguments in [
+            &["--attention", "--background"][..],
+            &["--attention", "--keyring-activation"],
+            &["--attention", "--open", "wsl-keyrings"],
+            &["--attention", "--no-tray"],
+            &["--attention", "--quit"],
+        ] {
+            let mut line = vec!["factorseal-desktop"];
+            line.extend_from_slice(arguments);
+            assert!(Args::try_parse_from(line).is_err(), "{arguments:?}");
+        }
+        let help = Args::command().render_long_help().to_string();
+        assert!(!help.contains("--attention"));
     }
 
     #[test]

@@ -58,6 +58,15 @@ impl WslConfig {
     pub(super) fn monitor_client(self) -> Result<BrokerVaultClient, CliError> {
         Ok(self.client()?.without_desktop())
     }
+
+    /// A client whose broker only asks Desktop for attention (its taskbar
+    /// button flashes) when the vault is sealed or not running: for the
+    /// keyring host, whose callers are often background tools that unlock
+    /// the keyring just in case, with nobody waiting on them.
+    #[cfg(feature = "vault")]
+    pub(super) fn attention_client(self) -> Result<BrokerVaultClient, CliError> {
+        Ok(self.client()?.with_desktop_attention())
+    }
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -350,13 +359,18 @@ mod tests {
     }
 
     /// Only the keyring host's monitor asks its broker not to bring Desktop
-    /// forward; a request made for a program or a person does.
+    /// forward, and its clients only ask for attention; a request made for a
+    /// program or a person brings it forward.
     #[cfg(feature = "vault")]
     #[test]
     fn only_the_monitor_client_leaves_desktop_alone() {
         assert_eq!(
             broker_arguments(|config| config.monitor_client().unwrap()),
             ["pipe", "NixOS", "relay", "--no-desktop"]
+        );
+        assert_eq!(
+            broker_arguments(|config| config.attention_client().unwrap()),
+            ["pipe", "NixOS", "relay", "--attention"]
         );
         assert_eq!(
             broker_arguments(|config| config.client().unwrap()),

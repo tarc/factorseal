@@ -240,8 +240,11 @@ holding a `secretspec.toml`): run from another folder, it asks again. Other
 items (a `gh` token, a git credential) are approved for the program wherever
 it runs.
 A program's `Lock` call does not seal the Windows
-vault. While the vault is sealed the keyring reports locked; unlocking brings
-Desktop forward. Items already in the distro's gnome-keyring are not moved
+vault. While the vault is sealed the keyring reports locked, and a program's
+unlock asks Desktop for attention rather than taking over the screen: its
+window opens minimized and its taskbar button flashes until you click it
+(many tools, such as those built on go-keyring, unlock before every lookup,
+even in the background). Items already in the distro's gnome-keyring are not moved
 by switching: move them first (see the next section), or programs ask you to
 sign in again. To go back, switch the distro off, stop `factorseal
 wsl-keyring` (or set the NixOS mode back) and start gnome-keyring again. See

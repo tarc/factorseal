@@ -4,6 +4,14 @@ All notable changes to FactorSeal will be documented in this file.
 
 ## Unreleased
 
+- A keyring unlock from WSL no longer puts Desktop's window in front of
+  what you are doing: the window opens minimized and its taskbar button
+  flashes until you click it. Background tools that unlock the keyring
+  before every lookup (those built on go-keyring) brought the unlock screen
+  forward each time the vault had idle-sealed. The broker's relay takes
+  `--attention` for this; update the Windows install before the distro's
+  `factorseal`, since an older broker refuses the option.
+
 - Move gnome-keyring items into FactorSeal. `factorseal
   export-secret-service` reads the Secret Service on the session bus and
   writes an encrypted archive of keyring items for a WSL2 distro's keyring

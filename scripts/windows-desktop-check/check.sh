@@ -50,7 +50,9 @@
 #       secret-tool: a store and a lookup each asked in the popup (which names
 #       the program as declared by WSL, unverified), a second lookup without
 #       a popup, another program asking again (denied), the collection locked
-#       after a seal, and a lookup after the unlock asking again. The broker
+#       after a seal, a lookup then opening the test Desktop (sent to the
+#       tray first) minimized and not in front, its taskbar button flashing,
+#       and a lookup after the unlock asking again. The broker
 #       is put beside the test Desktop's CLI, where the worker grants it the
 #       keyring, and the test Desktop runs with --wsl-keyring for this distro.
 #       Needs the Linux CLI (FACTORSEAL_LINUX_CLI, default
@@ -1072,9 +1074,14 @@ keyring)
     wait "$other" && die "the denied lookup succeeded: $(cat "$base/other.out")"
     echo "other program: asked ($id, denied)"
 
-    # 5. Sealed: the collection locks. A lookup brings the test Desktop
-    # forward, waits for the unlock, and asks again (WSL grants end with the
-    # seal).
+    # 5. Sealed: the collection locks. With Desktop in the tray, as it
+    # usually is, a lookup asks it for attention: its window opens minimized,
+    # not in front, with its taskbar button flashing (the flash itself isn't
+    # visible to a script). The lookup waits for the unlock and asks again
+    # (WSL grants end with the seal).
+    pid=$(desktop_pid)
+    powershell foreground.ps1 -Action hide -ProcessId "$pid" -TitleLike FactorSeal >/dev/null ||
+        die "could not send the test Desktop to the tray"
     factorseal seal >/dev/null
     for _ in $(seq 175); do
         [ "$(locked)" = true ] && break
@@ -1085,6 +1092,10 @@ keyring)
     tool "$secret_tool" lookup service "$service" account check >"$base/sealed.out" &
     after=$!
     sleep 3
+    front=$(powershell foreground.ps1 -Action get -ProcessId "$pid" -TitleLike FactorSeal)
+    grep -q '^minimized=True' <<<"$front" || die "the sealed lookup did not open the test Desktop minimized: $front"
+    grep -q '^match=False' <<<"$front" || die "the sealed lookup brought the test Desktop to the front: $front"
+    echo "sealed lookup: the test Desktop opened minimized, not in front"
     "$0" test-desktop >/dev/null || die "could not unlock the test vault again"
     pid=$(desktop_pid)
     id=$(pending_request)

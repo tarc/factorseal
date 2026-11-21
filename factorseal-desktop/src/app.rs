@@ -4614,6 +4614,39 @@ fn open_page(page: crate::instance::Page, cx: &mut App) {
     });
 }
 
+/// Ask for attention without taking the screen, as `--attention` asks: a
+/// visible window that isn't in front flashes its taskbar button, and a
+/// window in the tray opens minimized, without the focus, and flashes.
+/// Platforms that can't open a window that way bring Desktop forward.
+fn request_desktop_attention(cx: &mut App) {
+    cx.defer(|cx| {
+        let desktop = cx.global::<DesktopWindow>();
+        let (visible, handle) = (desktop.visible, desktop.handle);
+        let Some(handle) = handle else {
+            show_desktop(cx);
+            return;
+        };
+        let shown = handle.update(cx, |_, window, _| {
+            if visible {
+                window_activation::request_attention(window);
+                true
+            } else {
+                window_activation::minimized_with_attention(window)
+            }
+        });
+        match shown {
+            Ok(true) if visible => {}
+            Ok(true) => {
+                cx.global_mut::<DesktopWindow>().visible = true;
+                refresh_tray(cx);
+                let runtime = Arc::clone(&cx.global::<RuntimeGlobal>().0);
+                refresh_desktop_snapshot(runtime, cx);
+            }
+            Ok(false) | Err(_) => show_desktop(cx),
+        }
+    });
+}
+
 fn close_desktop(_: &CloseDesktop, cx: &mut App) {
     cx.defer(hide_desktop);
 }
@@ -4971,6 +5004,8 @@ pub(crate) struct Launch {
     pub(crate) no_tray: bool,
     /// The page `--open` asked for.
     pub(crate) open: Option<crate::instance::Page>,
+    /// `--attention`: start in the tray, then ask for attention.
+    pub(crate) attention: bool,
 }
 
 pub(crate) fn setup(
@@ -4985,6 +5020,7 @@ pub(crate) fn setup(
         background,
         no_tray,
         open,
+        attention,
     } = launch;
     gpui_component::init(cx);
     theming::initialize(cx);
@@ -5059,11 +5095,15 @@ pub(crate) fn setup(
     if let Some(page) = open {
         open_page(page, cx);
     }
+    if attention {
+        request_desktop_attention(cx);
+    }
     cx.spawn(async move |cx| {
         while let Ok(request) = requests.recv().await {
             cx.update(|cx| match request {
                 crate::instance::Request::Open(None) => open_desktop(&OpenDesktop, cx),
                 crate::instance::Request::Open(Some(page)) => open_page(page, cx),
+                crate::instance::Request::Attention => request_desktop_attention(cx),
                 crate::instance::Request::Quit => quit(&Quit, cx),
             });
         }

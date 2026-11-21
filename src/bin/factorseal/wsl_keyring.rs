@@ -206,8 +206,11 @@ fn observe(
 trait Brokers {
     /// For the host's own checks of the vault: never brings Desktop forward.
     fn monitor(&self) -> Result<Box<dyn VaultClient>, CliError>;
-    /// On a client's behalf (the store, an unlock): brings Desktop forward
-    /// when the vault is sealed or not running.
+    /// On a client's behalf (the store, an unlock): asks Desktop for
+    /// attention when the vault is sealed or not running. Keyring callers
+    /// are often background tools that unlock just in case (go-keyring
+    /// unlocks before every lookup), so the window opens minimized with its
+    /// taskbar button flashing rather than taking over the screen.
     fn client(&self) -> Result<Box<dyn VaultClient>, CliError>;
 }
 
@@ -217,7 +220,7 @@ impl Brokers for WslConfig {
     }
 
     fn client(&self) -> Result<Box<dyn VaultClient>, CliError> {
-        Ok(Box::new(self.clone().client()?))
+        Ok(Box::new(self.clone().attention_client()?))
     }
 }
 
@@ -383,8 +386,9 @@ impl<'a> HostLoop<'a> {
     }
 }
 
-/// After a client's unlock: ask through a new broker, which brings Desktop
-/// forward when the vault is sealed, then wait for the person to unseal.
+/// After a client's unlock: ask through a new broker, which asks Desktop
+/// for attention when the vault is sealed, then wait for the person to
+/// unseal.
 fn await_unseal(
     brokers: &dyn Brokers,
     timing: Timing,

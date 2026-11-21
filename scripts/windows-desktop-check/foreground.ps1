@@ -2,17 +2,20 @@
 # browser-check.mjs uses it: a browser's own idea of whether it has focus
 # (chrome.windows) can stay true while another app is in front.
 #
-#   foreground.ps1 -Action get
+#   foreground.ps1 -Action get [-ProcessId P [-TitleLike PATTERN]]
 #   foreground.ps1 -Action raise -ProcessId P [-TitleLike PATTERN]
+#   foreground.ps1 -Action hide -ProcessId P [-TitleLike PATTERN]
 # Prints key=value lines: pid, process and title of the foreground window, and
 # with -ProcessId, whether it is that process's window titled like -TitleLike
-# (matched here: console output can mangle non-ASCII titles).
+# (matched here: console output can mangle non-ASCII titles) and whether that
+# window is minimized (`none` when it has no visible window titled so).
+# hide closes the window, which sends Desktop's main window to the tray.
 # -TitleLike picks the process's window by title, such as '*Microsoft*Edge'
 # for a browser window rather than one of the browser's own bubbles. raise
 # closes the process's other windows first: Edge shows a bubble about
 # developer-mode extensions after starting, which takes the foreground.
 param(
-    [Parameter(Mandatory = $true)][ValidateSet('get', 'raise')][string]$Action,
+    [Parameter(Mandatory = $true)][ValidateSet('get', 'raise', 'hide')][string]$Action,
     [int]$ProcessId,
     [string]$TitleLike = '*'
 )
@@ -75,7 +78,18 @@ function Report {
     Write-Output "pid=$owner"
     Write-Output "process=$name"
     Write-Output "title=$([Front]::Title($hwnd))"
-    if ($ProcessId) { Write-Output "match=$($owner -eq $ProcessId -and [Front]::Title($hwnd) -like $TitleLike)" }
+    if ($ProcessId) {
+        Write-Output "match=$($owner -eq $ProcessId -and [Front]::Title($hwnd) -like $TitleLike)"
+        $window = [Front]::Windows($ProcessId) | Where-Object { [Front]::Title($_) -like $TitleLike } | Select-Object -First 1
+        if ($window) { Write-Output "minimized=$([Front]::IsIconic($window))" } else { Write-Output "minimized=none" }
+    }
+}
+
+if ($Action -eq 'hide') {
+    $hwnd = [Front]::Windows($ProcessId) | Where-Object { [Front]::Title($_) -like $TitleLike } | Select-Object -First 1
+    if (-not $hwnd) { Write-Output "error=no window of process $ProcessId titled like $TitleLike"; exit 1 }
+    [void][Front]::PostMessage($hwnd, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)
+    Start-Sleep -Milliseconds 500
 }
 
 if ($Action -eq 'raise') {

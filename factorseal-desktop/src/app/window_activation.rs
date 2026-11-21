@@ -51,6 +51,8 @@ pub(super) fn show(window: &mut Window, remap_unfocused: bool) {
     if remap_unfocused && !window.is_window_active() {
         window.set_visible(false);
     }
+    #[cfg(target_os = "windows")]
+    win32::restore_if_minimized(window);
     window.set_visible(true);
     window.activate();
 }
@@ -61,6 +63,19 @@ pub(super) fn request_attention(window: &Window) {
     win32::flash_until_foreground(window);
     #[cfg(not(target_os = "windows"))]
     window.request_attention();
+}
+
+/// Open a hidden window minimized, without taking the foreground, and flash
+/// its taskbar button until the person brings it forward. False where that
+/// isn't possible (the caller brings the window forward instead).
+pub(super) fn minimized_with_attention(window: &Window) -> bool {
+    #[cfg(target_os = "windows")]
+    return win32::show_minimized_flashing(window);
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = window;
+        false
+    }
 }
 
 /// Flag a window that lost the foreground before the user interacted with it.
@@ -99,7 +114,8 @@ mod win32 {
     use windows_sys::Win32::Foundation::HWND;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         FLASHW_ALL, FLASHW_STOP, FLASHW_TIMERNOFG, FLASHWINFO, FLASHWINFO_FLAGS, FlashWindowEx,
-        GA_ROOTOWNER, GetAncestor, GetForegroundWindow,
+        GA_ROOTOWNER, GetAncestor, GetForegroundWindow, IsIconic, SW_RESTORE, SW_SHOWMINNOACTIVE,
+        ShowWindow,
     };
 
     fn hwnd(window: &Window) -> Option<HWND> {
@@ -145,6 +161,40 @@ mod win32 {
         // For an owner, "until the foreground" would wait for a disabled
         // window; `stop_owner_flash` ends it when the dialog is in front.
         flash(taskbar_window(hwnd), FLASHW_ALL | FLASHW_TIMERNOFG);
+    }
+
+    /// Show the window minimized without activating it, then flash its
+    /// taskbar button until it comes to the foreground. `SW_MINIMIZE` would
+    /// hand the foreground to another window; `SW_SHOWMINNOACTIVE` leaves it
+    /// where it is. Synchronous, on the window's own thread, so the button
+    /// exists before the flash starts. GPUI learns of the change from
+    /// `WM_SHOWWINDOW`, as with its own `ShowWindowAsync` calls.
+    pub(super) fn show_minimized_flashing(window: &Window) -> bool {
+        let Some(hwnd) = hwnd(window) else {
+            return false;
+        };
+        // SAFETY: `hwnd` is this thread's live window, lent by GPUI; the
+        // return value only says whether it was visible before.
+        let _ = unsafe { ShowWindow(hwnd, SW_SHOWMINNOACTIVE) };
+        flash(hwnd, FLASHW_ALL | FLASHW_TIMERNOFG);
+        true
+    }
+
+    /// Restore a minimized window before it is shown and activated. GPUI
+    /// shows windows with `SW_SHOWNOACTIVATE`, which leaves a minimized
+    /// window unready for input: typed keys were lost right after Desktop
+    /// came back from the minimized attention state.
+    pub(super) fn restore_if_minimized(window: &Window) {
+        let Some(hwnd) = hwnd(window) else {
+            return;
+        };
+        // SAFETY: `hwnd` is this thread's live window, lent by GPUI; both
+        // calls only read or change its show state.
+        unsafe {
+            if IsIconic(hwnd) != 0 {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+            }
+        }
     }
 
     /// Stop an owner's flash started for this window. A window's own flash

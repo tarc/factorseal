@@ -45,7 +45,7 @@ mod windows_impl {
         WindowsVaultClient, wsl_relay,
     };
 
-    const USAGE: &str = "usage: factorseal-wsl-broker <pipe-name> <distro> status | get <project> <profile> <key> | relay [--root <WINDOWS_ROOT>] [--no-desktop]";
+    const USAGE: &str = "usage: factorseal-wsl-broker <pipe-name> <distro> status | get <project> <profile> <key> | relay [--root <WINDOWS_ROOT>] [--no-desktop] [--attention]";
 
     /// `VaultAction` deliberately doesn't derive `Clone` (some variants carry
     /// secret material), so the request this broker sends twice -- once
@@ -179,8 +179,8 @@ mod windows_impl {
     /// Serve one Linux client: each frame on standard input is a request,
     /// answered by one frame on standard output, until the input ends.
     /// `wsl_relay::serve` enforces the allowlist; Desktop is brought forward
-    /// the first time the vault is sealed or unreachable, unless
-    /// `--no-desktop`.
+    /// (or, with `--attention`, asked for attention) the first time the vault
+    /// is sealed or unreachable, unless `--no-desktop`.
     fn relay(
         client: &WindowsVaultClient,
         distro: &str,
@@ -192,7 +192,7 @@ mod windows_impl {
             options,
             &mut std::io::stdin().lock(),
             &mut std::io::stdout().lock(),
-            || open_desktop(options.root.as_deref()),
+            || open_desktop(options.root.as_deref(), options.attention),
         )
         .map_err(|error| error.to_string())
     }
@@ -200,8 +200,11 @@ mod windows_impl {
     /// Bring FactorSeal Desktop forward so the person can unlock: starting
     /// the Desktop installed beside the broker, on the vault at `root` if
     /// given, shows that vault's running instance's window, or starts it.
-    /// Best effort; the request is refused either way.
-    fn open_desktop(root: Option<&str>) {
+    /// With `attention`, Desktop is started with `--attention` instead: its
+    /// window opens minimized and its taskbar button flashes, so a request
+    /// no person may be waiting on doesn't take over the screen. Best
+    /// effort; the request is refused either way.
+    fn open_desktop(root: Option<&str>, attention: bool) {
         use std::os::windows::process::CommandExt as _;
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
@@ -215,6 +218,7 @@ mod windows_impl {
         // No inherited handles: standard output is the relay's channel.
         let _ = std::process::Command::new(desktop)
             .args(root.iter().flat_map(|root| ["--root", *root]))
+            .args(attention.then_some("--attention"))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

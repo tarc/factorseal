@@ -404,7 +404,13 @@ When `wsl.json` names a vault other than the default one
 (`relay --root <root>`) and starts Desktop on that vault. A client that
 checks the vault by itself rather than for someone (the WSL keyring host's
 monitor) starts its broker with `relay --no-desktop`, which never brings
-Desktop forward.
+Desktop forward. A client whose requests no person may be waiting on (the
+WSL keyring host, on behalf of D-Bus callers) starts it with
+`relay --attention`: the broker then starts Desktop with `--attention`, which
+opens the window minimized, without the focus, and flashes its taskbar
+button (a window already visible only flashes). `--no-desktop` wins over
+`--attention`. An older broker refuses `--attention`, so the Windows install
+is updated before the distro's `factorseal`.
 
 ### WSL keyring
 
@@ -447,9 +453,13 @@ index (labels and attributes); item values travel only inside an access
 check for a declared caller, for the item that check names.
 
 While the vault is sealed, the collection reports locked; a client's unlock
-asks through a new broker, which brings Desktop forward, and the collection
-is installed once the vault is unsealed. A client's request that finds the
-vault sealed brings Desktop forward too. While installed, the host checks the
+asks through a new broker, which asks Desktop for attention, and the
+collection is installed once the vault is unsealed. A client's request that
+finds the vault sealed asks for attention too. Desktop's window is not
+brought forward for these, because many clients unlock just in case: tools
+built on go-keyring call `Unlock` before every lookup, and a background
+tool doing that would otherwise put the unlock screen in front of whatever
+the person is doing. While installed, the host checks the
 vault by its idle deadline (a status request does not extend the lease) and
 whenever a request finds it sealed; those checks, and the one at start-up,
 go through a broker started with `--no-desktop`, so the host never brings
