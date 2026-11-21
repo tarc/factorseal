@@ -4,6 +4,12 @@ All notable changes to FactorSeal will be documented in this file.
 
 ## Unreleased
 
+- The Windows installer release carries the browser extension for Edge and
+  Chrome, installed in `%LOCALAPPDATA%\Programs\FactorSeal\extension\chromium`,
+  so every update keeps it in step with Desktop and its native host. Load it
+  unpacked from there once; after an update, reload it or restart the
+  browser.
+
 - A keyring unlock from WSL no longer puts Desktop's window in front of
   what you are doing: the window opens minimized and its taskbar button
   flashes until you click it. Background tools that unlock the keyring

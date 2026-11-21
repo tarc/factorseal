@@ -34,6 +34,11 @@ be loaded again after restarting Firefox.
 
 ### Chromium, Chrome, and Edge
 
+FactorSeal installed with the Windows installer brings the extension in
+`%LOCALAPPDATA%\Programs\FactorSeal\extension\chromium`, kept in step with
+Desktop by every update: load that folder unpacked as below (and reload it
+after an update). From a development build:
+
 Chromium/Chrome/Edge 137+: open the browser's extensions page, enable developer
 mode, and load `dist/chromium` unpacked. Its development ID is fixed by the
 manifest public key ([Chrome documentation](https://developer.chrome.com/docs/extensions/reference/manifest/key)).

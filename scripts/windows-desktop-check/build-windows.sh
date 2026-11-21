@@ -18,9 +18,11 @@
 #   build-windows.sh dist
 #       Mirror, then write a release for the installer in the copy's
 #       dist\factorseal-<version>\ (packaging/build-windows-release.ps1): the
-#       artifacts, the stored installer copied (never rebuilt), and
-#       factorseal-release.json. Then install it with its own installer into
-#       a test folder and uninstall it again, under a test registry key.
+#       artifacts, the Chromium browser extension (built here, since the
+#       mirror skips dist folders), the stored installer copied (never
+#       rebuilt), and factorseal-release.json. Then install it with its own
+#       installer into a test folder and uninstall it again, under a test
+#       registry key.
 #   --broker also cross-compiles the WSL broker on the WSL side.
 #   --test-hooks builds Desktop with the `wsl-test-hooks` feature (and, with
 #       check, also runs its tests with it), for `check.sh keyring-import`.
@@ -151,9 +153,18 @@ dist)
         echo "warning: uncommitted changes; the release is $version" >&2
     fi
     echo "Writing the release $version"
+    # The mirror skips every dist folder, the extension's build included:
+    # build it here and copy it into the copy's target\, which /MIR keeps.
+    (cd "$repo" && devenv shell -- node extensions/browser/build.mjs) >/dev/null ||
+        die "building the browser extension failed"
+    extension="$windows_tree/target/extension/chromium"
+    rm -rf "$extension"
+    mkdir -p "$extension"
+    cp -R "$repo/extensions/browser/dist/chromium/." "$extension/"
     output=$(windows "& .\\packaging\\build-windows-release.ps1 -Version '$version' \
         -Setup 'dist\\setup\\factorseal-setup-$setup_version.exe' \
-        -SetupSums 'dist\\setup\\SHA256SUMS' -CliFeatures '$cli_features'") \
+        -SetupSums 'dist\\setup\\SHA256SUMS' -CliFeatures '$cli_features' \
+        -Extension 'target\\extension\\chromium'") \
         || { printf '%s\n' "$output"; die "writing the release failed"; }
     printf '%s\n' "$output" | grep -v '^\s*$' | tail -n 3
     release="$windows_tree/dist/factorseal-$version"
@@ -179,6 +190,12 @@ dist)
         --install-dir "$check_w\FactorSeal" "${roots[@]}" </dev/null 2>/dev/null
     installed=$?
     files=$(find "$check/FactorSeal" -type f 2>/dev/null | wc -l)
+    # The installed extension is the one built from this checkout.
+    if diff -rq "$repo/extensions/browser/dist/chromium" "$check/FactorSeal/extension/chromium" >/dev/null 2>&1; then
+        extension_installed=yes
+    else
+        extension_installed=no
+    fi
     "$check/FactorSeal/factorseal-setup.exe" --quiet --uninstall --no-wsl \
         --install-dir "$check_w\FactorSeal" "${roots[@]}" </dev/null 2>/dev/null
     uninstalled=$?
@@ -195,7 +212,8 @@ dist)
         die "uninstalling the release failed (exit $uninstalled)"
     fi
     [ ! -e "$check/FactorSeal" ] || die "the uninstall left $check_w\FactorSeal"
-    echo "Installed ($files files) and uninstalled in a test folder"
+    [ "$extension_installed" = yes ] || die "the installed extension\\chromium differs from the extension built here"
+    echo "Installed ($files files, the browser extension included) and uninstalled in a test folder"
     rm -rf "$check"
     echo "Release: $(wslpath -w "$release")"
     ;;

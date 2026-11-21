@@ -38,8 +38,18 @@ user in `%LOCALAPPDATA%\Programs\FactorSeal`, with no administrator rights:
    The vault stays sealed until you unlock it again.
 4. The last page offers to open FactorSeal, on the WSL keyrings page.
 
+The browser extension for Edge and Chrome is installed with the rest, in
+`%LOCALAPPDATA%\Programs\FactorSeal\extension\chromium`. Load it once from
+there: open `edge://extensions` (or `chrome://extensions`), turn on
+**Developer mode**, choose **Load unpacked** and pick that folder, then pair
+it from its popup (**Pair with Desktop**). An extension loaded from another
+folder (an earlier build) can't be moved: remove it, load this one and pair
+again.
+
 To update, run the new release's `factorseal-setup.exe` the same way: it
-replaces the installed files and keeps your choices. To uninstall, use
+replaces the installed files, the extension's included, and keeps your
+choices. A running browser keeps the extension it loaded until you choose
+**Reload** on its extensions page or restart the browser. To uninstall, use
 **Settings → Apps → Installed apps → FactorSeal → Uninstall**: it removes
 FactorSeal, its shortcuts and its WSL setup in the distros you keep ticked,
 and deletes its settings folder only if you ask. **Your vault is always

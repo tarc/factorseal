@@ -7,12 +7,19 @@
 #
 # The installer is never built here: -Setup names the stored binary, which
 # must match its line in -SetupSums, and is copied as factorseal-setup.exe.
+#
+# -Extension names the built Chromium extension (extensions/browser's
+# dist/chromium, which build-windows.sh builds and copies over), shipped as
+# extension/chromium/ so that every update keeps it in step with Desktop
+# and the native host. Firefox's build is left out: an unsigned add-on is
+# only temporary there.
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$Version,
     [Parameter(Mandatory = $true)][string]$Setup,
     [Parameter(Mandatory = $true)][string]$SetupSums,
     [Parameter(Mandatory = $true)][string]$CliFeatures,
+    [Parameter(Mandatory = $true)][string]$Extension,
     [string]$OutputDirectory = 'dist'
 )
 
@@ -74,6 +81,24 @@ foreach ($name in $artifacts.Keys) {
     Copy-Item -LiteralPath $artifacts[$name] -Destination $target
     $files += [ordered]@{ path = $name; sha256 = (Get-Sha256 $target) }
 }
+# The Chromium extension, every file under extension/chromium/, in a stable
+# order. Desktop's native host only answers the extension ID its manifest's
+# key fixes, so a build without the key would install but never connect.
+$extensionManifest = Join-Path $Extension 'manifest.json'
+if (-not (Test-Path -LiteralPath $extensionManifest -PathType Leaf)) { throw "no extension manifest in $Extension" }
+if (-not (Get-Content -Raw -LiteralPath $extensionManifest | ConvertFrom-Json).key) {
+    throw "$extensionManifest has no key, so its extension ID would not be FactorSeal's"
+}
+$extensionRoot = (Resolve-Path -LiteralPath $Extension).Path.TrimEnd('\')
+foreach ($source in Get-ChildItem -LiteralPath $extensionRoot -Recurse -File | Sort-Object FullName) {
+    $relative = $source.FullName.Substring($extensionRoot.Length + 1).Replace('\', '/')
+    $name = "extension/chromium/$relative"
+    $target = Join-Path $release ($name.Replace('/', '\'))
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $target) | Out-Null
+    Copy-Item -LiteralPath $source.FullName -Destination $target
+    $files += [ordered]@{ path = $name; sha256 = (Get-Sha256 $target) }
+}
+
 $installer = Join-Path $release 'factorseal-setup.exe'
 Copy-Item -LiteralPath $Setup -Destination $installer
 if ((Get-Sha256 $installer) -ne $expected) { throw "the copy of $Setup differs from it" }

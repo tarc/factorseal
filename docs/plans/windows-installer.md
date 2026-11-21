@@ -1003,6 +1003,22 @@ in the native build.
       the vault seals"), and the next two lookups answered in about 0.25 s
       without a popup.
 
+### After the plan: the browser extension in the release (2026-11-21)
+
+At the user's request, a release also carries the Chromium extension (Edge
+and Chrome), so updates keep it in step with Desktop and the native host
+instead of a folder refreshed by hand. No installer change: release paths
+may have folders (`extension/chromium/...`), the engine creates them and
+uninstall removes them deepest first. `build-windows.sh dist` builds the
+extension on the WSL side (the mirror skips every `dist` folder) into the
+copy's `target\extension\chromium`; `build-windows-release.ps1 -Extension`
+lists each file with its SHA-256 and refuses a manifest without the key
+that fixes FactorSeal's extension ID; the dist check compares the installed
+folder with the build. Firefox's build is left out: an unsigned add-on is
+only temporary there. A browser keeps running the extension it loaded until
+it is reloaded or restarted, and one loaded from another folder has to be
+removed, loaded from the install folder and paired again.
+
 ## Order with the import plan
 
 1. Import core: steps 1–4 and 7 of the import plan (CLI usable by hand).

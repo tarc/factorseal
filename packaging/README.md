@@ -89,7 +89,8 @@ vault. It refuses to replace an existing task unless `-Replace` is explicit.
 `factorseal-setup.exe` installs FactorSeal for the current Windows user, in
 `%LOCALAPPDATA%\Programs\FactorSeal`, without administrator rights. It is
 built once and never changes per release: a release is a folder holding the
-executables, the installer and a `factorseal-release.json` that lists every
+executables, the Chromium browser extension (`extension\chromium`, for Edge
+and Chrome), the installer and a `factorseal-release.json` that lists every
 file with its SHA-256 and the install steps, from the installer's fixed
 vocabulary (copy the files, shortcuts, set up WSL, start Desktop, and what
 uninstall removes). The installer refuses a release whose files don't match,
