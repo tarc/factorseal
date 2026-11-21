@@ -137,8 +137,10 @@ and exit codes. For example:
 
 ```powershell
 $release = (Resolve-Path 'dist\factorseal-0.1.0+g1234567890').Path
-$run = Start-Process -Wait -PassThru "$release\factorseal-setup.exe" `
+$run = Start-Process -PassThru "$release\factorseal-setup.exe" `
   -ArgumentList '--quiet', '--manifest', "`"$release\factorseal-release.json`"", '--no-wsl'
+$null = $run.Handle  # keeps the exit code readable after the installer exits
+$run.WaitForExit()
 $run.ExitCode
 ```
 
@@ -147,8 +149,11 @@ the process's own folder, which can differ from PowerShell's location.
 
 A release that sets up WSL needs `--wsl <distro>` (repeated) or `--no-wsl`;
 `--uninstall` removes the install (`--also-delete` also deletes the settings
-folder). The installer is a Windows program, so PowerShell waits for it and
-reports its exit code only through `Start-Process -Wait -PassThru`.
+folder). The installer is a Windows program, so PowerShell doesn't wait for
+it on its own: start it with `Start-Process -PassThru` and wait with
+`WaitForExit()`, as above. `Start-Process -Wait` also waits for every process
+the installer started, and at the end it starts FactorSeal, so `-Wait` would
+return only when FactorSeal exits; it is fine with `--no-start`.
 
 ## Microsoft Store MSIX
 

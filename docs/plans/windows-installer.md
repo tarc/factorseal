@@ -1014,6 +1014,14 @@ in the native build.
 
 ## Notes and risks
 
+- **`--help` recommends `Start-Process -Wait -PassThru`** (seen in the
+  2026-11-21 rollout of a2b7452): `-Wait` also waits for the processes the
+  installer starts, so with the default start it hangs until FactorSeal
+  exits. `packaging/README.md` now shows `Start-Process -PassThru` and
+  `WaitForExit()`. The help text, which also names `$LASTEXITCODE` where
+  `-PassThru` gives `ExitCode`, is part of the installer, so it changes with
+  the next installer version.
+
 - **Updates while a browser fill waits**: stopping the browser host cancels
   it. The installer says so before stopping it.
 - **The update swaps folders**, so a running process the wait missed, or one
